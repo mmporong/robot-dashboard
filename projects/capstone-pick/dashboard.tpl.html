@@ -1,0 +1,1526 @@
+<title>Bench Telemetry</title>
+<style>
+  :root{
+    --ground:#EEF1F4; --panel:#FFFFFF; --ink:#12171C; --muted:#5B6670;
+    --rule:#DCE1E6; --rule-soft:#EBEEF1; --accent:#0E7490; --accent-soft:#E0F2F6;
+    --ok:#15803D; --ok-soft:#E7F5EC; --warn:#B45309; --warn-soft:#FDF3E7;
+    --crit:#B91C1C; --crit-soft:#FDECEC; --hold:#0F766E; --rel:#7C3AED;
+    --mono:ui-monospace,"SF Mono","Cascadia Code",Menlo,Consolas,monospace;
+    --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans KR",sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--sans);
+       font-size:14px;line-height:1.45;-webkit-font-smoothing:antialiased}
+  .num{font-family:var(--mono);font-variant-numeric:tabular-nums}
+  .eyebrow{font-size:10px;font-weight:700;letter-spacing:.10em;text-transform:uppercase;
+           color:var(--muted);margin:0 0 7px}
+
+  .app{height:100dvh;display:flex;flex-direction:column;overflow:hidden}
+
+  /* ── 상단바 ─────────────────────────────── */
+  .topbar{flex:0 0 auto;display:flex;align-items:center;gap:14px;padding:8px 14px;
+          background:var(--panel);border-bottom:1px solid var(--rule);flex-wrap:wrap}
+  .brand{font-size:14px;font-weight:700;letter-spacing:-.01em;white-space:nowrap}
+  .brand span{font-weight:400;color:var(--muted);font-size:12px;margin-left:7px}
+  .tab{border:1px solid var(--rule);background:var(--panel);font-family:inherit;font-size:12.5px;
+       padding:4px 13px;border-radius:7px;cursor:pointer;color:var(--muted);font-weight:600}
+  .tab:hover{border-color:var(--accent);color:var(--accent)}
+  .tab[aria-expanded="true"]{border-color:var(--accent);background:var(--accent-soft);color:var(--accent)}
+  .tab:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+  .runsel{display:flex;gap:5px;flex-wrap:wrap;margin-left:auto;align-items:center}
+  .chip{border:1px solid var(--rule);background:var(--panel);border-radius:7px;
+        padding:3px 9px;cursor:pointer;font-family:inherit;font-size:11.5px;
+        display:flex;align-items:center;gap:6px;white-space:nowrap}
+  .chip:hover{border-color:var(--accent)}
+  .chip:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+  .chip[aria-pressed="true"]{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent)}
+  .chip .id{font-family:var(--mono);color:var(--muted)}
+  /* 실험 종류는 배경, 판정 결과가 앞이다 — 둘이 같은 굵기로 붙어 있으면 한 덩어리로
+     읽혀서 "팔 단독 통 안"처럼 무슨 말인지 모르게 된다. */
+  .chip .kind{color:var(--muted);font-size:10.5px;margin-right:5px}
+  .chip b{font-weight:700}
+  .led{width:7px;height:7px;border-radius:50%;flex:0 0 auto}
+  .led.ok{background:var(--ok)} .led.crit{background:var(--crit)}
+  .led.warn{background:var(--warn)} .led.mute{background:#B4BEC6}
+
+  /* ── 페이지 ─────────────────────────────── */
+  /* 마지막 줄이 타임라인이다. 단계 이름 줄(16px)이 새로 붙은 만큼 늘려 준다 —
+     안 늘리면 그 높이가 아래 곡선에서 깎인다. */
+  .live{flex:1;min-height:0;display:grid;grid-template-rows:auto minmax(0,1fr) 206px;
+        gap:9px;padding:9px 12px}
+  .pane{background:var(--panel);border:1px solid var(--rule);border-radius:10px;
+        padding:9px 11px;min-height:0;min-width:0;display:flex;flex-direction:column}
+
+  /* 판정 줄 */
+  .vbar{display:grid;grid-template-columns:5px auto 1fr auto;gap:13px;align-items:center;
+        background:var(--panel);border:1px solid var(--rule);border-radius:10px;padding:8px 12px}
+  .vbar.mismatch{border-color:var(--crit);background:var(--crit-soft)}
+  .vbar.pass{border-color:var(--ok);background:var(--ok-soft)}
+  .vbar.fail{border-color:var(--warn);background:var(--warn-soft)}
+  .vstripe{align-self:stretch;border-radius:3px;background:#B4BEC6}
+  .vbar.mismatch .vstripe{background:var(--crit)}
+  .vbar.pass .vstripe{background:var(--ok)}
+  .vbar.fail .vstripe{background:var(--warn)}
+  .vtitle{font-size:14.5px;font-weight:700;letter-spacing:-.01em;white-space:nowrap}
+  .vbody{font-size:12.5px;color:var(--muted);min-width:0}
+  .vbody b{color:var(--ink);font-weight:600}
+  .vnum{text-align:right;white-space:nowrap}
+  .vnum .big{font-family:var(--mono);font-size:23px;font-weight:700;line-height:1;
+             font-variant-numeric:tabular-nums}
+  .vbar.mismatch .vnum .big{color:var(--crit)}
+  .vbar.pass .vnum .big{color:var(--ok)}
+  .vbar.fail .vnum .big{color:var(--warn)}
+  .vnum .cap{font-size:9.5px;color:var(--muted);letter-spacing:.06em;text-transform:uppercase}
+
+  /* 무대 3열 */
+  /* 분석은 페이지를 갈아 끼우지 않고 **오른쪽에서 열린다.** 재생을 멈추지 않고
+     표를 같이 읽는 것이 이 화면의 쓸모라, 화면을 바꿔 버리면 그 쓸모가 사라진다.
+     열리면 타일이 좁아질 뿐 전부 보인다. */
+  .stage{display:grid;grid-template-columns:minmax(0,2.05fr) minmax(0,.78fr) 0fr;
+         gap:9px;min-height:0;transition:grid-template-columns .26s cubic-bezier(.4,0,.2,1)}
+  .stage.open{grid-template-columns:minmax(0,1.35fr) minmax(0,.62fr) minmax(330px,.95fr)}
+  @media (max-width:1150px){
+    .stage.open{grid-template-columns:minmax(0,1fr) 0fr minmax(300px,.9fr)}
+    .stage.open > .pane:nth-of-type(1){display:none}
+  }
+  .drawer{overflow:hidden;min-width:0;padding:0;border:0;background:none;display:flex}
+  .drawer .inner{flex:1;min-width:0;min-height:0;overflow-y:auto;background:var(--panel);
+                 border:1px solid var(--rule);border-radius:10px;padding:11px 13px}
+  .stage:not(.open) .drawer{opacity:0;pointer-events:none}
+  .drawer h3{font-size:11px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;
+             color:var(--muted);margin:16px 0 7px;padding-top:12px;border-top:1px solid var(--rule-soft)}
+  .drawer h3:first-child{margin-top:0;padding-top:0;border-top:0}
+  .drawer .logwrap{max-height:236px;overflow-y:auto;border:1px solid var(--rule-soft);
+                   border-radius:7px}
+  .drawer .dtable td{padding:4px 7px}
+  /* 시행 하나가 칸 하나. 76시행이 한 줄에 들어가야 "언제부터"가 눈에 잡히므로
+     칸을 잘게 두고, 넘치면 줄바꿈한다(가로 스크롤은 만들지 않는다). */
+  .strip{display:grid;grid-template-columns:58px 1fr;gap:7px;align-items:start;margin:7px 0}
+  .strip .slbl{font-family:var(--mono);font-size:10px;color:var(--muted);padding-top:2px}
+  .scells{display:flex;flex-wrap:wrap;gap:2px}
+  .sc{width:9px;height:13px;border-radius:2px;display:inline-block;vertical-align:-2px}
+  .sc.green{background:var(--ok)} .sc.amber{background:var(--warn)}
+  .sc.red{background:var(--crit)} .sc.gray{background:#C3CCD2}
+  .drawer .dtable th{position:sticky;top:0;background:var(--panel);z-index:1}
+  @media (prefers-reduced-motion:reduce){.stage{transition:none}}
+  /* 3D는 카메라 한 칸 크기면 충분하다 — 네 타일을 같은 크기로 놓고,
+     남은 자리에 평면도를 올려 "지금 물체가 통 어디쯤인가"를 관제에서 바로 본다. */
+  .tiles{display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;
+         gap:9px;min-height:0;min-width:0}
+  .phead{display:flex;justify-content:space-between;align-items:center;gap:8px;flex:0 0 auto;
+         min-height:19px}
+  .phead .eyebrow{white-space:nowrap}
+  .vbtns{flex-wrap:nowrap;overflow:hidden}
+  .phead .eyebrow{margin:0}
+  .vbtns{display:flex;gap:3px}
+  .vb{border:1px solid var(--rule);background:var(--panel);border-radius:5px;padding:2px 7px;
+      font-family:var(--mono);font-size:10.5px;cursor:pointer;color:var(--muted)}
+  .vb:hover{border-color:var(--accent)}
+  .vb:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+  .vb[aria-pressed="true"]{border-color:var(--accent);background:var(--accent-soft);color:var(--accent)}
+
+  .canvwrap{flex:1;min-height:0;position:relative;margin-top:7px;
+            border-radius:7px;background:#F7FAFB;border:1px solid var(--rule-soft);overflow:hidden}
+  .canvwrap canvas{position:absolute;inset:0;width:100%;height:100%}
+
+  .cams{flex:1;min-height:0;display:flex;flex-direction:column;gap:7px;margin-top:7px}
+  .cam{flex:1;min-height:0;position:relative;border-radius:7px;overflow:hidden;
+       background:#E9EDF0;border:1px solid var(--rule-soft)}
+  .cam img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#DCE3E7}
+  .camtag{position:absolute;left:5px;top:5px;background:rgba(18,23,28,.72);color:#fff;
+          font-family:var(--mono);font-size:9.5px;padding:1px 6px;border-radius:4px;z-index:2}
+  .camtag.miss{background:rgba(185,28,28,.85)}
+  .camnote{font-family:var(--mono);font-size:10px;color:var(--muted)}
+
+  .stat{flex:1;min-height:0;overflow-y:auto;margin-top:7px;padding-right:2px}
+
+  /* 큐브 상태 배지 */
+  .cstate{border-radius:8px;padding:6px 10px;display:flex;align-items:center;gap:10px;
+          margin-bottom:7px;border:1px solid transparent}
+  .cstate .big{font-size:17px;font-weight:700;letter-spacing:-.01em}
+  .cstate .sm{font-size:11.5px;opacity:.85;line-height:1.35}
+  .cs-lifted{background:var(--ok-soft);border-color:#A9D8BC;color:var(--ok)}
+  .cs-gripped{background:#E3F3F2;border-color:#A6D3D0;color:var(--hold)}
+  .cs-injaw{background:var(--warn-soft);border-color:#EBCDA4;color:var(--warn)}
+  .cs-dropped{background:var(--crit-soft);border-color:#EFB6B6;color:var(--crit)}
+  .cs-released{background:#F1EAFD;border-color:#CBB6F0;color:var(--rel)}
+  .cs-ground{background:var(--rule-soft);border-color:var(--rule);color:var(--muted)}
+  .cs-none{background:var(--rule-soft);border-color:var(--rule);color:var(--muted)}
+
+  /* 그리퍼 게이지 */
+  .gg{margin-bottom:6px}
+  .ggtop{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px}
+  .ggval{font-family:var(--mono);font-size:15px;font-weight:700;font-variant-numeric:tabular-nums}
+  .ggtrack{position:relative;height:16px;border-radius:4px;background:var(--rule-soft);
+           overflow:hidden;border:1px solid var(--rule)}
+  .ggband{position:absolute;top:0;bottom:0;background:#CFE8DA}
+  .ggfill{position:absolute;top:0;bottom:0;left:0;background:var(--accent);opacity:.85}
+  .ggcube{position:absolute;top:0;bottom:0;width:2px;background:var(--crit)}
+  .ggscale{display:flex;justify-content:space-between;font-family:var(--mono);font-size:9.5px;
+           color:var(--muted);margin-top:2px}
+
+  /* 관절 */
+  .jrow{display:grid;grid-template-columns:76px 1fr 50px;gap:6px;align-items:center;padding:2px 0}
+  .jname{font-family:var(--mono);font-size:10.5px;color:var(--muted)}
+  .jbar{position:relative;height:7px;background:var(--rule-soft);border-radius:4px}
+  .jzero{position:absolute;top:-2px;bottom:-2px;width:1px;background:#C3CCD2}
+  .jfill{position:absolute;top:0;bottom:0;background:var(--accent);border-radius:4px}
+  .jfill.near{background:var(--warn)}
+  .jval{font-family:var(--mono);font-size:11px;text-align:right;font-variant-numeric:tabular-nums}
+
+  #metrics{display:grid;grid-template-columns:1fr 1fr;gap:0 12px}
+  .metric{display:flex;justify-content:space-between;align-items:baseline;padding:3px 0;
+          border-bottom:1px solid var(--rule-soft);min-width:0}
+  .metric .mval{margin-left:6px;white-space:nowrap}
+  .gg .metric{border-bottom:0;padding:2px 0}
+  .mlbl{font-size:11.5px;color:var(--muted)}
+  .mval{font-family:var(--mono);font-size:12.5px;font-weight:600;font-variant-numeric:tabular-nums}
+  .mval.ok{color:var(--ok)} .mval.warn{color:var(--warn)} .mval.crit{color:var(--crit)}
+
+  /* 타임라인 */
+  .tlpane{display:flex;flex-direction:column;gap:5px}
+  .tl{position:relative;height:24px;border-radius:5px;overflow:hidden;
+      background:var(--rule-soft);flex:0 0 auto}
+  /* 칸을 **시각 좌표에 직접 놓는다.** 예전엔 flex로 폭만 주면서 좁은 칸에 최소 폭을
+     줬는데, 그 최소 폭이 뒤 칸을 전부 오른쪽으로 밀어 위쪽 이름 눈금과 어긋났다. */
+  .tlseg{position:absolute;top:0;bottom:0;border-right:1px solid var(--panel);cursor:pointer}
+  /* 국면이 바뀌는 자리만 굵게. 같은 국면 안의 칸 경계는 얇게 둬서 "여섯 번 들었다"는
+     사실은 남기되, 눈이 먼저 잡는 것은 국면 경계가 되게 한다. */
+  .tlseg.pend{border-right:2px solid var(--ground)}
+  /* 단계 이름은 색 칸 **밖**에 적는다. 칸 안에 넣으면 좁은 칸은 이름이 통째로 사라지고
+     (실제로 열여덟 칸 중 넷만 보였다) 같은 이름이 옆칸에 거듭 찍힌다. */
+  .tllab{position:relative;height:16px;font-size:10px;line-height:16px;color:var(--muted)}
+  .tllab span{position:absolute;top:0;white-space:nowrap;padding-left:5px;
+              border-left:1px solid var(--rule)}
+  .tllab span.on{color:var(--accent);font-weight:700;border-left-color:var(--accent)}
+  /* 자리가 없어 이름을 접을 때도 **눈금은 남긴다** — 이름이 사라지는 것과 국면 경계가
+     사라지는 것은 다르다. 경계까지 없어지면 몇 국면인지조차 안 보인다. */
+  .tllab span.tick{font-size:0;padding-left:0}
+  /* 오른쪽 끝 국면은 밖으로 넘쳐 잘린다. 눈금을 오른쪽에 두고 글자를 안으로 접는다. */
+  .tllab span.right{padding:0 5px 0 0;border-left:0;border-right:1px solid var(--rule);
+                    transform:translateX(-100%)}
+  .tllab span.right.on{border-right-color:var(--accent)}
+  .band{display:grid;grid-template-columns:62px 1fr;gap:8px;align-items:center}
+  .band .lbl{font-family:var(--mono);font-size:10px;color:var(--muted);text-align:right}
+  .btrack{position:relative;height:11px;border-radius:3px;background:var(--rule-soft);
+          overflow:hidden}
+  .bseg{position:absolute;top:0;bottom:0}
+  .cursor{position:absolute;top:0;bottom:0;width:2px;background:var(--ink);z-index:3;
+          pointer-events:none}
+  .spark{width:100%;height:100%;display:block}
+  .ctrl{display:flex;align-items:center;gap:9px}
+  .ctrl input[type=range]{flex:1}
+  .playbtn{border:1px solid var(--rule);background:var(--panel);border-radius:6px;
+           width:28px;height:24px;cursor:pointer;font-size:11px;color:var(--ink);
+           display:flex;align-items:center;justify-content:center}
+  .playbtn:hover{border-color:var(--accent)}
+  .playbtn:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+  .tnow{font-family:var(--mono);font-size:11px;color:var(--muted);min-width:88px;text-align:right}
+  .legend{display:flex;align-items:center;gap:5px;margin-left:auto;font-family:var(--mono);
+          font-size:10px;color:var(--muted)}
+  .legend i{width:10px;height:2px;display:inline-block;margin-left:7px}
+  .legend i.dash{background:repeating-linear-gradient(90deg,#D8A15E 0 3px,transparent 3px 6px)}
+
+  /* ── 분석 페이지 ────────────────────────── */
+  .deep h2{font-size:17px;font-weight:700;letter-spacing:-.01em;margin:26px 0 12px}
+  .deep h2:first-of-type{margin-top:0}
+  .dgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px}
+  .card{border:1px solid var(--rule);border-radius:10px;background:var(--panel);padding:14px 16px}
+  .dtable{width:100%;border-collapse:collapse;font-size:12.5px}
+  .dtable th{text-align:left;font-size:10px;letter-spacing:.06em;text-transform:uppercase;
+             color:var(--muted);font-weight:700;padding:5px 7px;border-bottom:1px solid var(--rule)}
+  .dtable td{padding:5px 7px;border-bottom:1px solid var(--rule-soft);
+             font-family:var(--mono);font-variant-numeric:tabular-nums;font-size:12px}
+  .dtable td:first-child{font-family:var(--sans);color:var(--muted)}
+  .dtable tr.hit td{background:var(--accent-soft)}
+  .delta.up{color:var(--crit)} .delta.dn{color:var(--ok)}
+  .plan{width:100%;height:auto;display:block}
+  .note{font-size:12px;color:var(--muted);margin:9px 0 0;line-height:1.5}
+  .note code,.deep code{font-family:var(--mono);font-size:11.5px;background:var(--rule-soft);
+             padding:1px 4px;border-radius:4px}
+  .pill{display:inline-block;font-size:10px;font-weight:700;letter-spacing:.04em;
+        padding:1px 6px;border-radius:99px}
+  .pill.ok{background:var(--ok-soft);color:var(--ok)}
+  .pill.crit{background:var(--crit-soft);color:var(--crit)}
+  .pill.warn{background:var(--warn-soft);color:var(--warn)}
+  .pill.mute{background:var(--rule-soft);color:var(--muted)}
+  .seq{display:flex;flex-direction:column}
+  .step{display:flex;gap:9px;align-items:flex-start;padding:5px 0;cursor:pointer;
+        border:0;background:none;font-family:inherit;text-align:left;width:100%}
+  .step:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:5px}
+  .dot{width:10px;height:10px;border-radius:50%;border:2px solid var(--rule);
+       background:var(--panel);margin-top:4px;flex:0 0 auto}
+  .step.done .dot{background:var(--accent);border-color:var(--accent)}
+  .step.cur .dot{background:var(--accent);border-color:var(--accent);box-shadow:0 0 0 4px var(--accent-soft)}
+  .step .nm{font-size:12.5px;font-weight:500}
+  .step.cur .nm{font-weight:700;color:var(--accent)}
+  .step .tm{font-family:var(--mono);font-size:10.5px;color:var(--muted)}
+  .conn{width:2px;height:7px;background:var(--rule);margin-left:6px}
+
+  @media (max-width:1200px), (max-height:620px){
+    .app{height:auto;overflow:visible}
+    .live{grid-template-rows:none}
+    .stage{grid-template-columns:1fr}
+    .canvwrap{height:380px;flex:none}
+    .cams{height:420px;flex:none}
+    .stat{overflow:visible}
+  }
+  @media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+
+<div class="app">
+  <div class="topbar">
+    <div class="brand">Bench Telemetry<span>SO-101 pick &amp; place</span></div>
+    <button class="tab drawertoggle" id="tabDeep" aria-expanded="false"
+            aria-controls="drawer">분석 열기</button>
+    <div class="runsel" id="runsel"></div>
+  </div>
+
+  <div class="live" id="pageLive">
+    <div id="verdict"></div>
+
+    <div class="stage">
+     <div class="tiles">
+      <section class="pane">
+        <div class="phead">
+          <p class="eyebrow">로봇 자세</p>
+          <div class="vbtns" id="viewbtns"></div>
+        </div>
+        <div class="canvwrap"><canvas id="rob"
+             aria-label="관절값으로 계산한 로봇 자세와 그리퍼 개폐"></canvas></div>
+      </section>
+
+      <section class="pane">
+        <div class="phead">
+          <p class="eyebrow">전방 RGB-D</p>
+          <span class="camnote num" id="camdist"></span>
+        </div>
+        <div class="cams">
+          <div class="cam"><span class="camtag" id="tagFront">전방</span>
+            <img id="camFront" alt="전방 RGB-D 카메라"></div>
+        </div>
+      </section>
+
+      <section class="pane">
+        <div class="phead"><p class="eyebrow">평면도 · 실좌표</p>
+          <span class="camnote num" id="plandist"></span></div>
+        <div class="canvwrap" style="background:#F8FAFB">
+          <svg id="planLive" preserveAspectRatio="xMidYMid meet" role="img"
+               style="position:absolute;inset:0;width:100%;height:100%"
+               aria-label="로봇·물체·통 실좌표 평면도"></svg>
+        </div>
+      </section>
+
+      <section class="pane">
+        <div class="phead"><p class="eyebrow">손목 카메라</p>
+          <span class="camnote">파지·운반은 여기서만 보인다</span></div>
+        <div class="cams">
+          <div class="cam"><span class="camtag" id="tagWrist">손목</span>
+            <img id="camWrist" alt="손목 카메라"></div>
+        </div>
+      </section>
+     </div>
+
+      <section class="pane">
+        <div class="phead"><p class="eyebrow">물체 · 그리퍼 · 관절</p></div>
+        <div class="stat">
+          <div id="cstate"></div>
+          <div class="gg" id="gg"></div>
+          <div id="joints"></div>
+          <div id="metrics" style="margin-top:5px"></div>
+        </div>
+      </section>
+
+      <section class="pane drawer" id="drawer" aria-label="분석">
+       <div class="inner">
+        <h3>물체 상태 전이</h3>
+        <div class="logwrap"><table class="dtable" id="cubelog"></table></div>
+        <p class="note" id="cubenote"></p>
+
+        <h3>단계</h3>
+        <div class="seq" id="seq"></div>
+
+        <h3>그리퍼 — 각도를 밀리미터로</h3>
+        <table class="dtable" id="griptable"></table>
+        <p class="note">물림각은 <code>arm_gripper</code> 관절의 라디안 값이라 그대로는 크기를
+          말해 주지 않는다. URDF의 두 손가락 패드(<code>fixed_finger_tip</code> ·
+          <code>moving_finger_tip</code>)를 정기구학으로 옮겨 <b>끝 패드 사이 거리</b>를 낸다.
+          이 정기구학은 ROS <code>tf2</code>가 내놓는 같은 링크의 좌표와
+          <span class="num">0.5</span>mm 안에서 일치한다.</p>
+        <p class="note"><b>캘리퍼가 아니다.</b> 같은 30mm 물체를 세 번 잡은 실측에서 고정 죠는
+          물체 중심으로부터 <span class="num">23.0 / 23.0 / 22.8</span>mm로 일정했지만, 움직이는
+          죠는 <span class="num">28.6 / 25.8 / 18.9</span>mm로 물체 면 기준 <b>±5mm</b> 흔들렸다 —
+          죠가 접촉 후 파고든 깊이만큼 각도가 더 닫히기 때문이다. 코드도 임계를 점이 아니라
+          띠(<code>0.32~0.55</code>)로 잡아 둔다.</p>
+
+        <h3>시행 비교 — 결과</h3>
+        <table class="dtable" id="cmpall"></table>
+
+        <h3>시행 비교 — 파지 신호</h3>
+        <table class="dtable" id="cmpgrip"></table>
+
+        <h3>카메라</h3>
+        <table class="dtable" id="posetable"></table>
+        <p class="note">시행이 도는 동안 같은 노드·같은 시계로 녹화했다. 관제 화면은 스크럽한
+          시각 이하에서 <b>가장 늦은 프레임</b>을 띄운다 — 태그의 숫자가 그 프레임의 시각이고,
+          앞뒤 어느 쪽으로든 <span class="num">1.5</span>초 넘게 벌어지면 빨갛게 표시한다. 주행 시행은 그때 녹화를
+          하지 않아 영상이 없다. 비슷한 그림으로 채우지 않고 <b>없다고 표시</b>한다.</p>
+
+        <h3>판정 규칙</h3>
+        <p class="note" style="margin-top:0">판정은 로그가 아니라 <b>Gazebo 실좌표</b>로 한다 —
+          <code>gz model -m &lt;name&gt; -p</code>. 개구부는 <span class="num">136</span>mm각
+          (반폭 <span class="num">68</span>mm), 벽 상단 <span class="num">0.090</span>m다.
+          물체 중심이 개구부 안이고 높이가 벽 상단보다 낮아야 <b>통 안</b>이다.</p>
+        <p class="note">물체 상태는 로그의 상태값이 아니라 좌표에서 다시 센다. 죠와 물체의
+          <b>반경 차</b>(회전 불변량)와 <b>높이 차</b>로 근접을 판정한다. 주행 시행은 차체 yaw의
+          실측이 없고 오도메트리가 어긋나 있어(실측 <span class="num">1.6</span>rad) 방위가
+          필요한 값은 쓰지 않았다.</p>
+
+        <h3>누적 · 회귀</h3>
+        <p class="note" style="margin-top:0">화면에 세운 7시행은 인박스에서 고른 것이다.
+          쌓인 것 전부를 견주면 한 시행만 봐서는 안 보이는 것이 나온다. <b>세대가 다르면
+          견주지 않는다</b> — 무대 배치가 바뀌면 같은 잣대가 아니다.</p>
+        <table class="dtable" id="epochtable"></table>
+        <div id="runstrip"></div>
+        <table class="dtable" id="regtable"></table>
+        <p class="note"><b>탐지기를 먼저 의심했다.</b> "달라졌다"는 판정은 순서를 무작위로
+          섞어도 같은 격차가 나오는지로 검정한다(순열 4,000회 · 최대값 통계라 후보를 여럿
+          본 것에 대한 보정이 들어 있다). 순수 잡음(동전 던지기 40회)에 이 탐지기가 걸리는
+          비율은 <span class="num">6.0</span>%로 유의수준 <span class="num">5</span>%에
+          맞고, 진짜 계단은 <span class="num">100</span>% 잡는다.
+          <b>다만 약한 변화는 못 잡는다</b> — 0.7에서 0.3으로 떨어지는 계단조차 40시행에서는
+          <span class="num">34</span>%만 잡혔다. "변화 없음"은 <b>변화가 없다는 증명이 아니라
+          이 표본으로는 말할 수 없다</b>는 뜻이다.</p>
+        <p class="note" id="attemptnote"></p>
+
+        <h3>데이터 출처</h3>
+        <p class="note" style="margin-top:0">이 화면은 <b>MCAP</b>을 읽는다 — 로봇 기록의 표준
+          컨테이너다. 자체 포맷을 만들지 않았다. 시행 하나가 파일 하나이고, 안에 실린 것은
+          전부 실재하는 ROS 2 타입이다:
+          <code>sensor_msgs/JointState</code>(팔 5축 + 그리퍼, 부하는 <code>effort</code>),
+          <code>tf2_msgs/TFMessage</code>(죠 위치),
+          <code>nav_msgs/Odometry</code>,
+          <code>geometry_msgs/PoseStamped</code>(Gazebo 실좌표),
+          <code>diagnostic_msgs/DiagnosticArray</code>(단계·코드 주장),
+          <code>sensor_msgs/CompressedImage</code>(두 카메라).</p>
+        <p class="note"><b>판정은 파일에 들어 있지 않다.</b> 실좌표만 싣고 통 안인지는 읽는
+          쪽에서 다시 센다. 결론을 파일에 박으면 이 화면은 코드가 뭐라고 했는지를 되풀이하는
+          물건이 된다 — 그 주장이 틀렸다는 것이 여기서 찾아낸 사실이다.</p>
+        <p class="note">MCAP은 메시지 정의를 파일 안에 넣고 다녀서 <b>ROS가 없는 기계에서도</b>
+          열린다. 반대로 이 파일들은 <code>ros2 bag info</code>·Foxglove로도 열린다 — 우리
+          도구만 읽을 수 있는 기록이 아니다.</p>
+        <p class="note"><b>나가는 쪽도 표준이다.</b> 같은 MCAP을
+          <b>LeRobotDataset v3.0</b>으로 내보낸다 — Parquet(관절·액션·실좌표) + MP4(카메라)
+          + 관계형 메타. 스키마를 손으로 재현하지 않고 <code>lerobot</code> 라이브러리의
+          쓰기 API를 그대로 쓰므로 포맷이 구성상 맞고, 검증도 그 라이브러리로 되읽어 한다.
+          싣는 키는 전부 예약 키다: <code>observation.state</code> ·
+          <code>observation.environment_state</code> · <code>observation.images.*</code> ·
+          <code>action</code> · <code>next.success</code> · <code>next.reward</code>.</p>
+        <p class="note"><code>next.success</code>가 이 데이터셋의 값어치다. LeRobot v0.6.0이
+          <code>lerobot.rewards</code>로 성공 판정 모델을 통합했는데, 그 모델들이 영상에서
+          <b>추정하려는 값</b>이 여기엔 시뮬레이터 실좌표로 들어 있다 — 추정과 맞대 볼 정답이
+          함께 나간다. 다만 <code>action</code>은 <b>다음 시점의 관절 측정값</b>이다.
+          이 기록엔 지령값이 없어서다. 지령을 기록한 척하지 않으려고 데이터셋 카드에도
+          같은 문장을 넣었다.</p>
+        <p class="note">옮기는 과정에서 하나가 잡혔다. 종전에는 단계와 카메라의 0초를 <b>따로</b>
+          잡았는데, 녹화는 무대를 세우는 동안 이미 돌고 있어 첫 단계보다
+          <span class="num">4.5</span>초 앞서 시작한다(실측 <span class="num">+4.53</span>·
+          <span class="num">+4.48</span>·<span class="num">+4.49</span>초). 그래서 팔 단독 전
+          시행에서 영상이 관절보다 4.5초 앞선 채 겹쳐 재생됐다. bag은 시계가 하나뿐이라
+          옮기는 순간 드러났다.</p>
+       </div>
+      </section>
+    </div>
+
+    <section class="pane tlpane">
+      <div class="phead">
+        <p class="eyebrow">타임라인 · 물체 높이</p>
+        <span class="legend">
+          <i style="background:#0E7490"></i>물체
+          <i style="background:#9FB4BD"></i>죠
+          <i class="dash"></i>통 벽 상단 90mm
+        </span>
+        <span class="tnow num" id="tnow"></span>
+      </div>
+      <div class="tllab" id="tllab" aria-hidden="true"></div>
+      <div style="position:relative">
+        <div class="tl" id="tl"></div>
+        <div class="cursor" id="cur1"></div>
+      </div>
+      <div class="band"><span class="lbl">물체</span>
+        <div class="btrack" id="bandCube"></div></div>
+      <div class="band"><span class="lbl">쥔 힘</span>
+        <div class="btrack" id="bandLoad"></div></div>
+      <div style="position:relative;flex:1;min-height:0">
+        <svg class="spark" id="spark" role="img"
+             aria-label="죠 높이와 물체 높이의 시계열"></svg>
+        <div class="cursor" id="cur2"></div>
+      </div>
+      <div class="ctrl">
+        <button class="playbtn" id="play" aria-label="재생">▶</button>
+        <input type="range" id="scrub" min="0" max="0" value="0" step="0.02"
+               aria-label="시행 시점 스크럽">
+        <div class="vbtns" id="speed"></div>
+      </div>
+    </section>
+  </div>
+
+</div>
+
+<script>
+const RUNS = /*__RUNS__*/;
+const CHAIN = /*__CHAIN__*/;
+const RUNFRAMES = /*__FRAMES__*/;
+// 인박스 전량의 요약 — 화면에 세운 7시행 밖에서 무엇이 쌓였나. 프레임은 안 들어 있다.
+const TREND = /*__TREND__*/;
+const TRASH_DEF = [0.15, 0.62], OPEN_HALF = 0.068, WALL_TOP = 0.090;
+const JOINTS = [
+  ['shoulder_pan',  -1.91986, 1.91986],
+  ['shoulder_lift', -1.74533, 1.74533],
+  ['elbow_flex',    -1.69,    1.69],
+  ['wrist_flex',    -1.65806, 1.65806],
+  ['wrist_roll',    -2.74385, 2.84121],
+];
+const STAGE_COLOR = {
+  '시작':'#94A3B8', '접근 종료':'#0E7490', '정렬 종료':'#0891B2', '파지 종료':'#15803D',
+  '들기':'#16A34A', '들기 종료':'#0F766E', '선회':'#0369A1', '하강':'#C2740A',
+  '개구부 위':'#D97706', '통 도착':'#B45309', '투입 종료':'#7C3AED',
+  '투입 실패':'#B91C1C', '종료':'#64748B',
+};
+const CSTATE = {
+  none:    {ko:'기록 없음', c:'#C3CCD2', cls:'cs-none'},
+  ground:  {ko:'바닥',     c:'#94A3B8', cls:'cs-ground'},
+  injaw:   {ko:'죠 안',    c:'#B45309', cls:'cs-injaw'},
+  gripped: {ko:'물림',     c:'#0F766E', cls:'cs-gripped'},
+  lifted:  {ko:'들림',     c:'#15803D', cls:'cs-lifted'},
+  released:{ko:'놓음',     c:'#7C3AED', cls:'cs-released'},
+  dropped: {ko:'놓침',     c:'#B91C1C', cls:'cs-dropped'},
+};
+const NEAR_R = 0.06, NEAR_Z = 0.05, LIFT_UP = 0.03, LOAD_MIN = 1.0;
+
+let cur = 0, at = 0, tNow = 0, F = null, playing = false, raf = null, speedIdx = 1;
+// 시행 길이가 65초에서 416초까지 벌어진다. 실시간으로 틀면 긴 시행은 7분이라
+// 아무도 끝까지 안 본다 — **전체를 몇 초에 볼지**로 잡는다.
+const SPEEDS = [{ko:'느리게', sec:45}, {ko:'보통', sec:22}, {ko:'빠르게', sec:10}];
+const el = id => document.getElementById(id);
+const fmt = (v, n=2) => (v===null||v===undefined||Number.isNaN(v)) ? '—' : Number(v).toFixed(n);
+const hyp = (a,b) => Math.hypot(a,b);
+const trashOf = r => r.trash || TRASH_DEF;
+/** 통을 로봇 base 좌표로. 3D 뷰는 base 기준이라 world 좌표를 그대로 못 쓴다.
+ *  주행 시행은 **차체 yaw 실측이 없어**(오도메트리가 1.6rad 어긋나 있다) 회전을 풀 수
+ *  없으므로 그리지 않는다 — 틀린 자리에 통을 그리느니 안 그리는 편이 낫다.
+ *  평면도는 world 좌표를 그대로 쓰므로 주행 시행에서도 통이 보인다. */
+function trashBase(r, s){
+  if (r.kind !== '팔 단독' || !s || !s.robot) return null;
+  const t = trashOf(r);
+  return [t[0] - s.robot[0], t[1] - s.robot[1]];
+}
+
+/* ── 행렬 · 정기구학 ────────────────────────
+   URDF의 관절 원점·rpy를 그대로 곱해 링크 위치를 낸다. 모든 관절 축이 (0,0,1)이라
+   회전은 z축 하나로 끝난다 — kinematics.py와 0.002mm로 일치함을 빌드 전에 대조했다. */
+const M = {
+  ident: () => [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1],
+  mul(a, b){
+    const o = new Array(16);
+    for (let r = 0; r < 4; r++) for (let c = 0; c < 4; c++){
+      let s = 0;
+      for (let k = 0; k < 4; k++) s += a[r*4+k] * b[k*4+c];
+      o[r*4+c] = s;
+    }
+    return o;
+  },
+  fromRpyXyz(xyz, rpy){
+    const [r,p,y] = rpy;
+    const cr=Math.cos(r), sr=Math.sin(r), cp=Math.cos(p), sp=Math.sin(p),
+          cy=Math.cos(y), sy=Math.sin(y);
+    return [cy*cp, cy*sp*sr-sy*cr, cy*sp*cr+sy*sr, xyz[0],
+            sy*cp, sy*sp*sr+cy*cr, sy*sp*cr-cy*sr, xyz[1],
+            -sp,   cp*sr,          cp*cr,          xyz[2],
+            0,0,0,1];
+  },
+  rotZ(q){
+    const c = Math.cos(q), s = Math.sin(q);
+    return [c,-s,0,0,  s,c,0,0,  0,0,1,0,  0,0,0,1];
+  },
+  pos: T => [T[3], T[7], T[11]],
+  col: (T,k) => [T[k], T[4+k], T[8+k]],
+};
+const BY = Object.fromEntries(CHAIN.map(j => [j.name, j]));
+const ARM_ORDER = ['base_joint','arm_riser_joint','arm_mount_joint','arm_shoulder_pan',
+  'arm_shoulder_lift','arm_elbow_flex','arm_wrist_flex','arm_wrist_roll','arm_gripper_frame_joint'];
+
+/** 관절각 q(5) → 체인 각 지점 + 그리퍼 링크 변환. */
+function fkPoints(q){
+  let T = M.ident(), qi = 0, Tgrip = null;
+  const pts = [{name:'base', p:[0,0,0]}];
+  for (const nm of ARM_ORDER){
+    const j = BY[nm]; if (!j) continue;
+    T = M.mul(T, M.fromRpyXyz(j.xyz, j.rpy));
+    if (j.type === 'revolute'){ T = M.mul(T, M.rotZ(q[qi] ?? 0)); qi++; }
+    if (j.name === 'arm_wrist_roll') Tgrip = T;      // arm_gripper_link
+    pts.push({name: j.child || nm, p: M.pos(T), joint: j.type === 'revolute' ? nm : null});
+  }
+  return {pts, Tgrip};
+}
+function fixedPoints(){
+  let T = M.mul(M.ident(), M.fromRpyXyz(BY['base_joint'].xyz, BY['base_joint'].rpy));
+  const mast = M.mul(T, M.fromRpyXyz(BY['rgbd_mast_joint'].xyz, BY['rgbd_mast_joint'].rpy));
+  const cam  = M.mul(mast, M.fromRpyXyz(BY['rgbd_camera_joint'].xyz, BY['rgbd_camera_joint'].rpy));
+  const lidar= M.mul(T, M.fromRpyXyz(BY['laser_joint'].xyz, BY['laser_joint'].rpy));
+  return {cam: M.pos(cam), lidar: M.pos(lidar), base: M.pos(T)};
+}
+
+/* ── 그리퍼 기하 ────────────────────────────
+   손가락 패드의 실제 좌표를 FK로 옮겨 **끝 패드 사이 여유 간격**을 낸다.
+   각도(rad)는 크기를 말해 주지 않지만 이 간격은 mm라 물체 크기와 바로 견줄 수 있다. */
+const PAD_F = ['fixed_finger_base','fixed_finger_mid','fixed_finger_tip'];
+const PAD_M = ['moving_finger_base','moving_finger_mid','moving_finger_tip'];
+
+function jawGeom(ga, Tgrip){
+  const T = Tgrip || M.ident();
+  const Tj = M.mul(T, M.mul(M.fromRpyXyz(BY['arm_gripper'].xyz, BY['arm_gripper'].rpy), M.rotZ(ga)));
+  const fixed = PAD_F.map(n => M.mul(T,  M.fromRpyXyz(BY[n].xyz, BY[n].rpy)));
+  const mov   = PAD_M.map(n => M.mul(Tj, M.fromRpyXyz(BY[n].xyz, BY[n].rpy)));
+  // 두 상자를 잇는 방향으로 각자의 반지름을 투영해 뺀다(지지함수).
+  const Tf = fixed[2], Tm = mov[2];
+  const pf = M.pos(Tf), pm = M.pos(Tm);
+  const d = [pm[0]-pf[0], pm[1]-pf[1], pm[2]-pf[2]];
+  const L = Math.hypot(d[0], d[1], d[2]);
+  const u = L > 1e-9 ? d.map(v => v/L) : [1,0,0];
+  const sup = (T, size) => [0,1,2].reduce((s,k) => {
+    const c = M.col(T,k);
+    return s + Math.abs(c[0]*u[0] + c[1]*u[1] + c[2]*u[2]) * size[k]/2;
+  }, 0);
+  const gap = L - sup(Tf, BY['fixed_finger_tip'].size) - sup(Tm, BY['moving_finger_tip'].size);
+  return {
+    fixed: fixed.map(M.pos), mov: mov.map(M.pos),
+    tipF: pf, tipM: pm, gap,
+    mid: [(pf[0]+pm[0])/2, (pf[1]+pm[1])/2, (pf[2]+pm[2])/2],
+  };
+}
+
+/* ── 물체 상태 ──────────────────────────────
+   로그가 스스로 붙인 판정을 믿지 않고 좌표에서 다시 센다. 죠와 물체의 반경 차는
+   차체 yaw와 무관해(회전 불변) 오도메트리가 어긋나 있어도 쓸 수 있다. */
+function cubeStates(r){
+  const first = r.steps.find(s => s.cube);
+  const rest = first ? first.cube[2] : 0.02;
+  // 차체 좌표는 gz 조회라 이따금 한 표본이 비는데, 그건 로봇이 사라진 것이 아니라
+  // **측정이 빠진 것**이다. 그대로 두면 운반 한복판에 '기록 없음'이 한 칸 뚫려
+  // 고장처럼 보인다. 시간상 가장 가까운 표본으로 메운다.
+  const rob = r.steps.map(s => s.robot);
+  rob.forEach((v, i) => {
+    if (v) return;
+    for (let d = 1; d < rob.length; d++){
+      if (rob[i-d]) { rob[i] = rob[i-d]; return; }
+      if (r.steps[i+d] && r.steps[i+d].robot) { rob[i] = r.steps[i+d].robot; return; }
+    }
+  });
+  const out = [];
+  let prev = null;
+  r.steps.forEach((s, i) => {
+    let st;
+    if (!s.cube || !s.jaw || !rob[i]){ st = 'none'; }
+    else {
+      const rc = hyp(s.cube[0]-rob[i][0], s.cube[1]-rob[i][1]);
+      const rj = hyp(s.jaw[0], s.jaw[1]);
+      const near = Math.abs(rc - rj) < NEAR_R && Math.abs(s.cube[2] - s.jaw[2]) < NEAR_Z;
+      const up   = s.cube[2] > rest + LIFT_UP;
+      // 들림의 근거는 **좌표**다 — 물체가 죠와 함께 바닥을 떠나 있으면 들린 것이다.
+      // 부하는 뒷받침일 뿐이라 판정에 넣지 않는다. 넣었더니 운반 중 부하가 한 표본
+      // 끊긴 자리(#A2 t=74.1, 부하 -0.41)가 '죠 안'으로 튀어 띠가 깜빡였다.
+      if (near && up)        st = 'lifted';
+      else if (near && Math.abs(s.gl) > LOAD_MIN) st = 'gripped';
+      else if (near)         st = 'injaw';
+      else if (prev === 'lifted' || prev === 'gripped')
+        st = /투입|개구부/.test(s.stage || '') ? 'released' : 'dropped';
+      else st = 'ground';
+    }
+    out.push(st);
+    if (st !== 'none') prev = st;
+  });
+  return {states: out, rest};
+}
+/** 사람이 읽을 한 줄 — 어디서 갈렸나. */
+function cubeStory(r, states){
+  const trash = trashOf(r);
+  const iLift = states.indexOf('lifted');
+  const iDrop = states.indexOf('dropped');
+  const iRel  = states.indexOf('released');
+  if (iDrop >= 0){
+    const s = r.steps[iDrop];
+    return {kind:'dropped', t:s.t, stage:s.stage,
+            msg:`<b>${fmt(s.t,1)}s · ${s.stage}</b>에서 물체가 죠를 벗어났다 — 운반 중 낙하다.`};
+  }
+  if (iLift < 0) return {kind:'nolift', msg:'물체가 한 번도 바닥을 떠나지 않았다.'};
+  if (iRel >= 0){
+    let last = -1;
+    for (let i = 0; i < states.length; i++) if (states[i] === 'lifted') last = i;
+    const s = r.steps[last];
+    const d = hyp(s.cube[0]-trash[0], s.cube[1]-trash[1]) * 1000;
+    const over = d - OPEN_HALF*1000;
+    return {kind: over > 0 ? 'offtarget' : 'ontarget', d, over, t:s.t,
+      msg: over > 0
+        ? `놓기 직전 물체는 통 중심에서 <b>${d.toFixed(0)}mm</b> — 개구부 반폭 68mm보다
+           <b>${over.toFixed(0)}mm 밖</b>이다. 놓는 동작이 아니라 <b>자리</b>가 틀렸다.`
+        : `놓기 직전 물체는 통 중심에서 <b>${d.toFixed(0)}mm</b>로 개구부 안이었다
+           (반폭 68mm).`};
+  }
+  return {kind:'held', msg:'들린 채로 기록이 끝났다.'};
+}
+
+/* ── 보간 ───────────────────────────────────
+   기록은 단계 경계에서만 남는다(수 초 간격). 그 값만 툭툭 갈아 끼우면 팔이 순간이동해
+   무엇이 어디로 움직였는지 눈이 못 따라간다. 사이를 이어 그리되, **이어 그린 구간은
+   기록이 아니라 보간**이라는 것을 시각 옆에 표시한다.
+   각도·좌표 같은 연속량만 잇고, 단계·판정 같은 이름표는 앞 계단 것을 그대로 쓴다. */
+const ease = u => u * u * (3 - 2 * u);          // smoothstep — 계단 경계에서 속도가 0
+const lerp = (a, b, u) => a + (b - a) * u;
+const lerpArr = (a, b, u) => (a && b) ? a.map((v, i) => lerp(v, b[i], u)) : (a || b);
+
+function idxAt(r, t){
+  let i = 0;
+  for (let k = 0; k < r.steps.length; k++) if (r.steps[k].t <= t + 1e-9) i = k;
+  return i;
+}
+function frameAt(r, t){
+  const i = idxAt(r, t), a = r.steps[i], b = r.steps[i + 1];
+  if (!b) return {...a, i, u: 0, t: a.t};
+  const span = Math.max(b.t - a.t, 1e-6);
+  const u = ease(Math.min(1, Math.max(0, (t - a.t) / span)));
+  const num = (k) => (a[k] === null || b[k] === null) ? a[k] : lerp(a[k], b[k], u);
+  return {
+    ...a, i, u, t,
+    q: a.q.map((v, k) => lerp(v, b.q[k], u)),
+    ga: num('ga'), gl: num('gl'),
+    jaw: lerpArr(a.jaw, b.jaw, u),
+    cube: lerpArr(a.cube, b.cube, u),
+    robot: lerpArr(a.robot, b.robot, u),
+  };
+}
+function seek(t){
+  const r = RUNS[cur];
+  tNow = Math.max(0, Math.min(r.dur || 0, t));
+  F = frameAt(r, tNow);
+  at = F.i;
+}
+
+/** 시행 하나의 결과. 라벨은 칩에 그대로 찍히므로 **짧고 그 자체로 읽히는 말**이어야
+    한다 — 예전 라벨 "팔 단독 통 안"은 둘 다 이 프로젝트 안에서만 통하는 말이었다. */
+function status(r){
+  if (r.truth === true)  return {k:'pass',  label:'성공',       pill:'ok'};
+  if (r.truth === false && r.claim === 'PICK_SUCCESS')
+                         return {k:'mismatch', label:'거짓 성공', pill:'crit'};
+  if (r.truth === false) return {k:'fail',  label:'실패',       pill:'warn'};
+  return {k:'unknown', label:'판정 불가', pill:'mute'};
+}
+
+/* ── 상단 시행 선택 ─────────────────────── */
+function drawRuns(){
+  const host = el('runsel'); host.innerHTML = '';
+  RUNS.forEach((r, i) => {
+    const s = status(r);
+    const b = document.createElement('button');
+    b.className = 'chip';
+    b.setAttribute('aria-pressed', i === cur ? 'true' : 'false');
+    b.title = `${KIND_NOTE[r.kind] || r.kind} — 실좌표 판정 ${s.label}`;
+    b.innerHTML = `<span class="led ${s.pill}"></span><span class="id">#${r.id}</span>
+                   <span class="kind">${r.kind || ''}</span><b>${s.label}</b>`;
+    b.onclick = () => { cur = i; stop(); seek(0); renderAll(); };
+    host.appendChild(b);
+  });
+}
+
+/* ── 판정 줄 ───────────────────────────── */
+function drawVerdict(){
+  const r = RUNS[cur], s = status(r);
+  const {states} = cubeStates(r);
+  const story = cubeStory(r, states);
+  let title, body;
+  if (s.k === 'mismatch'){
+    title = '로그는 성공, 실좌표는 통 밖';
+    body = `코드가 <b>PICK_SUCCESS</b>를 찍었지만 물체는 통 중심에서 <b>${r.dist}mm</b>다. ${story.msg}`;
+  } else if (s.k === 'pass'){
+    title = '통 안에 들어갔다';
+    body = `물체가 통 중심에서 <b>${r.dist}mm</b>, 높이 <b>${fmt(r.cube[2]*1000,0)}mm</b>로
+            개구부 안에 안착했다. ${story.msg}`;
+  } else if (s.k === 'fail'){
+    title = `실패 — 통에서 ${r.dist}mm`;
+    body = story.msg;
+  } else {
+    title = '실좌표가 없어 판정할 수 없다';
+    body = `코드 주장은 <b>${r.claim || '없음'}</b>지만 물체 좌표가 기록되지 않았다.`;
+  }
+  el('verdict').innerHTML = `<div class="vbar ${s.k}">
+      <div class="vstripe"></div>
+      <div class="vtitle">${title}</div>
+      <div class="vbody">${body}</div>
+      <div class="vnum"><div class="big">${r.dist ?? '—'}</div><div class="cap">통까지 mm</div></div>
+    </div>`;
+}
+
+/* ── 물체 상태 배지 ─────────────────────── */
+function drawCubeState(){
+  const r = RUNS[cur], s = F;
+  const {states, rest} = cubeStates(r);
+  const st = states[at], meta = CSTATE[st];
+  const trash = trashOf(r);
+  let sub;
+  if (!s.cube) sub = '물체 좌표가 이 시점에 기록되지 않았다';
+  else {
+    const h = (s.cube[2] - rest) * 1000;
+    const d = hyp(s.cube[0]-trash[0], s.cube[1]-trash[1]) * 1000;
+    sub = `바닥 대비 ${h >= 0 ? '+' : ''}${h.toFixed(0)}mm · 통까지 ${d.toFixed(0)}mm`;
+  }
+  el('cstate').innerHTML = `<div class="cstate ${meta.cls}">
+      <div><div class="big">${meta.ko}</div><div class="sm">${sub}</div></div></div>`;
+}
+
+/* ── 그리퍼 게이지 ─────────────────────── */
+function drawGrip(){
+  const r = RUNS[cur], s = F;
+  const {Tgrip} = fkPoints(s.q);
+  const g = jawGeom(s.ga, Tgrip);
+  const mm = g.gap * 1000;
+  const SPAN = 100;                       // 게이지 상한 mm
+  const pct = v => Math.max(0, Math.min(100, (v / SPAN) * 100));
+  const cube = (r.cube_size || 0.04) * 1000;
+  const lo = jawGeom(0.32, Tgrip).gap * 1000, hi = jawGeom(0.55, Tgrip).gap * 1000;
+  const cls = mm < 2 ? 'crit' : (Math.abs(mm - cube) < 8 ? 'ok' : 'warn');
+  el('gg').innerHTML = `
+    <div class="ggtop"><span class="mlbl">그리퍼 벌어짐</span>
+      <span class="ggval mval ${cls}">${mm.toFixed(0)}<span style="font-size:11px">mm</span></span></div>
+    <div class="ggtrack">
+      <div class="ggband" style="left:${pct(lo)}%;width:${pct(hi)-pct(lo)}%"></div>
+      <div class="ggfill" style="width:${pct(mm)}%"></div>
+      <div class="ggcube" style="left:${pct(cube)}%"></div>
+    </div>
+    <div class="ggscale"><span>0</span><span>물체 ${cube.toFixed(0)}mm</span><span>${SPAN}</span></div>
+    <div class="metric" style="margin-top:5px"><span class="mlbl">물림각</span>
+      <span class="mval">${fmt(s.ga,3)} rad</span></div>
+    <div class="metric"><span class="mlbl">쥔 힘</span>
+      <span class="mval ${Math.abs(s.gl)>LOAD_MIN?'ok':'crit'}">${fmt(s.gl,2)}</span></div>`;
+}
+
+/* ── 관절 ─────────────────────────────── */
+function drawJoints(){
+  const s = F, host = el('joints');
+  host.innerHTML = '<p class="eyebrow" style="margin:6px 0 2px">관절</p>';
+  JOINTS.forEach(([name, lo, hi], i) => {
+    const v = s.q[i] ?? 0;
+    const span = hi - lo, zero = ((0 - lo) / span) * 100, pos = ((v - lo) / span) * 100;
+    const near = (v - lo) < span*0.03 || (hi - v) < span*0.03;
+    const left = Math.min(zero, pos), w = Math.abs(pos - zero);
+    const row = document.createElement('div'); row.className = 'jrow';
+    row.innerHTML = `<span class="jname">${name}</span>
+      <span class="jbar"><span class="jzero" style="left:${zero}%"></span>
+        <span class="jfill${near ? ' near' : ''}" style="left:${left}%;width:${w}%"></span></span>
+      <span class="jval">${fmt(v,3)}</span>`;
+    host.appendChild(row);
+  });
+}
+
+/* ── 신호 카드 ─────────────────────────── */
+function drawMetrics(){
+  const r = RUNS[cur], s = F;
+  const rows = [['단계', s.stage || '—', ''],
+                ['시각', fmt(s.t,1) + 's' + (s.u > 0.01 ? ' ·보간' : ''), '']];
+  if (s.jaw) rows.push(['죠 높이', fmt(s.jaw[2]*1000,0)+'mm', s.jaw[2] > 0.12 ? 'ok' : '']);
+  if (s.jaw) rows.push(['죠 반경', fmt(hyp(s.jaw[0],s.jaw[1])*1000,0)+'mm', '']);
+  if (r.kind !== '팔 단독' && s.odom)
+    rows.push(['주행', fmt(s.odom[0],2)+' · '+fmt(s.odom[1],2), '']);
+  if (s.er !== undefined && s.er !== null)
+    rows.push(['접근 오차', s.er+'mm', Math.abs(s.er) < 25 ? 'ok' : 'warn']);
+  if (s.verdict) rows.push(['코드 판정', s.verdict, '']);
+  el('metrics').innerHTML = rows.map(([k,v,c]) =>
+    `<div class="metric"><span class="mlbl">${k}</span><span class="mval ${c}">${v}</span></div>`).join('');
+}
+
+/* ── 타임라인 ────────────────────────────
+   단계 띠·상태 띠·높이 곡선은 **시행이 바뀔 때만** 다시 짓는다. 재생 중에 매 프레임
+   다시 지으면(칩·띠·SVG 문자열까지) 그 비용 때문에 프레임이 떨어진다 — 실제로
+   떨어졌다. 매 프레임 움직이는 것은 커서와 숫자뿐이다. */
+/** 단계 이름 → 국면. `들기`와 `들기 종료`는 같은 국면이다 — 끝 표시일 뿐이라
+    이름 줄에서는 묶고, 색 칸과 툴팁에는 원래 이름을 그대로 남긴다. */
+function phaseOf(stage){
+  return (stage !== '종료' && stage.endsWith(' 종료')) ? stage.slice(0, -3) : stage;
+}
+
+/* 단계 이름(정렬·파지·선회·하강·투입)은 이 분야에서 쓰는 말 그대로 둔다.
+   풀어 쓸 것은 **이 프로젝트 안에서만 통하던 약어**다 — 칩에 "팔 단독 통 안"이라고
+   찍혀 있으면 실험 종류와 판정 결과가 한 덩어리로 붙어 아무것도 안 읽힌다. */
+const KIND_NOTE = {
+  '팔 단독': '차체를 세워 두고 팔만 움직인 시행',
+  '주행': '차체가 이동해 다가간 뒤 집는 시행',
+};
+
+function drawTracks(){
+  const r = RUNS[cur], total = r.dur || 1;
+  const tl = el('tl'); tl.innerHTML = '';
+  const marks = r.steps.map((s,i) => ({...s, i})).filter(s => s.stage);
+
+  // 이름 줄에 쓸 국면 묶음. 이어지는 같은 국면은 하나로 합친다.
+  const phases = [];
+  marks.forEach(m => {
+    const p = phaseOf(m.stage), last = phases[phases.length - 1];
+    if (last && last.name === p) { last.hi = m.i; last.n++; }
+    else phases.push({name: p, t: m.t, lo: m.i, hi: m.i, n: 1});
+  });
+
+  marks.forEach((m, k) => {
+    const next = marks[k+1] ? marks[k+1].t : total;
+    const d = document.createElement('div');
+    d.className = 'tlseg' + (marks[k+1] && phaseOf(marks[k+1].stage) !== phaseOf(m.stage) ? ' pend' : '');
+    d.style.left = ((m.t / total) * 100) + '%';
+    d.style.width = (((next - m.t) / total) * 100) + '%';
+    d.style.background = STAGE_COLOR[m.stage] || '#94A3B8';
+    d.dataset.i = String(m.i);
+    d.title = `${m.stage} · ${fmt(m.t,1)}s`;
+    d.onclick = () => { stop(); seek(m.t); renderFrame(); };
+    tl.appendChild(d);
+  });
+
+  const lab = el('tllab'); lab.innerHTML = '';
+  phases.forEach(p => {
+    const s = document.createElement('span');
+    s.style.left = ((p.t / total) * 100) + '%';
+    s.textContent = p.name + (p.n > 1 ? ` ×${p.n}` : '');
+    s.title = `${p.name} · ${fmt(p.t,1)}s부터 · 단계 ${p.n}개`;
+    s.dataset.lo = String(p.lo); s.dataset.hi = String(p.hi);
+    s.onclick = () => { stop(); seek(p.t); renderFrame(); };
+    lab.appendChild(s);
+  });
+  // 자리 정리는 글자 수로 어림하지 않고 **실제로 재서** 한다 — 시행마다 국면 길이가
+  // 달라 어림값은 어떤 시행에서든 반드시 틀린다. 순서도 중요하다: 먼저 오른쪽으로
+  // 넘치는 것을 접어 넣고, 그 결과 위치로 겹침을 본다.
+  const kids = Array.from(lab.children), box = lab.getBoundingClientRect();
+  kids.forEach(s => {
+    if (s.getBoundingClientRect().right > box.right) s.classList.add('right');
+  });
+  let edge = -1e9;
+  kids.forEach(s => {
+    const b = s.getBoundingClientRect();
+    if (b.left < edge + 4) { s.classList.add('tick'); return; }
+    edge = b.right;
+  });
+
+  const {states} = cubeStates(r);
+  const band = (host, color) => {
+    host.innerHTML = '';
+    r.steps.forEach((s, i) => {
+      const next = r.steps[i+1] ? r.steps[i+1].t : total;
+      const seg = document.createElement('div');
+      seg.className = 'bseg';
+      // 단계 띠와 같은 좌표계 — 여기도 최소 폭을 주면 아래 띠만 오른쪽으로 밀린다
+      seg.style.left = ((s.t / total) * 100) + '%';
+      seg.style.width = (((next - s.t) / total) * 100) + '%';
+      seg.style.background = color(s, i);
+      seg.title = `${fmt(s.t,1)}s · ${CSTATE[states[i]].ko}`;
+      host.appendChild(seg);
+    });
+  };
+  band(el('bandCube'), (s,i) => CSTATE[states[i]].c);
+  band(el('bandLoad'), s => Math.abs(s.gl) > LOAD_MIN ? '#0F766E' : '#E4E9ED');
+
+  drawSpark();
+  const sc = el('scrub');
+  sc.min = '0'; sc.step = '0.02';
+  sc.max = String(total);
+  sc.oninput = e => { stop(); seek(+e.target.value); renderFrame(); };
+}
+
+/** 매 프레임 — 커서·시계·슬라이더만 만진다. */
+function updateCursor(){
+  const total = RUNS[cur].dur || 1;
+  const pos = (tNow / total) * 100;
+  el('cur1').style.left = pos + '%';
+  el('cur2').style.left = pos + '%';
+  el('tnow').textContent = `${fmt(tNow,1)}s / ${fmt(total,1)}s`;
+  const sc = el('scrub');
+  if (document.activeElement !== sc) sc.value = String(tNow);
+  Array.from(el('tl').children).forEach((d, k) => {
+    d.style.opacity = (+d.dataset.i === at) ? '1' : '.7';
+  });
+  Array.from(el('tllab').children).forEach(s => {
+    s.classList.toggle('on', at >= +s.dataset.lo && at <= +s.dataset.hi);
+  });
+}
+
+/** 죠 높이와 물체 높이를 겹쳐 그린다 — 두 선이 갈라지는 곳이 물체를 놓은 지점이다. */
+function drawSpark(){
+  const r = RUNS[cur], total = r.dur || 1;
+  // viewBox를 실제 픽셀 크기에 맞춘다. 고정 비율에 preserveAspectRatio="none"을 쓰면
+  // 선은 늘어나도 되지만 **글자가 함께 눌려** 읽을 수 없게 된다.
+  const box = el('spark');
+  const W = Math.max(box.clientWidth || 900, 200), H = Math.max(box.clientHeight || 60, 46);
+  const PAD = 5;
+  const zs = r.steps.flatMap(s => [s.jaw ? s.jaw[2] : null, s.cube ? s.cube[2] : null])
+                    .filter(v => v !== null);
+  const zmax = Math.max(0.22, ...zs), zmin = 0;
+  const X = t => (t / total) * W;
+  const Y = z => H - PAD - ((z - zmin) / (zmax - zmin)) * (H - PAD*2);
+  const line = pick => {
+    const pts = r.steps.map(s => [X(s.t), pick(s)]).filter(p => p[1] !== null);
+    return pts.map(p => `${p[0].toFixed(1)},${Y(p[1]).toFixed(1)}`).join(' ');
+  };
+  const jawL  = line(s => s.jaw ? s.jaw[2] : null);
+  const cubeL = line(s => s.cube ? s.cube[2] : null);
+  const {states} = cubeStates(r);
+  let marks = '';
+  states.forEach((st, i) => {
+    if (st !== 'dropped' && st !== 'released') return;
+    const s = r.steps[i]; if (!s.cube) return;
+    marks += `<circle cx="${X(s.t).toFixed(1)}" cy="${Y(s.cube[2]).toFixed(1)}" r="4"
+              fill="${CSTATE[st].c}" stroke="#fff" stroke-width="1.5"/>`;
+  });
+  box.setAttribute('viewBox', `0 0 ${W} ${H}`);
+  box.innerHTML = `
+    <line x1="0" y1="${Y(WALL_TOP)}" x2="${W}" y2="${Y(WALL_TOP)}"
+          stroke="#D8A15E" stroke-width="1" stroke-dasharray="5 4"/>
+    <polyline points="${jawL}" fill="none" stroke="#9FB4BD" stroke-width="2"/>
+    <polyline points="${cubeL}" fill="none" stroke="#0E7490" stroke-width="2.5"/>
+    ${marks}`;
+}
+
+/* ── 3D 뷰 ─────────────────────────────── */
+const VIEWS = {
+  '비스듬': {az: -0.62, el: 0.34},
+  '정면':   {az: 0.0,   el: 0.12},
+  '옆':     {az: -1.5708, el: 0.12},
+  '위':     {az: -0.62, el: 1.30},
+  '죠':     {az: -0.62, el: 0.34, zoom: 'jaw'},
+};
+let viewName = '비스듬';
+
+function proj(p){
+  const {az, el} = VIEWS[viewName];
+  const ca = Math.cos(az), sa = Math.sin(az), ce = Math.cos(el), se = Math.sin(el);
+  const x =  p[0]*ca + p[1]*sa;
+  const y = -p[0]*sa + p[1]*ca;
+  return [x, y*se + p[2]*ce];
+}
+
+function drawRobot(){
+  const cv = el('rob'), box = cv.parentElement;
+  const W = box.clientWidth, H = box.clientHeight;
+  if (!W || !H) return;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  cv.width = W*dpr; cv.height = H*dpr;
+  const g = cv.getContext('2d');
+  g.setTransform(dpr,0,0,dpr,0,0);
+  g.clearRect(0,0,W,H);
+
+  const r = RUNS[cur], s = F;
+  const {pts, Tgrip} = fkPoints(s.q);
+  const jg = jawGeom(s.ga, Tgrip);
+  const fx = fixedPoints();
+  const {states} = cubeStates(r);
+  const st = states[at];
+  const cubeSize = r.cube_size || 0.04;
+
+  // 그릴 것을 다 모아 화면에 맞춘다 — 시점을 바꿔도 잘리지 않는다
+  const grid = [];
+  for (let i = -2; i <= 5; i++){ grid.push([i*0.1,-0.25,0],[i*0.1,0.25,0],[-0.05,i*0.1,0],[0.48,i*0.1,0]); }
+  // 화면을 채울 기준은 **팔과 죠**다. 바닥 격자와 도달링은 배경이라 여기에 넣으면
+  // 프레임만 넓어지고 정작 봐야 할 팔이 작아진다 — 배경은 잘려도 된다.
+  const body = [[0.03,-0.16,0],[0.27,-0.16,0],[0.27,0.16,0],[0.03,0.16,0]];
+  const all = viewName === '죠'
+    ? [...jg.fixed, ...jg.mov, pts[pts.length-1].p, pts[pts.length-2].p]
+    : [...pts.map(p => p.p), ...jg.fixed, ...jg.mov, ...body];
+  const pp = all.map(proj);
+  const xs = pp.map(p => p[0]), ys = pp.map(p => p[1]);
+  const bx0 = Math.min(...xs), bx1 = Math.max(...xs);
+  const by0 = Math.min(...ys), by1 = Math.max(...ys);
+  const pad = 26;
+  const S = Math.min((W-pad*2)/Math.max(bx1-bx0, 1e-3), (H-pad*2)/Math.max(by1-by0, 1e-3));
+  const cx = (bx0+bx1)/2, cy = (by0+by1)/2;
+  const P = p => { const q = proj(p); return [W/2 + (q[0]-cx)*S, H/2 - (q[1]-cy)*S]; };
+
+  if (viewName !== '죠'){
+    g.strokeStyle = '#E4EAED'; g.lineWidth = 1;
+    for (let i = -2; i <= 5; i++){
+      let a = P([i*0.1,-0.25,0]), b = P([i*0.1,0.25,0]);
+      g.beginPath(); g.moveTo(a[0],a[1]); g.lineTo(b[0],b[1]); g.stroke();
+      a = P([-0.05,i*0.1,0]); b = P([0.48,i*0.1,0]);
+      g.beginPath(); g.moveTo(a[0],a[1]); g.lineTo(b[0],b[1]); g.stroke();
+    }
+    // 정면 최대 도달 (실측 0.545m). 비스듬 시점에서는 프레임 밖으로 뻗어 화면만
+    // 비우므로 위에서 볼 때만 그린다.
+    if (viewName === '위'){
+    g.strokeStyle = '#CFDCE2'; g.setLineDash([4,4]);
+    g.beginPath();
+    for (let k = 0; k <= 64; k++){
+      const th = -Math.PI/2 + Math.PI*k/64;
+      const p = P([0.1588 + 0.545*Math.cos(th), 0.545*Math.sin(th), 0]);
+      k ? g.lineTo(p[0],p[1]) : g.moveTo(p[0],p[1]);
+    }
+    g.stroke(); g.setLineDash([]);
+    }
+
+    const chassis = body.map(P);
+    g.fillStyle = 'rgba(14,116,144,.06)'; g.strokeStyle = '#C4D6DC'; g.lineWidth = 1.2;
+    g.beginPath(); chassis.forEach((p,i) => i ? g.lineTo(p[0],p[1]) : g.moveTo(p[0],p[1]));
+    g.closePath(); g.fill(); g.stroke();
+
+    // 통. 팔이 어디로 뻗고 있는지는 통이 같이 보여야 읽힌다.
+    const tb = trashBase(r, s);
+    if (tb){
+      const [tx, ty] = tb, h = WALL_TOP, a = OPEN_HALF;
+      const corner = (sx, sy, z) => [tx + sx*a, ty + sy*a, z];
+      const sq = z => [corner(-1,-1,z), corner(1,-1,z), corner(1,1,z), corner(-1,1,z)].map(P);
+      const lo = sq(0), hi = sq(h);
+      g.strokeStyle = '#D9A063'; g.lineWidth = 1.2;
+      [lo, hi].forEach(ring => {
+        g.beginPath(); ring.forEach((p,i) => i ? g.lineTo(p[0],p[1]) : g.moveTo(p[0],p[1]));
+        g.closePath(); g.stroke();
+      });
+      for (let i = 0; i < 4; i++){
+        g.beginPath(); g.moveTo(lo[i][0], lo[i][1]); g.lineTo(hi[i][0], hi[i][1]); g.stroke();
+      }
+      // 개구부만 채운다 — 판정 기준이 "이 네모 안이고 이 높이보다 낮은가"라서다
+      g.fillStyle = 'rgba(180,83,9,.10)';
+      g.beginPath(); hi.forEach((p,i) => i ? g.lineTo(p[0],p[1]) : g.moveTo(p[0],p[1]));
+      g.closePath(); g.fill();
+      const lab = P([tx, ty, h]);
+      g.fillStyle = '#B45309'; g.font = '600 10px ui-monospace,monospace';
+      g.textAlign = 'center'; g.fillText('통', lab[0], lab[1] - 5);
+      g.textAlign = 'left';
+    }
+  }
+
+  // 팔 링크
+  g.lineCap = 'round'; g.lineJoin = 'round';
+  for (let i = 0; i < pts.length-1; i++){
+    const a = P(pts[i].p), b = P(pts[i+1].p);
+    const moving = !!pts[i+1].joint;
+    g.strokeStyle = moving ? '#12171C' : '#B3C3CA';
+    g.lineWidth   = moving ? 6 : 4;
+    g.beginPath(); g.moveTo(a[0],a[1]); g.lineTo(b[0],b[1]); g.stroke();
+  }
+  pts.forEach(pt => {
+    if (!pt.joint) return;
+    const p = P(pt.p);
+    g.fillStyle = '#FFFFFF'; g.strokeStyle = '#0E7490'; g.lineWidth = 2;
+    g.beginPath(); g.arc(p[0],p[1],4,0,7); g.fill(); g.stroke();
+  });
+
+  // 손가락 — 고정 죠와 움직이는 죠. 벌어짐이 그대로 보인다.
+  const held = Math.abs(s.gl) > LOAD_MIN;
+  [[jg.fixed, '#8FA3AB'], [jg.mov, held ? '#15803D' : '#B45309']].forEach(([pads, col]) => {
+    const q = pads.map(P);
+    g.strokeStyle = col; g.lineWidth = 5;
+    g.beginPath(); q.forEach((p,i) => i ? g.lineTo(p[0],p[1]) : g.moveTo(p[0],p[1])); g.stroke();
+    g.fillStyle = col;
+    g.beginPath(); g.arc(q[2][0], q[2][1], 3.4, 0, 7); g.fill();
+  });
+
+  // 물체 — 죠 사이에 있을 때만 그린다. 차체 yaw 실측이 없어 그 밖의 방위는 못 세운다.
+  if (st === 'gripped' || st === 'lifted' || st === 'injaw'){
+    const c = P(jg.mid), h = cubeSize/2 * S;
+    g.fillStyle = st === 'lifted' ? 'rgba(21,128,61,.22)' : 'rgba(180,83,9,.18)';
+    g.strokeStyle = CSTATE[st].c; g.lineWidth = 1.6;
+    g.fillRect(c[0]-h, c[1]-h, h*2, h*2);
+    g.strokeRect(c[0]-h, c[1]-h, h*2, h*2);
+  }
+
+  // 벌어짐 치수선
+  const a2 = P(jg.tipF), b2 = P(jg.tipM);
+  g.strokeStyle = '#12171C'; g.lineWidth = 1; g.setLineDash([2,2]);
+  g.beginPath(); g.moveTo(a2[0],a2[1]); g.lineTo(b2[0],b2[1]); g.stroke(); g.setLineDash([]);
+  g.fillStyle = '#12171C'; g.font = '600 11px ui-monospace,monospace';
+  const away = Math.sign((b2[0]-a2[0]) || 1);
+  g.fillText(`${(jg.gap*1000).toFixed(0)}mm`,
+             (a2[0]+b2[0])/2 + away*16, (a2[1]+b2[1])/2 - 12);
+
+  const tcp = P(pts[pts.length-1].p);
+  g.fillStyle = '#5B6670'; g.font = '10px ui-monospace,monospace';
+  g.fillText(`TCP ${pts[pts.length-1].p.map(v=>v.toFixed(3)).join(', ')}`, tcp[0]+9, tcp[1]+13);
+}
+
+function drawViewBtns(){
+  const host = el('viewbtns'); host.innerHTML = '';
+  Object.keys(VIEWS).forEach(k => {
+    const b = document.createElement('button');
+    b.className = 'vb'; b.textContent = k;
+    b.setAttribute('aria-pressed', k === viewName ? 'true' : 'false');
+    b.onclick = () => { viewName = k; drawRobot(); drawViewBtns(); };
+    host.appendChild(b);
+  });
+}
+
+/* ── 카메라 ─────────────────────────────
+   시행이 도는 **동안** 같은 노드·같은 시계로 녹화한 프레임을 시각으로 잇는다.
+   종전에는 자세가 가장 닮은 스틸을 골라 붙였는데, 관절값이 닮았다고 같은 순간이
+   아니다 — 성공한 시행에 큐브를 놓친 장면이 붙었고, 다섯 장뿐이라 재생도 끊겼다.
+   녹화가 없는 시행(주행 기록에는 카메라가 없다)은 **없다고 말한다.** 비슷한 그림을
+   대신 채우면 화면이 거짓말을 한다. */
+const shown = {front: -1, wrist: -1};
+let shownRun = null;
+
+/** t 이하에서 가장 늦은 프레임의 색인. 없으면 -1. */
+function frameIdx(list, t){
+  let lo = 0, hi = list.length - 1, best = -1;
+  while (lo <= hi){
+    const m = (lo + hi) >> 1;
+    if (list[m].t <= t){ best = m; lo = m + 1; } else hi = m - 1;
+  }
+  return best;
+}
+
+function drawCams(){
+  const r = RUNS[cur];
+  const rec = RUNFRAMES[r.id] || null;
+  if (String(r.id) !== shownRun){ shownRun = String(r.id); shown.front = shown.wrist = -1; }
+
+  ['front', 'wrist'].forEach(cam => {
+    const id = cam === 'front' ? 'camFront' : 'camWrist';
+    const img = el(id), tag = el(cam === 'front' ? 'tagFront' : 'tagWrist');
+    const list = rec && rec[cam];
+    if (!list || !list.length){
+      if (shown[cam] !== -2){
+        shown[cam] = -2;
+        img.removeAttribute('src');
+        img.style.visibility = 'hidden';
+      }
+      tag.className = 'camtag miss';
+      tag.textContent = '이 시행은 영상 없음';
+      return;
+    }
+    const i = Math.max(0, frameIdx(list, tNow));
+    if (i !== shown[cam]){
+      shown[cam] = i;
+      img.src = 'data:image/jpeg;base64,' + list[i].b;
+      img.style.visibility = 'visible';
+    }
+    // 앞뒤 어느 쪽으로든 멀면 표시한다 — 시행 시작 전 장면을 걷어낸 뒤로는 첫 몇
+    // 초에 붙는 프레임이 오히려 미래에서 온다
+    const lag = Math.abs(tNow - list[i].t);
+    tag.className = 'camtag' + (lag > 1.5 ? ' miss' : '');
+    tag.textContent = `${list[i].t.toFixed(1)}s`;
+  });
+
+  const n = rec ? ((rec.front || []).length + (rec.wrist || []).length) : 0;
+  el('camdist').textContent = n ? `${n}장 녹화` : '녹화 없음';
+}
+
+/* ── 재생 ─────────────────────────────────
+   종전에는 setInterval로 0.7초마다 **계단을 갈아 끼웠다.** 기록 간격이 제각각이라
+   화면이 튀었고, 갈아 끼울 때마다 화면 전체를 다시 지어 그 비용까지 얹혔다.
+   여기서는 화면 주사에 맞춰 시간을 흘리고(rAF), 사이는 보간해 잇는다. */
+function stop(){
+  if (raf){ cancelAnimationFrame(raf); raf = null; }
+  playing = false;
+  el('play').textContent = '▶';
+  el('play').setAttribute('aria-label', '재생');
+}
+function play(){
+  if (playing) return;
+  const r = RUNS[cur];
+  if (tNow >= (r.dur || 0) - 1e-3) tNow = 0;      // 끝에서 누르면 처음부터
+  playing = true;
+  el('play').textContent = '❚❚';
+  el('play').setAttribute('aria-label', '일시정지');
+  let last = performance.now();
+  const tick = now => {
+    if (!playing) return;
+    const dt = Math.min((now - last) / 1000, 0.1);  // 탭이 쉬었다 돌아와도 건너뛰지 않는다
+    last = now;
+    const rate = (RUNS[cur].dur || 1) / SPEEDS[speedIdx].sec;
+    seek(tNow + dt * rate);
+    renderFrame();
+    if (tNow >= (RUNS[cur].dur || 0) - 1e-3){ stop(); return; }
+    raf = requestAnimationFrame(tick);
+  };
+  raf = requestAnimationFrame(tick);
+}
+el('play').onclick = () => playing ? stop() : play();
+function drawSpeed(){
+  const host = el('speed'); host.innerHTML = '';
+  SPEEDS.forEach((s, i) => {
+    const b = document.createElement('button');
+    b.className = 'vb'; b.textContent = s.ko;
+    b.title = `전체를 ${s.sec}초에 재생`;
+    b.setAttribute('aria-pressed', i === speedIdx ? 'true' : 'false');
+    b.onclick = () => { speedIdx = i; drawSpeed(); };
+    host.appendChild(b);
+  });
+}
+
+/* ── 분석 페이지 ───────────────────────── */
+function drawSeq(){
+  const r = RUNS[cur], host = el('seq');
+  host.innerHTML = '';
+  const marks = r.steps.map((s,i) => ({...s, i})).filter(s => s.stage);
+  marks.forEach((m, k) => {
+    const b = document.createElement('button');
+    b.className = 'step ' + (m.i < at ? 'done' : (m.i === at ? 'cur' : ''));
+    b.innerHTML = `<span class="dot"></span>
+      <span><span class="nm">${m.stage}</span><br><span class="tm">${fmt(m.t,1)}s</span></span>`;
+    b.onclick = () => { stop(); seek(m.t); renderFrame(); };
+    host.appendChild(b);
+    if (k < marks.length-1){ const c = document.createElement('div'); c.className='conn'; host.appendChild(c); }
+  });
+}
+
+function drawCubeLog(){
+  const r = RUNS[cur], trash = trashOf(r);
+  const {states} = cubeStates(r);
+  let h = `<tr><th>t</th><th>단계</th><th>상태</th><th>높이</th><th>통까지</th></tr>`;
+  let prev = null;
+  r.steps.forEach((s, i) => {
+    const st = states[i];
+    const changed = st !== prev; prev = st;
+    const z = s.cube ? (s.cube[2]*1000).toFixed(0)+'mm' : '—';
+    const d = s.cube ? (hyp(s.cube[0]-trash[0], s.cube[1]-trash[1])*1000).toFixed(0)+'mm' : '—';
+    h += `<tr class="${i === at ? 'hit' : ''}"><td>${fmt(s.t,1)}</td><td>${s.stage || ''}</td>
+          <td style="color:${CSTATE[st].c};font-weight:${changed?700:400}">${CSTATE[st].ko}</td>
+          <td>${z}</td><td>${d}</td></tr>`;
+  });
+  el('cubelog').innerHTML = h;
+  el('cubenote').innerHTML = cubeStory(r, states).msg;
+}
+
+function drawGripTable(){
+  const {Tgrip} = fkPoints(F.q);
+  const rows = [
+    [-0.17, '완전 닫힘 — 빈손'],
+    [0.05,  '25mm 물체 하단'],
+    [0.20,  '25mm 물체 상단'],
+    [0.25,  '<code>GRIPPER_STAGE1</code>'],
+    [0.38,  '4cm 물체 하단'],
+    [0.45,  '4cm 물체 상단'],
+    [0.50,  '<code>GRIPPER_OPEN</code>'],
+    [1.20,  '완전 열림'],
+  ];
+  const gaNow = F.ga;
+  let h = `<tr><th>물림각 rad</th><th>여유 간격</th><th>뜻</th></tr>`;
+  rows.forEach(([a, why]) => {
+    const mm = jawGeom(a, Tgrip).gap * 1000;
+    const hit = Math.abs(a - gaNow) < 0.04;
+    h += `<tr class="${hit ? 'hit' : ''}"><td>${a.toFixed(2)}</td>
+          <td>${mm.toFixed(1)}mm</td><td style="font-family:var(--sans)">${why}</td></tr>`;
+  });
+  h += `<tr class="hit"><td><b>지금 ${gaNow.toFixed(3)}</b></td>
+        <td><b>${(jawGeom(gaNow, Tgrip).gap*1000).toFixed(1)}mm</b></td>
+        <td style="font-family:var(--sans)">스크럽한 시점</td></tr>`;
+  el('griptable').innerHTML = h;
+}
+
+function drawPlan(target){
+  const r = RUNS[cur], s = F, trash = trashOf(r), host = el(target);
+  const VW = 250, VH = Math.max(120, Math.round(VW * (host.clientHeight || 200) /
+                                                 (host.clientWidth || 250)));
+  let X0=-0.25, X1=0.95, Y0=-0.55, Y1=0.95;
+  // 세계 창의 가로세로를 화면 타일과 맞춘다 — 부족한 쪽만 늘린다
+  const want = (X1-X0) / (Y1-Y0), got = VW / VH;
+  if (got > want){ const w = (Y1-Y0)*got, c = (X0+X1)/2; X0 = c-w/2; X1 = c+w/2; }
+  else           { const h = (X1-X0)/got, c = (Y0+Y1)/2; Y0 = c-h/2; Y1 = c+h/2; }
+  const px = x => ((x - X0)/(X1 - X0)) * VW;
+  const py = y => VH - ((y - Y0)/(Y1 - Y0)) * VH;
+  const rb = s.robot || r.steps[0].robot;
+  const cube = s.cube || r.cube;
+  const jawR = s.jaw ? hyp(s.jaw[0], s.jaw[1]) : null;
+  // viewBox(250)가 타일 폭으로 늘어나는 만큼 글자도 커진다 — 1366에서 9px이던 것이
+  // 1920에서 24px이 됐다. 화면에서 항상 같은 크기로 보이도록 역으로 나눈다.
+  const SC = VW / (host.clientWidth || VW);
+  const FS = (10 * SC).toFixed(1), SW = (1 * SC).toFixed(2), R = (4 * SC).toFixed(1);
+  let g = `<rect x="0" y="0" width="${VW}" height="${VH}" fill="#F8FAFB"/>`;
+  for (let gx = -0.4; gx <= 1.2; gx += 0.2)
+    g += `<line x1="${px(gx)}" y1="0" x2="${px(gx)}" y2="${VH}" stroke="#EAEEF1" stroke-width="${SW}"/>`;
+  for (let gy = -0.8; gy <= 1.2; gy += 0.2)
+    g += `<line x1="0" y1="${py(gy)}" x2="${VW}" y2="${py(gy)}" stroke="#EAEEF1" stroke-width="${SW}"/>`;
+  const tw = (0.16/(X1-X0))*VW, ow = (OPEN_HALF*2/(X1-X0))*VW;
+  g += `<rect x="${px(trash[0])-tw/2}" y="${py(trash[1])-tw/2}" width="${tw}" height="${tw}"
+        fill="none" stroke="#B45309" stroke-width="${1.5*SC}"/>`;
+  g += `<rect x="${px(trash[0])-ow/2}" y="${py(trash[1])-ow/2}" width="${ow}" height="${ow}"
+        fill="#FDF3E7" stroke="#B45309" stroke-width="${SW}" stroke-dasharray="${2*SC} ${2*SC}"/>`;
+  g += `<text x="${px(trash[0])}" y="${py(trash[1])+tw/2+9*SC}" font-size="${FS}" fill="#B45309"
+        text-anchor="middle" font-family="ui-monospace,monospace">통</text>`;
+  if (rb){
+    g += `<circle cx="${px(rb[0])}" cy="${py(rb[1])}" r="${5*SC}" fill="#0E7490"/>`;
+    g += `<text x="${px(rb[0])+7*SC}" y="${py(rb[1])+3*SC}" font-size="${FS}" fill="#0E7490"
+          text-anchor="start" font-family="ui-monospace,monospace">로봇</text>`;
+  }
+  if (cube){
+    const {states} = cubeStates(r);
+    const c = CSTATE[states[at]].c;
+    g += `<rect x="${px(cube[0])-3*SC}" y="${py(cube[1])-3*SC}" width="${6*SC}" height="${6*SC}" fill="${c}"/>`;
+    g += `<line x1="${px(cube[0])}" y1="${py(cube[1])}" x2="${px(trash[0])}" y2="${py(trash[1])}"
+          stroke="${c}" stroke-width="${SW}" stroke-dasharray="${3*SC} ${2*SC}"/>`;
+    g += `<text x="${px(cube[0])+7*SC}" y="${py(cube[1])+3*SC}" font-size="${FS}" fill="${c}"
+          text-anchor="start" font-family="ui-monospace,monospace">물체</text>`;
+  }
+  host.setAttribute('viewBox', `0 0 ${VW} ${VH}`);
+  host.innerHTML = g;
+  el('plandist').textContent = cube
+    ? `통까지 ${hyp(cube[0]-trash[0], cube[1]-trash[1]).toFixed(3)}m` : '좌표 없음';
+}
+
+function drawCmp(){
+  let h = `<tr><th>시행</th><th>종류</th><th>주장</th><th>실제</th><th>통까지</th><th>길이</th></tr>`;
+  RUNS.forEach((r, i) => {
+    const s = status(r);
+    h += `<tr class="${i === cur ? 'hit' : ''}"><td>#${r.id}</td>
+      <td style="font-family:var(--sans)">${r.kind || '—'}</td>
+      <td>${r.claim || '—'}</td>
+      <td><span class="pill ${s.pill}">${s.label}</span></td>
+      <td>${r.dist ?? '—'}${r.dist != null ? 'mm' : ''}</td>
+      <td>${fmt(r.dur,0)}s</td></tr>`;
+  });
+  el('cmpall').innerHTML = h;
+
+  let g = `<tr><th>시행</th><th>최대 물림각</th><th>물림 시 간격</th><th>최대 부하</th><th>들림</th></tr>`;
+  RUNS.forEach((r, i) => {
+    const {states} = cubeStates(r);
+    const gi = states.findIndex(s => s === 'gripped' || s === 'lifted');
+    const {Tgrip} = fkPoints(r.steps[gi >= 0 ? gi : 0].q);
+    const mm = gi >= 0 ? (jawGeom(r.steps[gi].ga, Tgrip).gap*1000).toFixed(0)+'mm' : '—';
+    const gmax = Math.max(...r.steps.map(s => s.ga));
+    const lmax = Math.max(...r.steps.map(s => Math.abs(s.gl)));
+    g += `<tr class="${i === cur ? 'hit' : ''}"><td>#${r.id}</td><td>${gmax.toFixed(2)}</td>
+      <td>${mm}</td><td>${lmax.toFixed(1)}</td>
+      <td>${states.includes('lifted') ? '○' : '✗'}</td></tr>`;
+  });
+  el('cmpgrip').innerHTML = g;
+
+  let p = `<tr><th>시행</th><th>전방</th><th>손목</th><th>구간</th><th>평균 간격</th></tr>`;
+  RUNS.forEach(r => {
+    const rec = RUNFRAMES[r.id];
+    const f = (rec && rec.front) || [], w = (rec && rec.wrist) || [];
+    const all = [...f, ...w].map(x => x.t).sort((a,b) => a-b);
+    const span = all.length > 1 ? `${all[0].toFixed(1)}~${all[all.length-1].toFixed(1)}s` : '—';
+    const gap = w.length > 1 ? ((w[w.length-1].t - w[0].t) / (w.length-1)).toFixed(2)+'s' : '—';
+    p += `<tr class="${String(r.id) === String(RUNS[cur].id) ? 'hit' : ''}"><td>#${r.id}</td>
+          <td>${f.length || '—'}</td><td>${w.length || '—'}</td><td>${span}</td><td>${gap}</td></tr>`;
+  });
+  el('posetable').innerHTML = p;
+}
+
+/* ── 분석 서랍 ───────────────────────────
+   페이지를 갈아 끼우지 않는다. 재생을 돌리면서 표를 같이 읽는 것이 이 화면의
+   쓸모라, 화면을 바꿔 버리면 그 쓸모가 사라진다. 서랍이 열려도 타임라인·재생·
+   3D·카메라는 그대로 살아 있다. */
+let drawerOpen = false;
+function setDrawer(on){
+  drawerOpen = on;
+  document.querySelector('.stage').classList.toggle('open', on);
+  const b = el('tabDeep');
+  b.setAttribute('aria-expanded', String(on));
+  b.textContent = on ? '분석 닫기' : '분석 열기';
+  el('drawer').setAttribute('aria-hidden', String(!on));
+  if (on) renderDrawer();
+  // 폭이 바뀌었으니 캔버스와 띠를 다시 맞춘다. 전환이 끝난 뒤라야 새 크기가 잡힌다.
+  setTimeout(() => { drawRobot(); drawTracks(); updateCursor(); drawPlan('planLive'); }, 300);
+}
+el('tabDeep').onclick = () => setDrawer(!drawerOpen);
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && drawerOpen) setDrawer(false);
+  if (e.key === ' ' && e.target === document.body){ e.preventDefault(); playing ? stop() : play(); }
+});
+
+/** 상태 전이표가 재생 헤드를 따라간다 — 표를 손으로 쫓아 내리지 않아도 된다. */
+function followLog(){
+  const wrap = document.querySelector('.logwrap');
+  const row = wrap && wrap.querySelector('tr.hit');
+  if (!row) return;
+  const top = row.offsetTop - wrap.clientHeight / 2 + row.offsetHeight / 2;
+  wrap.scrollTop = Math.max(0, top);
+}
+
+/** 세대별 요약 · 시행 띠 · 회귀 판정. 시행이 바뀌어도 내용은 같아 한 번만 그린다. */
+let trendDrawn = false;
+function drawTrend(){
+  if (trendDrawn || !TREND) return;
+  trendDrawn = true;
+
+  let e = '<tr><th>세대</th><th>기록</th><th>판정 가능</th><th>통 안</th>'
+        + '<th>거짓 성공</th><th>통까지 중앙</th></tr>';
+  TREND.epochs.forEach(x => {
+    // 기록된 시행만 세면 분모가 틀린다 — 무대 배치 단계에서 끊긴 시행은 추적이 아예 없다
+    const rec = x.attempts ? `${x.n} / ${x.attempts} 시도` : `${x.n}`;
+    e += `<tr><td>${x.key} <span class="pill mute">${x.kind}</span></td><td>${rec}</td>`
+       + `<td>${x.judged}</td><td>${x.truth}</td><td>${x.false_ok}</td>`
+       + `<td>${x.dist_med === null ? '—' : x.dist_med + 'mm'}</td></tr>`;
+  });
+  el('epochtable').innerHTML = e;
+
+  // 시행 하나가 칸 하나. 순서대로 놓으면 "언제부터 이상해졌나"가 눈으로 잡힌다.
+  let s = '';
+  TREND.epochs.forEach(x => {
+    const g = TREND.runs.filter(r => r.epoch === x.key);
+    s += `<div class="strip"><span class="slbl">${x.key}</span><div class="scells">`;
+    g.forEach(r => {
+      const k = !r.judged ? 'gray' : (r.false_ok ? 'red' : (r.truth ? 'green' : 'amber'));
+      const what = !r.judged ? '판정 불가 — 큐브 실좌표 없음'
+                 : (r.false_ok ? '거짓 성공 — 코드는 성공 주장, 실좌표는 통 밖'
+                 : (r.truth ? '통 안' : '통 밖'));
+      s += `<i class="sc ${k}" title="${r.id} · ${what}`
+         + `${r.dist === null ? '' : ' · 통까지 ' + r.dist + 'mm'}"></i>`;
+    });
+    s += '</div></div>';
+  });
+  s += '<p class="note" style="margin-top:6px"><span class="sc green"></span> 통 안'
+     + ' <span class="sc amber"></span> 통 밖'
+     + ' <span class="sc red"></span> 거짓 성공'
+     + ' <span class="sc gray"></span> 판정 불가 · 왼쪽이 이른 시행</p>';
+  el('runstrip').innerHTML = s;
+
+  // 0/1 지표는 비율이라 백분율로 읽는 편이 낫다. 차이는 퍼센트포인트라 단위가 다르다 —
+  // "27%"와 "27%p"를 같이 쓰면 27%가 27%p로 읽힌다.
+  const lvl = (v, u) => u ? `${Math.round(v)}${u}` : `${Math.round(v * 100)}%`;
+  const dif = (v, u) => u ? `${Math.round(v)}${u}` : `${Math.round(v * 100)}%p`;
+
+  let g = '<tr><th>세대 · 지표</th><th>판정</th><th>근거</th></tr>';
+  TREND.findings.forEach(f => {
+    const u = f.unit || '';
+    let pill, body;
+    if (f.verdict === 'hit'){
+      pill = '<span class="pill crit">회귀</span>';
+      body = `${f.at_id}부터 ${lvl(f.before, u)} → ${lvl(f.after, u)} · p=${f.p}`;
+    } else if (f.verdict === 'flat'){
+      pill = '<span class="pill mute">변화 없음</span>';
+      body = `${f.n}시행 내내 ${lvl(f.value, u)} — 변한 적이 없다`;
+    } else if (f.verdict === 'few'){
+      pill = '<span class="pill mute">보류</span>';
+      body = `시행 ${f.n}개 — 표본이 모자라 판단하지 않는다`;
+    } else {
+      pill = '<span class="pill ok">유의하지 않음</span>';
+      body = `가장 큰 격차 ${dif(f.effect, u)} · p=${f.p} — 순서를 섞어도 이만한 격차가 나온다`;
+    }
+    g += `<tr><td>${f.epoch} · ${f.label}</td><td>${pill}</td><td>${body}</td></tr>`;
+  });
+  el('regtable').innerHTML = g;
+
+  const miss = TREND.epochs.filter(x => x.attempts && x.attempts > x.n);
+  el('attemptnote').innerHTML = miss.length
+    ? `<b>분모를 조심할 것.</b> ${miss.map(x => `${x.key}는 기록이 ${x.n}건이지만 시도는 `
+      + `${x.attempts}회다`).join(' · ')} — 무대 배치 단계에서 끊긴 시행은 추적 파일에 한 줄도 `
+      + `안 남는다. 기록된 것만 세면 성공률이 실제보다 높게 나오고, 그 차이는 <b>기록 안에서는 `
+      + `절대 보이지 않는다.</b>`
+    : '';
+}
+
+function renderDrawer(){
+  if (!drawerOpen) return;
+  drawSeq(); drawCubeLog(); drawGripTable(); drawCmp(); drawTrend(); followLog();
+}
+
+/** 시행이 바뀔 때만 — 무겁다. */
+function renderRun(){
+  drawRuns(); drawVerdict(); drawViewBtns(); drawSpeed(); drawTracks();
+  if (drawerOpen) renderDrawer();
+}
+/** 매 프레임 — 가볍게. */
+function renderFrame(){
+  drawCubeState(); drawGrip(); drawJoints(); drawMetrics();
+  drawRobot(); drawCams(); drawPlan('planLive'); updateCursor();
+  if (drawerOpen){ drawCubeLog(); drawGripTable(); drawSeq(); followLog(); }
+}
+function renderAll(){ renderRun(); renderFrame(); }
+seek(0);
+renderAll();
+new ResizeObserver(() => { drawRobot(); drawTracks(); updateCursor(); })
+  .observe(el('rob').parentElement);
+</script>

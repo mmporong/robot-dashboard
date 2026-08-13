@@ -1,0 +1,536 @@
+[
+ {
+  "name": "base_joint",
+  "type": "fixed",
+  "parent": "base_footprint",
+  "child": "base_link",
+  "xyz": [
+   0.0,
+   0.0,
+   0.075
+  ],
+  "rpy": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "axis": [
+   0,
+   0,
+   1
+  ],
+  "lo": null,
+  "hi": null
+ },
+ {
+  "name": "left_wheel_joint",
+  "type": "continuous",
+  "parent": "base_link",
+  "child": "left_wheel_link",
+  "xyz": [
+   0.15,
+   0.175,
+   -0.008
+  ],
+  "rpy": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "axis": [
+   0.0,
+   1.0,
+   0.0
+  ],
+  "lo": null,
+  "hi": null
+ },
+ {
+  "name": "right_wheel_joint",
+  "type": "continuous",
+  "parent": "base_link",
+  "child": "right_wheel_link",
+  "xyz": [
+   0.15,
+   -0.175,
+   -0.008
+  ],
+  "rpy": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "axis": [
+   0.0,
+   1.0,
+   0.0
+  ],
+  "lo": null,
+  "hi": null
+ },
+ {
+  "name": "caster_front_joint",
+  "type": "fixed",
+  "parent": "base_link",
+  "child": "caster_link_front",
+  "xyz": [
+   0.2,
+   -0.0,
+   -0.005
+  ],
+  "rpy": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "axis": [
+   0,
+   0,
+   1
+  ],
+  "lo": null,
+  "hi": null
+ },
+ {
+  "name": "caster_rear_joint",
+  "type": "fixed",
+  "parent": "base_link",
+  "child": "caster_link_rear",
+  "xyz": [
+   -0.2,
+   -0.0,
+   -0.005
+  ],
+  "rpy": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "axis": [
+   0,
+   0,
+   1
+  ],
+  "lo": null,
+  "hi": null
+ },
+ {
+  "name": "laser_joint",
+  "type": "fixed",
+  "parent": "base_link",
+  "child": "laser_link",
+  "xyz": [
+   0.25,
+   0.0,
+   0.1
+  ],
+  "rpy": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "axis": [
+   0,
+   0,
+   1
+  ],
+  "lo": null,
+  "hi": null
+ },
+ {
+  "name": "arm_riser_joint",
+  "type": "fixed",
+  "parent": "base_link",
+  "child": "arm_riser_link",
+  "xyz": [
+   0.12,
+   0.0,
+   0.075
+  ],
+  "rpy": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "axis": [
+   0,
+   0,
+   1
+  ],
+  "lo": null,
+  "hi": null
+ },
+ {
+  "name": "arm_mount_joint",
+  "type": "fixed",
+  "parent": "arm_riser_link",
+  "child": "arm_base_link",
+  "xyz": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "rpy": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "axis": [
+   0,
+   0,
+   1
+  ],
+  "lo": null,
+  "hi": null
+ },
+ {
+  "name": "rgbd_mast_joint",
+  "type": "fixed",
+  "parent": "base_link",
+  "child": "rgbd_mast_link",
+  "xyz": [
+   0.0,
+   0.0,
+   0.075
+  ],
+  "rpy": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "axis": [
+   0,
+   0,
+   1
+  ],
+  "lo": null,
+  "hi": null
+ },
+ {
+  "name": "rgbd_camera_joint",
+  "type": "fixed",
+  "parent": "rgbd_mast_link",
+  "child": "rgbd_camera_link",
+  "xyz": [
+   0.05,
+   0.0,
+   0.35
+  ],
+  "rpy": [
+   0.0,
+   0.55,
+   0.0
+  ],
+  "axis": [
+   0,
+   0,
+   1
+  ],
+  "lo": null,
+  "hi": null
+ },
+ {
+  "name": "arm_shoulder_pan",
+  "type": "revolute",
+  "parent": "arm_base_link",
+  "child": "arm_shoulder_link",
+  "xyz": [
+   0.0388353,
+   -8.97657e-09,
+   0.0624
+  ],
+  "rpy": [
+   3.14159,
+   4.18253e-17,
+   -3.14159
+  ],
+  "axis": [
+   0.0,
+   0.0,
+   1.0
+  ],
+  "lo": -1.91986,
+  "hi": 1.91986
+ },
+ {
+  "name": "arm_shoulder_lift",
+  "type": "revolute",
+  "parent": "arm_shoulder_link",
+  "child": "arm_upper_arm_link",
+  "xyz": [
+   -0.0303992,
+   -0.0182778,
+   -0.0542
+  ],
+  "rpy": [
+   -1.5708,
+   -1.5708,
+   0.0
+  ],
+  "axis": [
+   0.0,
+   0.0,
+   1.0
+  ],
+  "lo": -1.74533,
+  "hi": 1.74533
+ },
+ {
+  "name": "arm_elbow_flex",
+  "type": "revolute",
+  "parent": "arm_upper_arm_link",
+  "child": "arm_lower_arm_link",
+  "xyz": [
+   -0.11257,
+   -0.028,
+   1.73763e-16
+  ],
+  "rpy": [
+   -3.63608e-16,
+   8.74301e-16,
+   1.5708
+  ],
+  "axis": [
+   0.0,
+   0.0,
+   1.0
+  ],
+  "lo": -1.69,
+  "hi": 1.69
+ },
+ {
+  "name": "arm_wrist_camera_joint",
+  "type": "fixed",
+  "parent": "arm_wrist_link",
+  "child": "arm_wrist_camera_link",
+  "xyz": [
+   0.0,
+   -0.11,
+   0.03
+  ],
+  "rpy": [
+   0.0,
+   0.628,
+   -1.5708
+  ],
+  "axis": [
+   0,
+   0,
+   1
+  ],
+  "lo": null,
+  "hi": null
+ },
+ {
+  "name": "arm_wrist_flex",
+  "type": "revolute",
+  "parent": "arm_lower_arm_link",
+  "child": "arm_wrist_link",
+  "xyz": [
+   -0.1349,
+   0.0052,
+   3.62355e-17
+  ],
+  "rpy": [
+   4.02456e-15,
+   8.67362e-16,
+   -1.5708
+  ],
+  "axis": [
+   0.0,
+   0.0,
+   1.0
+  ],
+  "lo": -1.65806,
+  "hi": 1.65806
+ },
+ {
+  "name": "arm_wrist_roll",
+  "type": "revolute",
+  "parent": "arm_wrist_link",
+  "child": "arm_gripper_link",
+  "xyz": [
+   5.55112e-17,
+   -0.0611,
+   0.0181
+  ],
+  "rpy": [
+   1.5708,
+   0.0486795,
+   3.14159
+  ],
+  "axis": [
+   0.0,
+   0.0,
+   1.0
+  ],
+  "lo": -2.74385,
+  "hi": 2.84121
+ },
+ {
+  "name": "arm_gripper_frame_joint",
+  "type": "fixed",
+  "parent": "arm_gripper_link",
+  "child": "arm_gripper_frame_link",
+  "xyz": [
+   -0.0079,
+   -0.000218121,
+   -0.0981274
+  ],
+  "rpy": [
+   0.0,
+   3.14159,
+   0.0
+  ],
+  "axis": [
+   0,
+   0,
+   1
+  ],
+  "lo": null,
+  "hi": null
+ },
+ {
+  "name": "arm_gripper",
+  "type": "revolute",
+  "parent": "arm_gripper_link",
+  "child": "arm_moving_jaw_link",
+  "xyz": [
+   0.0202,
+   0.0188,
+   -0.0234
+  ],
+  "rpy": [
+   1.5708,
+   -5.24284e-08,
+   -1.41553e-15
+  ],
+  "axis": [
+   0.0,
+   0.0,
+   1.0
+  ],
+  "lo": -0.174533,
+  "hi": 1.74533
+ },
+ {
+  "name": "fixed_finger_tip",
+  "type": "pad",
+  "parent": "arm_gripper_link",
+  "xyz": [
+   -0.0157,
+   -0.0002,
+   -0.0895
+  ],
+  "rpy": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "size": [
+   0.0156,
+   0.0158,
+   0.0299
+  ]
+ },
+ {
+  "name": "fixed_finger_mid",
+  "type": "pad",
+  "parent": "arm_gripper_link",
+  "xyz": [
+   -0.023,
+   -0.0002,
+   -0.0594
+  ],
+  "rpy": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "size": [
+   0.0229,
+   0.0243,
+   0.0299
+  ]
+ },
+ {
+  "name": "fixed_finger_base",
+  "type": "pad",
+  "parent": "arm_gripper_link",
+  "xyz": [
+   -0.0115,
+   0.0,
+   -0.0294
+  ],
+  "rpy": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "size": [
+   0.0473,
+   0.048,
+   0.0299
+  ]
+ },
+ {
+  "name": "moving_finger_tip",
+  "type": "pad",
+  "parent": "arm_moving_jaw_link",
+  "xyz": [
+   -0.0083,
+   -0.0756,
+   0.0189
+  ],
+  "rpy": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "size": [
+   0.0181,
+   0.0129,
+   0.0203
+  ]
+ },
+ {
+  "name": "moving_finger_mid",
+  "type": "pad",
+  "parent": "arm_moving_jaw_link",
+  "xyz": [
+   -0.003,
+   -0.0549,
+   0.0189
+  ],
+  "rpy": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "size": [
+   0.0256,
+   0.0398,
+   0.0238
+  ]
+ },
+ {
+  "name": "moving_finger_base",
+  "type": "pad",
+  "parent": "arm_moving_jaw_link",
+  "xyz": [
+   0.0,
+   -0.015,
+   0.0189
+  ],
+  "rpy": [
+   0.0,
+   0.0,
+   0.0
+  ],
+  "size": [
+   0.02,
+   0.0399,
+   0.048
+  ]
+ }
+]
