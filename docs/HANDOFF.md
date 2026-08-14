@@ -14,21 +14,31 @@
 
 ## 1. 파일 구성
 
+리포 구조는 최상위 `README.md`에 있다. 여기는 **캡스톤 pick 프로젝트에서 무엇이
+어디 있는지**만 적는다. 경로는 `~/robot-dashboard/` 기준이다.
+
 | 파일 | 역할 |
 |---|---|
-| `dashboard.tpl.html` | 화면 템플릿. 데이터 자리는 `/*__RUNS__*/` `/*__CHAIN__*/` `/*__FRAMES__*/` `/*__TREND__*/` 플레이스홀더 |
-| `build.py` | 템플릿 + JSON 4종 → `dashboard.html` |
-| `read_mcap.py` | **입구.** MCAP → `runs.json` + `run_frames.json`. 인자는 입력 디렉터리·프레임 예산 MB |
-| `trend.py` | 인박스 **전량** → `trend.json` (세대별 누적 · 회귀 판정). `--selftest`로 탐지기 자체 시험 |
-| `to_lerobot.py` | MCAP → **LeRobotDataset v3.0**. lerobot 쓰기 API를 그대로 쓴다 (lerobot 환경 필요) |
-| `rosmsg.py` | ROS 2 `.msg` → MCAP 스키마 본문. 쓰는 쪽에서만 쓴다 |
-| `to_mcap.py` | **레거시 변환기.** 추적 JSONL·프레임 JSON → 시행당 MCAP. 세대(epoch)를 파일에 적는다 |
-| `record_mcap.sh` | 시뮬 1회를 `ros2 bag record`로 직접 MCAP에 담아 인박스에 놓는다 |
-| `extract_chain.py` | URDF → `urdf_chain.json` (관절 18 + 손가락 패드 6) |
-| `make_runs.py` `make_frames.py` | **옛 방식.** 자체 JSONL을 직접 읽던 경로. `read_mcap.py`가 대체했다 |
-| `grab_frames.py` | **옛 방식.** 자세 5개 스틸 캡처 — 시행과 대응이 없어 폐기했다. 참고용으로만 남김 |
-| `PROJECT_PROMPT_TEMPLATE.md` | 다른 프로젝트를 이 대시보드에 태울 때 채우는 9절 양식 |
-| `RESEARCH_CLAIMS.md` | 시장·기술 조사 원자료 (출처 23건 · 주장 115개) |
+| `core/mcap_io.py` | **중립 층.** 파일 열기·시각 조회·TF 합성·프레임 굽기·용량 예산. 로봇도 과제도 모른다 |
+| `core/regress.py` | 세대별 누적 · 순열 검정 회귀 탐지. 프로젝트 리더의 `run_of()` 하나만 부른다 |
+| `core/lerobot_out.py` | MCAP → **LeRobotDataset v3.0**. lerobot 쓰기 API를 그대로 쓴다 (lerobot 환경 필요) |
+| `core/rosmsg.py` | ROS 2 `.msg` → MCAP 스키마 본문. 쓰는 쪽에서만 쓴다 |
+| `core/build.py` | 템플릿 + JSON 4종 → `dashboard.html` |
+| `projects/capstone-pick/mcap_read.py` | **이 과제의 읽기.** 무엇을 단계로 보고 무엇을 성공으로 볼지 |
+| `projects/capstone-pick/project.py` | 설정 — 관절 이름·프레임·판정 규칙·화면에 세울 시행 |
+| `projects/capstone-pick/dashboard.tpl.html` | 화면. 데이터 자리는 `/*__RUNS__*/` `/*__CHAIN__*/` `/*__FRAMES__*/` `/*__TREND__*/` |
+| `projects/capstone-pick/to_mcap.py` | **레거시 변환기.** 추적 JSONL·프레임 JSON → 시행당 MCAP. 세대(epoch)를 파일에 적는다 |
+| `projects/capstone-pick/record_mcap.sh` | 시뮬 1회를 `ros2 bag record`로 직접 MCAP에 담아 인박스에 놓는다 |
+| `projects/capstone-pick/extract_chain.py` | URDF → `urdf_chain.json` (관절 18 + 손가락 패드 6) |
+| `legacy/` | 자체 JSONL을 직접 읽던 옛 경로. 참고용 |
+| `docs/PROJECT_PROMPT_TEMPLATE.md` | 다른 프로젝트를 태울 때 채우는 9절 양식 |
+| `docs/RESEARCH_CLAIMS.md` | 시장·기술 조사 원자료 (출처 23건 · 주장 115개) |
+
+**2026-08-14에 구조가 갈렸다.** 처음엔 `core/mcap_read.py` 하나가 읽기를 다 했는데,
+SLAM을 태우려 하자 그것이 `/joint_states`와 팔 관절 이름을, 판정이 `/gt/trash`를
+전제해서 **import조차 되지 않았다.** "core는 로봇도 과제도 모른다"고 적어 뒀던 것이
+사실이 아니었다. 중립인 부분(`mcap_io`)과 아닌 부분(프로젝트 `mcap_read`)을 파일로
+갈랐고, 갈라도 결과가 같음을 `runs.json`·`trend.json` 완전 일치로 확인했다.
 
 **빌드**: `cd ~/robot-dashboard && python3 dash.py capstone-pick all`
 (구조가 `core/` + `projects/<이름>/`으로 갈렸다 — 리포 README 참고)
@@ -40,9 +50,9 @@
 **데이터 흐름** — 입구가 MCAP 하나다. 어느 경로로 들어왔든 리더는 구별하지 않는다.
 
 ```
-추적 JSONL ──to_mcap.py──┐                        ┌─read_mcap.py─▶ runs.json · run_frames.json
+추적 JSONL ──to_mcap.py──┐                        ┌─read──▶ runs.json · run_frames.json
                          ├─▶ ~/capstone_tools/mcap/*.mcap ─┤            (화면에 세운 7시행)
-ros2 bag record ─────────┘      (감시 디렉터리)   └─trend.py────▶ trend.json
+ros2 bag record ─────────┘      (감시 디렉터리)   └─trend─▶ trend.json
                                                                    (전량 누적·회귀)
                                         runs.json + run_frames.json + trend.json + urdf_chain.json
                                                           │  build.py
@@ -67,14 +77,14 @@ ros2 bag record ─────────┘      (감시 디렉터리)   └�
 
 **데이터**: 시행 7개 — 팔 단독 성공 3(A1·A2·A3) + 주행 실패 4(#14·#10·#17·#13).
 인박스(`~/capstone_tools/mcap/`)에는 MCAP 78개가 들어 있다 — 주행 72 + 팔 단독 1세대 3
-+ 팔 단독 2세대 2 + `ros2 bag record` 실기록 1. 화면에 세우는 7개는 `read_mcap.py`의
-`SHOW`가 고르고, **나머지는 `trend.py`가 누적·회귀로 쓴다**(8절).
++ 팔 단독 2세대 2 + `ros2 bag record` 실기록 1. 화면에 세우는 7개는 `project.py`의
+`SHOW`가 고르고, **나머지는 `core/regress.py`가 누적·회귀로 쓴다**(8절).
 
 **MCAP 전환에서 드러난 것**: 옛 파이프라인은 단계와 카메라 프레임의 0초를 **따로**
 잡았다. 녹화는 무대를 세우는 동안 이미 돌고 있어서 첫 단계보다 4.5초 앞서 시작하는데
 (실측: 시행1 +4.53s · 시행2 +4.48s · 시행3 +4.49s), 양쪽을 각자 0으로 맞추자 팔 단독
 전 시행에서 **영상이 관절보다 4.5초 앞선 채** 겹쳐 재생됐다. bag은 시계가 하나라
-옮기는 순간 드러났고, `read_mcap.py`가 두 계열을 같은 값만큼 밀어 고쳤다.
+옮기는 순간 드러났고, 리더가 두 계열을 같은 값만큼 밀어 고쳤다.
 
 **검증한 것** (숫자는 실측)
 - MCAP 경로가 옛 경로와 **동일한 결과**를 낸다 — 시행 7개 × 전 단계 × 전 필드에서
@@ -150,14 +160,14 @@ Hugging Face도 "시뮬은 contact-rich 조작엔 부적합, 알고리즘 평가
 (사용자 방침: 포트폴리오가 1순위, 빈자리 찾기로 방향 틀지 말 것).
 
 **~~1. MCAP 읽기~~ — 2026-08-13 완료.** 입구가 MCAP 하나가 됐다(위 데이터 흐름 참고).
-옛 JSONL은 `to_mcap.py`로 옮겼고, `read_mcap.py`가 변환본과 `ros2 bag record` 산출물을
+옛 JSONL은 `to_mcap.py`로 옮겼고, 리더가 변환본과 `ros2 bag record` 산출물을
 구별 없이 읽는다. 결과는 옛 경로와 차이 0건. 압축은 MCAP 자체의 **청크 레벨 zstd**를 쓴다 —
 전체 gzip은 인덱스를 파괴해 부분 추출이 불가능해진다.
 
-**~~2. N회 누적 + 회귀 탐지~~ — 2026-08-13 완료.** `trend.py` · 서랍의 「누적 · 회귀」.
+**~~2. N회 누적 + 회귀 탐지~~ — 2026-08-13 완료.** `core/regress.py` · 서랍의 「누적 · 회귀」.
 세대(epoch) 안에서만 견주고, 판정에는 순열 검정으로 유의확률을 붙인다. 8절 참고.
 
-**~~3. LeRobotDataset 스키마로 내보내기~~ — 2026-08-13 완료.** `to_lerobot.py`. 9절 참고.
+**~~3. LeRobotDataset 스키마로 내보내기~~ — 2026-08-13 완료.** `core/lerobot_out.py`. 9절 참고.
 
 1. **규모 이야기** — 로봇은 초당 1GB를 기록하는데 현장 업로드는 10~100Mbps다. 2~3 자릿수
    격차라 선택적·부분 업로드가 최적화가 아니라 구조 요건이다. 지금 화면엔 이 얘기가 없다.
@@ -233,8 +243,8 @@ python3 ~/jdamr_cube_ws/src/jdamr_cube_ros/capstone_pick/tools/armonly_pick.py 3
 ~/robot-dashboard/record_mcap.sh live2      # → ~/capstone_tools/mcap/live2.mcap
 
 cd ~/robot-dashboard
-python3 read_mcap.py && python3 build.py
-python3 read_mcap.py --probe ~/capstone_tools/mcap/live2.mcap   # 이 파일에서 뭐가 읽히나
+python3 dash.py capstone-pick all
+python3 dash.py capstone-pick probe ~/capstone_tools/mcap/live2.mcap   # 이 파일에서 뭐가 읽히나
 ```
 
 ## 7. 진짜 bag으로 한 검증 — 그리고 거기서 나온 시뮬 문제
@@ -277,7 +287,7 @@ python3 read_mcap.py --probe ~/capstone_tools/mcap/live2.mcap   # 이 파일에�
    세대는 **파일 메타데이터**에서 읽는다 — id로 짐작하면 `ros2 bag record` 파일에는 쓸 수 없다.
 2. **성공률만 보지 않는다.** 이 기록에서 실제로 일어난 사고는 성공률 하락이 아니라
    **판정 근거의 소실**이었다. 성공률만 보면 "시행이 줄었다"로 읽히고 조용히 지나간다.
-3. **탐지기를 먼저 의심한다.** `python3 trend.py --selftest`로 귀무모형을 돌린다.
+3. **탐지기를 먼저 의심한다.** `python3 dash.py capstone-pick selftest`로 귀무모형을 돌린다.
 
 ### 세대
 
@@ -331,14 +341,14 @@ python3 read_mcap.py --probe ~/capstone_tools/mcap/live2.mcap   # 이 파일에�
 
 `arm-v2`는 기록이 2건인데 시도는 3회다. 무대 배치 단계에서 끊긴 시행은 추적 파일에
 한 줄도 안 남아서, **기록만 세면 성공률이 2/2 = 100%로 나온다.** 아는 만큼만
-`trend.py`의 `ATTEMPTS`에 출처와 함께 적고 화면에 "2 / 3 시도"로 표시한다.
+`project.py`의 `ATTEMPTS`에 출처와 함께 적고 화면에 "2 / 3 시도"로 표시한다.
 근본 해법은 시행 스크립트가 **시도 자체를 기록하는 것**이다 — 4절 3번과 같은 뿌리다.
 
 ---
 
 ## 9. LeRobotDataset v3.0 내보내기
 
-`~/miniforge3/envs/lerobot/bin/python to_lerobot.py` → `~/capstone_tools/lerobot/<세대>/`.
+`core/lerobot_out.py`를 lerobot 환경 파이썬으로 → `~/capstone_tools/lerobot/<세대>/`.
 **대시보드 빌드와 무관하다** — 학습 생태계로 나가는 별도 출구다.
 
 ### 스키마를 손으로 재현하지 않는다
@@ -413,8 +423,17 @@ v2가 에피소드당 파일 1개로 하다 파일시스템 한계에 부딪혀 
 
 ### 겪은 것
 
-- **`read_mcap.py`가 import 시점에 `sys.argv`를 읽고 있었다.** 모듈로 가져다 쓰는 쪽이
+- **리더가 import 시점에 `sys.argv`를 읽고 있었다.** 모듈로 가져다 쓰는 쪽이
   자기 인자를 쓰면 남의 인자에 걸려 import가 그 자리에서 죽는다
   (`--epoch drive-v1` → `could not convert string to float: 'drive-v1'`). 기본값만 모듈에
   두고 argv 해석은 `main()`으로 옮겼다
+- **`mcap_ros2`가 돌려주는 메시지 객체를 그대로 쌓지 말 것.** 필드마다 파이썬
+  인스턴스가 달린 중첩 구조라 원본의 100배로 부푼다. `/tf`는 `robot_state_publisher`가
+  관절 상태마다 전 링크를 재발행해 1000Hz를 넘기도 한다(SLAM 기록 실측 82,042건·1045Hz).
+  **표본을 솎아서는 못 고친다** — `/tf`를 시간 기준으로 솎으면 판정이 깨진다(8mm → 240mm).
+  줄일 것은 개수가 아니라 한 건의 크기다. `core/mcap_io.load`가 읽는 순간 9-튜플로 접는다
+- **백그라운드 작업에는 상한을 걸 것.** 위 문제로 상한 없이 띄운 읽기가 RAM 25.6GB까지
+  자랐고, `systemd-oomd`가 진범 대신 gnome-shell을 죽여 데스크톱이 무너졌다(2026-08-13).
+  PSI 기준이라 150MB짜리 셸이 25.6GB짜리 python보다 먼저 죽는다.
+  `systemd-run --user --scope -p MemoryMax=4G timeout 900 ...`
 - **영상 인코더는 홀수 변을 싫어한다.** 녹화가 217×163이라 216×162로 맞춘다
