@@ -34,13 +34,14 @@ python3 dash.py capstone-pick selftest  # 회귀 탐지기 귀무모형 시험
 ```
 core/                로봇도 과제도 모른다
   rosmsg.py            ROS 2 .msg → MCAP 스키마 본문
-  mcap_read.py         MCAP → 시행 기록 (판정 규칙은 project.py에서 받아 쓴다)
+  mcap_io.py           파일 열기 · 시각 조회 · TF 합성 · 프레임 굽기 · 용량 예산
   regress.py           세대별 누적 · 순열 검정 회귀 탐지
   lerobot_out.py       LeRobotDataset v3.0 내보내기
   build.py             템플릿 + JSON → 한 장짜리 HTML
 projects/
   capstone-pick/       SO-101 pick-and-place
-    project.py           **이 프로젝트의 전부** — 관절·프레임·판정 규칙·화면 구성
+    project.py           설정 — 관절·프레임·판정 규칙·화면 구성
+    mcap_read.py         **이 과제의 읽기** — 무엇을 단계로 볼지, 무엇을 성공으로 볼지
     dashboard.tpl.html   화면 (프로젝트마다 아예 다르게 짜도 된다)
     to_mcap.py           옛 JSONL → MCAP (이 프로젝트 전용 변환)
     record_mcap.sh       ros2 bag record로 직접 MCAP 받기
@@ -49,8 +50,14 @@ docs/                  인수인계·조사 원자료·다른 프로젝트를 �
 legacy/                자체 JSONL을 직접 읽던 옛 경로. 참고용
 ```
 
-`core/`에는 로봇 이름도 판정 규칙도 없다. 다른 로봇으로 옮길 때 **고치는 곳은
-`projects/<이름>/project.py` 하나**이고, 그게 사실인지는 `check`가 확인한다.
+`core/`에는 로봇 이름도 판정 규칙도 없다. 새 프로젝트에서 쓰는 것은 `mcap_io`의
+중립 도구들이고, **무엇을 단계로 보고 무엇을 성공으로 볼지는 프로젝트가 정한다**
+(`project.py` + `mcap_read.py`).
+
+처음엔 "고칠 곳은 `project.py` 하나"라고 적어 뒀는데 **사실이 아니었다.** SLAM을
+태우려다 드러났다 — 그때의 `core/mcap_read.py`는 `/joint_states`와 팔 관절 이름을,
+판정은 `/gt/trash`를 전제해서 SLAM 기록으로는 import조차 되지 않았다. 지금 구조는
+그 실패를 반영한 것이다. 중립인 부분과 아닌 부분을 **파일로** 갈랐다.
 
 ## 데이터가 들어오는 길
 

@@ -29,6 +29,8 @@ import sys
 
 import project as P
 
+# 프로젝트 리더. `run_of(path) → (메타, 시행)` 하나만 쓴다 — 그 이상 들여다보면
+# 프로젝트마다 다른 `steps_of`·`judge`에 묶여 이 파일이 중립일 수 없다.
 import mcap_read as R
 
 HERE = pathlib.Path.cwd()          # 생성물은 프로젝트 폴더에 떨어진다
@@ -118,8 +120,7 @@ def collect(inbox):
             # 다른 무대의 시행이 같은 추세선에 섞인다 — 빼되 뺐다고 적는다.
             skipped.append((path.stem, f'{path.stat().st_size / 1e6:.0f}MB · 세대 미상'))
             continue
-        _, series, _ = R.load(path)
-        rec = R.judge(path.stem, meta, series, R.steps_of(series))
+        _, rec = R.run_of(path)
         if rec is None:
             skipped.append((path.stem, '판정 기준 없음'))
             continue
