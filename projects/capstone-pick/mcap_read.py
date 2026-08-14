@@ -134,9 +134,14 @@ def judge(rid, meta, series, steps):
         'truth': truth,
         'dist': dist,
         'trash': [round(tp.x, 4), round(tp.y, 4)],
-        # 물체 크기는 바닥에 놓였을 때의 중심 높이에서 나온다 — 무대가 3cm/4cm를
+        # 물체 크기는 **바닥에 놓였을 때의** 중심 높이에서 나온다 — 무대가 3cm/4cm를
         # 오갔기 때문에 상수로 박으면 게이지의 기준선이 틀린다.
-        'cube_size': round(cubes[0][2] * 2, 3) if cubes else None,
+        #
+        # 첫 표본을 쓰면 안 된다. 기록이 시작될 때 물체가 이미 들려 있을 수 있다
+        # (bagA3이 그랬다: 첫 관측 0.027 → 54mm로 잡혀 실제 30mm의 두 배가 됐다).
+        # 물체는 바닥보다 낮아질 수 없으므로 **관측된 최소 높이**가 곧 반지름이다.
+        # 물리 떨림으로 0.2mm쯤 파고드는 표본이 있지만 소수 세 자리에서 반올림되며 사라진다.
+        'cube_size': round(min(c[2] for c in cubes) * 2, 3) if cubes else None,
     }
 
 
