@@ -21,6 +21,7 @@ import pathlib
 
 import mcap_io as IO
 import project as P
+import video as V
 
 HERE = pathlib.Path.cwd()          # 생성물은 프로젝트 폴더에 떨어진다
 # 기본값만 여기서 정한다. **import 시점에 `sys.argv`를 읽지 않는다** — 이 파일을 모듈로
@@ -145,7 +146,9 @@ def run_of(path):
     누적·회귀 쪽(`core/regress.py`)이 부르는 **유일한 입구**다. 그쪽이 `load`·`steps_of`·
     `judge`를 직접 부르면 프로젝트마다 다른 그 셋에 묶여 중립일 수가 없다.
     """
-    meta, series, _ = IO.load(path, CAMS, JPEG)
+    # **카메라는 풀지 않는다.** 누적·회귀는 좌표만 보는데, 영상까지 풀면 시행 하나가
+    # 수십 MB짜리 base64 덩어리가 된다(재녹화본이 시행당 700장·640×480이다).
+    meta, series, _ = IO.load(path, {}, JPEG)
     return meta, judge(path.stem, meta, series, steps_of(series))
 
 
@@ -225,7 +228,18 @@ def main(inbox=None, budget=None):
     for r in by_run.values():
         for cam in r:
             r[cam].sort(key=lambda f: f['t'])
-    IO.fit_budget(by_run, BUDGET_MB, {'wrist': 1.0, 'front': 0.45})
+
+    if getattr(P, 'VIDEO', False):
+        # 비디오는 고정 주기라야 담긴다. 격자에 맞춰 고르고(영차 유지) 한 번에 굽는다.
+        span = {rec['id']: rec['dur'] for rec in runs}
+        for rid, cams in by_run.items():
+            for cam in cams:
+                cams[cam] = V.resample(cams[cam], P.VIDEO_FPS, span.get(rid, 0))
+        budget = getattr(P, 'VIDEO_BUDGET_MB', BUDGET_MB)
+        by_run, total = V.build(by_run, P.VIDEO_FPS, budget, crf=P.VIDEO_CRF)
+        print(f'  비디오 {total/1e6:.1f}MB (예산 {budget}MB)')
+    else:
+        IO.fit_budget(by_run, BUDGET_MB, {'wrist': 1.0, 'front': 0.45})
 
     (HERE / 'runs.json').write_text(
         json.dumps(runs, ensure_ascii=False, separators=(',', ':')), encoding='utf-8')
@@ -240,8 +254,12 @@ def main(inbox=None, budget=None):
     print(f'run_frames.json {os.path.getsize(HERE / "run_frames.json") // 1024}KB')
     for rid in sorted(by_run):
         for cam in ('front', 'wrist'):
-            fs = by_run[rid][cam]
+            fs = by_run[rid].get(cam)
             if not fs:
+                continue
+            if isinstance(fs, dict):        # 비디오
+                print(f'  {rid} {cam:5s} {fs["n"]:4d}프레임 · {fs["w"]}x{fs["h"]}'
+                      f' · {fs["fps"]}fps · {len(fs["src"]) * 3 // 4 // 1024}KB')
                 continue
             gap = (fs[-1]['t'] - fs[0]['t']) / max(1, len(fs) - 1)
             kb = sum(len(f['b']) for f in fs) // 1024

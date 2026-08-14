@@ -127,7 +127,8 @@
   .cams{flex:1;min-height:0;display:flex;flex-direction:column;gap:7px;margin-top:7px}
   .cam{flex:1;min-height:0;position:relative;border-radius:7px;overflow:hidden;
        background:#E9EDF0;border:1px solid var(--rule-soft)}
-  .cam img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#DCE3E7}
+  .cam img,.cam video{position:absolute;inset:0;width:100%;height:100%;
+                      object-fit:contain;background:#DCE3E7}
   .camtag{position:absolute;left:5px;top:5px;background:rgba(18,23,28,.72);color:#fff;
           font-family:var(--mono);font-size:9.5px;padding:1px 6px;border-radius:4px;z-index:2}
   .camtag.miss{background:rgba(185,28,28,.85)}
@@ -298,7 +299,9 @@
         </div>
         <div class="cams">
           <div class="cam"><span class="camtag" id="tagFront">전방</span>
-            <img id="camFront" alt="전방 RGB-D 카메라"></div>
+            <img id="camFront" alt="전방 RGB-D 카메라">
+            <video id="vidFront" muted playsinline preload="auto"
+                   aria-label="전방 RGB-D 카메라"></video></div>
         </div>
       </section>
 
@@ -317,7 +320,9 @@
           <span class="camnote">파지·운반은 여기서만 보인다</span></div>
         <div class="cams">
           <div class="cam"><span class="camtag" id="tagWrist">손목</span>
-            <img id="camWrist" alt="손목 카메라"></div>
+            <img id="camWrist" alt="손목 카메라">
+            <video id="vidWrist" muted playsinline preload="auto"
+                   aria-label="손목 카메라"></video></div>
         </div>
       </section>
      </div>
@@ -652,7 +657,7 @@ function cubeStory(r, states){
   if (iDrop >= 0){
     const s = r.steps[iDrop];
     return {kind:'dropped', t:s.t, stage:s.stage,
-            msg:`<b>${fmt(s.t,1)}s · ${s.stage}</b>에서 물체가 죠를 벗어났다 — 운반 중 낙하다.`};
+            msg:`<b>${fmt(s.t,1)}s${s.stage ? ' · ' + s.stage : ''}</b>에서 물체가 죠를 벗어났다 — 운반 중 낙하다.`};
   }
   if (iLift < 0) return {kind:'nolift', msg:'물체가 한 번도 바닥을 떠나지 않았다.'};
   if (iRel >= 0){
@@ -783,7 +788,10 @@ function drawGrip(){
   const r = RUNS[cur], s = F;
   const {Tgrip} = fkPoints(s.q);
   const g = jawGeom(s.ga, Tgrip);
-  const mm = g.gap * 1000;
+  // 물림각이 0 아래로 내려가면 정기구학상 패드가 서로를 지나쳐 **음수 간격**이 나온다.
+  // 실제로 그런 일은 없고, 빈손으로 끝까지 닫힌 상태다(재녹화본 bagA1이 낙하 뒤 그랬다).
+  // 음수를 그대로 찍으면 고장으로 읽히므로 0에서 자르고 아래 물림각으로 원값을 보여 준다.
+  const mm = Math.max(0, g.gap * 1000);
   const SPAN = 100;                       // 게이지 상한 mm
   const pct = v => Math.max(0, Math.min(100, (v / SPAN) * 100));
   const cube = (r.cube_size || 0.04) * 1000;
@@ -859,7 +867,24 @@ const KIND_NOTE = {
 function drawTracks(){
   const r = RUNS[cur], total = r.dur || 1;
   const tl = el('tl'); tl.innerHTML = '';
-  const marks = r.steps.map((s,i) => ({...s, i})).filter(s => s.stage);
+  // `ros2 bag record`가 받아 적은 기록에는 단계 표시가 없다 — 그건 시행 스크립트가
+  // 로그로 찍는 것이라 토픽에 안 실린다. 그럴 때는 **실좌표에서 뽑은 물체 상태**로
+  // 시간축을 세운다. 없는 것을 지어내는 게 아니라 이미 계산하고 있는 값을 쓰는 것이고,
+  // 오히려 판정과 같은 근거(좌표)라 화면 안에서 앞뒤가 맞는다.
+  const named = r.steps.some(s => s.stage);
+  const marks = named
+    ? r.steps.map((s,i) => ({...s, i})).filter(s => s.stage)
+    : (() => {
+        const st = cubeStates(r).states;
+        // 같은 상태가 이어지는 구간을 하나로 묶는다. 168칸짜리 띠는 못 읽는다.
+        const out = [];
+        r.steps.forEach((s, i) => {
+          const nm = CSTATE[st[i]].ko;
+          if (!out.length || out[out.length-1].stage !== nm)
+            out.push({...s, i, stage: nm});
+        });
+        return out;
+      })();
 
   // 이름 줄에 쓸 국면 묶음. 이어지는 같은 국면은 하나로 합친다.
   const phases = [];
@@ -875,7 +900,8 @@ function drawTracks(){
     d.className = 'tlseg' + (marks[k+1] && phaseOf(marks[k+1].stage) !== phaseOf(m.stage) ? ' pend' : '');
     d.style.left = ((m.t / total) * 100) + '%';
     d.style.width = (((next - m.t) / total) * 100) + '%';
-    d.style.background = STAGE_COLOR[m.stage] || '#94A3B8';
+    d.style.background = STAGE_COLOR[m.stage]
+      || (Object.values(CSTATE).find(c => c.ko === m.stage) || {}).c || '#94A3B8';
     d.dataset.i = String(m.i);
     d.title = `${m.stage} · ${fmt(m.t,1)}s`;
     d.onclick = () => { stop(); seek(m.t); renderFrame(); };
@@ -1169,40 +1195,72 @@ function frameIdx(list, t){
   return best;
 }
 
+/* 카메라는 두 형태로 온다.
+   · **비디오** — `{src, fps, w, h, t0, n}`. 낱장 JPEG은 같은 그림을 매번 통째로 실어서
+     같은 용량에 해상도를 8.7배 키울 자리를 버린다(실측 4.30MB → 1.72MB). 되감기는
+     `currentTime`으로 하고, 그래서 구울 때 키프레임을 1초마다 박아 뒀다
+   · **낱장 목록** — `[{t, b}]`. 옛 기록이 그 형태라 그대로 읽는다
+   시행마다 다를 수 있으므로(주행 시행은 아예 영상이 없다) 형태로 갈라 본다. */
+const isVideo = v => !!(v && v.src);
+
 function drawCams(){
   const r = RUNS[cur];
   const rec = RUNFRAMES[r.id] || null;
   if (String(r.id) !== shownRun){ shownRun = String(r.id); shown.front = shown.wrist = -1; }
 
   ['front', 'wrist'].forEach(cam => {
-    const id = cam === 'front' ? 'camFront' : 'camWrist';
-    const img = el(id), tag = el(cam === 'front' ? 'tagFront' : 'tagWrist');
-    const list = rec && rec[cam];
-    if (!list || !list.length){
+    const suffix = cam === 'front' ? 'Front' : 'Wrist';
+    const img = el('cam' + suffix), vid = el('vid' + suffix), tag = el('tag' + suffix);
+    const src = rec && rec[cam];
+    const has = isVideo(src) ? true : !!(src && src.length);
+    if (!has){
       if (shown[cam] !== -2){
         shown[cam] = -2;
-        img.removeAttribute('src');
-        img.style.visibility = 'hidden';
+        img.removeAttribute('src'); img.style.visibility = 'hidden';
+        vid.removeAttribute('src'); vid.style.visibility = 'hidden';
       }
       tag.className = 'camtag miss';
       tag.textContent = '이 시행은 영상 없음';
       return;
     }
-    const i = Math.max(0, frameIdx(list, tNow));
+
+    if (isVideo(src)){
+      img.style.visibility = 'hidden';
+      if (vid.dataset.run !== String(r.id) + cam){
+        vid.dataset.run = String(r.id) + cam;
+        vid.src = src.src;
+        vid.style.visibility = 'visible';
+        shown[cam] = -1;
+      }
+      // 매 프레임 `currentTime`을 건드리면 디코더가 따라오지 못한다. 한 프레임 폭보다
+      // 멀어졌을 때만 옮긴다 — 그 안이면 어차피 같은 그림이다.
+      const want = Math.max(0, tNow - src.t0);
+      if (Math.abs(vid.currentTime - want) > 0.5 / src.fps && vid.readyState >= 1){
+        if (vid.fastSeek) vid.fastSeek(want); else vid.currentTime = want;
+      }
+      const lag = Math.abs(tNow - (src.t0 + vid.currentTime));
+      tag.className = 'camtag' + (lag > 1.5 ? ' miss' : '');
+      tag.textContent = `${(src.t0 + vid.currentTime).toFixed(1)}s`;
+      return;
+    }
+
+    vid.style.visibility = 'hidden';
+    const i = Math.max(0, frameIdx(src, tNow));
     if (i !== shown[cam]){
       shown[cam] = i;
-      img.src = 'data:image/jpeg;base64,' + list[i].b;
+      img.src = 'data:image/jpeg;base64,' + src[i].b;
       img.style.visibility = 'visible';
     }
     // 앞뒤 어느 쪽으로든 멀면 표시한다 — 시행 시작 전 장면을 걷어낸 뒤로는 첫 몇
     // 초에 붙는 프레임이 오히려 미래에서 온다
-    const lag = Math.abs(tNow - list[i].t);
+    const lag = Math.abs(tNow - src[i].t);
     tag.className = 'camtag' + (lag > 1.5 ? ' miss' : '');
-    tag.textContent = `${list[i].t.toFixed(1)}s`;
+    tag.textContent = `${src[i].t.toFixed(1)}s`;
   });
 
-  const n = rec ? ((rec.front || []).length + (rec.wrist || []).length) : 0;
-  el('camdist').textContent = n ? `${n}장 녹화` : '녹화 없음';
+  const say = c => isVideo(c) ? `${c.w}×${c.h} ${c.n}프레임` : (c ? `${c.length}장` : '');
+  const parts = ['front', 'wrist'].map(c => rec && rec[c] ? say(rec[c]) : '').filter(Boolean);
+  el('camdist').textContent = parts.length ? parts.join(' · ') : '녹화 없음';
 }
 
 /* ── 재생 ─────────────────────────────────

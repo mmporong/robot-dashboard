@@ -102,8 +102,14 @@ def change_point(xs, trials=TRIALS, min_side=MIN_SIDE, seed=SEED):
 
 
 def meta_only(path):
-    """세대만 먼저 본다 — 추세에서 뺄 파일까지 통째로 푸는 것은 낭비다(163MB짜리가 있다)."""
+    """세대만 먼저 본다 — 추세에서 뺄 파일까지 통째로 푸는 것은 낭비다(163MB짜리가 있다).
+
+    `ros2 bag record` 산출물은 메타데이터가 파일 밖(`.run.json`)에 있으므로 그쪽도 본다.
+    """
     from mcap.reader import make_reader
+    side = path.with_suffix('.run.json')
+    if side.exists():
+        return json.loads(side.read_text(encoding='utf-8'))
     with path.open('rb') as f:
         for md in make_reader(f).iter_metadata():
             if md.name == 'run':
@@ -116,6 +122,9 @@ def collect(inbox):
     for path in sorted(inbox.glob('*.mcap')):
         meta = meta_only(path)
         if not meta.get('epoch'):
+            # 세대를 모르는 기록은 뺀다. 억지로 끼워 넣으면 다른 무대의 시행이 같은
+            # 추세선에 섞인다 — 크기로 거르지 않는다. 큰 파일이라도 세대가 적혀 있으면
+            # 봐야 하고(재녹화본이 시행당 80MB다), 작아도 세대를 모르면 못 쓴다.
             # `ros2 bag record`가 받아 적은 파일은 세대를 모른다. 억지로 끼워 넣으면
             # 다른 무대의 시행이 같은 추세선에 섞인다 — 빼되 뺐다고 적는다.
             skipped.append((path.stem, f'{path.stat().st_size / 1e6:.0f}MB · 세대 미상'))

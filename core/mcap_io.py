@@ -25,6 +25,7 @@ RAM 25.6GB까지 자랐고, `systemd-oomd`가 진범 대신 gnome-shell을 죽�
 import base64
 import bisect
 import io
+import json
 import math
 
 from mcap.reader import make_reader
@@ -93,13 +94,19 @@ def load(path, cams, jpeg, keep=None):
               `/tf`·`/tf_static`은 이 훅과 무관하게 **항상** 튜플로 접는다.
     """
     series, frames, meta = {}, {}, {}
+    # `ros2 bag record`는 우리 메타데이터(`run`)를 쓸 방법이 없다. 그래서 녹화 스크립트가
+    # 같은 이름의 `.run.json`을 옆에 떨어뜨리고, 파일 안에 없을 때만 그것을 읽는다.
+    # 파일 안에 있으면 그쪽이 이긴다 — 기록에 실린 것이 옆에 놓인 것보다 세다.
+    side = path.with_suffix('.run.json')
+    if side.exists():
+        meta = json.loads(side.read_text(encoding='utf-8'))
     with path.open('rb') as f:
         # 메타데이터와 메시지를 한 번에 훑으려면 리더를 직접 세워야 한다. 이때
         # ROS 2 해독기를 함께 물려야 스키마가 파일 안에 있어도 메시지가 풀린다.
         reader = make_reader(f, decoder_factories=[DecoderFactory()])
         for md in reader.iter_metadata():
             if md.name == 'run':
-                meta = dict(md.metadata)
+                meta = dict(md.metadata)          # 파일 안 것이 사이드카를 이긴다
         for m in read_ros2_messages(reader):
             topic, t = m.channel.topic, m.log_time_ns / 1e9
             if topic in cams:
