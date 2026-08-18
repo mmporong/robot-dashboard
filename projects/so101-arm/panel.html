@@ -1,0 +1,343 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SO-101 팔로워 제어</title>
+<style>
+  :root{
+    --ground:#EEF1F4; --panel:#FFFFFF; --ink:#12171C; --muted:#5B6670;
+    --rule:#DCE1E6; --rule-soft:#EBEEF1; --accent:#0E7490; --accent-soft:#E0F2F6;
+    --ok:#15803D; --warn:#B45309; --crit:#B91C1C; --crit-deep:#9B1717;
+    --stage:#14191E; --stage-ink:#E8EDF1;
+    --mono:ui-monospace,"SF Mono","Cascadia Code",Menlo,Consolas,monospace;
+    --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans KR",sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--sans);
+       font-size:14px;line-height:1.45;-webkit-font-smoothing:antialiased}
+  .num{font-family:var(--mono);font-variant-numeric:tabular-nums}
+  .eyebrow{font-size:10px;font-weight:700;letter-spacing:.10em;text-transform:uppercase;
+           color:var(--muted);margin:0 0 8px}
+  .app{height:100dvh;display:flex;flex-direction:column;gap:9px;padding:9px 12px}
+
+  /* ── 상단바: 왼쪽 연결 조작, 오른쪽 정지 ─────────────── */
+  .topbar{flex:0 0 auto;display:flex;align-items:center;gap:8px}
+  .brand{font-size:15px;font-weight:800;letter-spacing:-.01em;margin-right:6px}
+  .brand span{font-weight:500;color:var(--muted);font-size:12px;margin-left:7px}
+  .chip{border:1px solid var(--rule);background:var(--panel);border-radius:8px;
+        padding:6px 13px;cursor:pointer;font-family:inherit;font-size:12.5px;
+        font-weight:600;color:var(--ink);white-space:nowrap}
+  .chip:hover{border-color:var(--accent);color:var(--accent)}
+  .chip:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+  .chip.hot{border-color:var(--crit);color:var(--crit)}
+  .chip.hot:hover{background:#FDECEC}
+  .stop-big{margin-left:auto;background:var(--crit);border:1px solid var(--crit);
+            color:#fff;font-weight:800;font-size:14.5px;padding:9px 26px;border-radius:9px;
+            cursor:pointer;font-family:inherit;letter-spacing:.02em}
+  .stop-big:hover{background:var(--crit-deep)}
+  .stop-big:focus-visible{outline:3px solid var(--crit);outline-offset:2px}
+  .stop-big small{display:block;font-size:9.5px;font-weight:600;opacity:.75;letter-spacing:.08em}
+
+  /* ── 본문: 카메라 스테이지(히어로) + 조작 컬럼 ────────── */
+  .main{flex:1;min-height:0;display:grid;gap:9px;
+        grid-template-columns:minmax(0,1fr) 372px}
+  .stage{position:relative;background:var(--stage);border-radius:12px;overflow:hidden;
+         display:flex;align-items:center;justify-content:center}
+  .stage img{width:100%;height:100%;object-fit:contain;display:block}
+  .feeds{position:absolute;inset:0;display:grid;grid-template-columns:1fr 1fr;gap:2px}
+  .feed{position:relative;min-width:0;overflow:hidden;display:flex;
+        align-items:center;justify-content:center}
+  .ftag{position:absolute;left:8px;bottom:8px;background:rgba(10,14,18,.72);
+        color:var(--stage-ink);font-size:11px;font-weight:600;padding:3px 9px;
+        border-radius:6px;backdrop-filter:blur(2px)}
+  @media (max-width:980px){ .feeds{grid-template-columns:1fr;grid-template-rows:1fr 1fr} }
+  .stage .nocam{color:#6B7683;font-size:13px}
+  .hud{position:absolute;top:10px;left:12px;right:12px;display:flex;gap:6px;
+       pointer-events:none}
+  .badge{display:inline-flex;align-items:center;gap:6px;background:rgba(10,14,18,.72);
+         color:var(--stage-ink);border-radius:7px;padding:4px 10px;font-size:11px;
+         font-weight:600;backdrop-filter:blur(2px)}
+  .badge[hidden]{display:none}
+  .badge .led{width:7px;height:7px;border-radius:50%;background:#5B6670}
+  .badge.on .led{background:#34D399}
+  .badge.warn .led{background:#FBBF24}
+  .badge:last-child{margin-left:auto}
+
+  .ops{display:flex;flex-direction:column;gap:9px;min-height:0;overflow:auto}
+  .card{background:var(--panel);border:1px solid var(--rule);border-radius:12px;
+        padding:11px 13px}
+
+  /* 속도 */
+  .speedrow{display:flex;align-items:center;gap:10px}
+  .speedrow label{font-size:11px;font-weight:700;letter-spacing:.08em;color:var(--accent)}
+  .speedrow input{flex:1;accent-color:var(--accent)}
+  .speedrow .num{width:40px;text-align:right;font-size:12.5px;font-weight:700;color:var(--accent)}
+
+  /* 관절: 슬라이더가 상태 표시이자 조작 */
+  .jrow{display:grid;grid-template-columns:88px 26px 1fr 26px 62px;gap:6px;
+        align-items:center;padding:5px 0;border-bottom:1px solid var(--rule-soft)}
+  .jrow:last-child{border-bottom:0}
+  .jname{font-size:12px;font-weight:600}
+  .jname i{font-style:normal;color:var(--muted);font-weight:500;font-size:10px;display:block}
+  .jrow input[type=range]{width:100%;accent-color:var(--accent);height:24px}
+  .jrow input[type=range]:disabled{accent-color:#B4BEC6}
+  .jbtn{border:1px solid var(--rule);background:var(--panel);border-radius:6px;
+        width:26px;height:24px;font-family:var(--mono);font-size:13px;cursor:pointer;
+        padding:0;line-height:1;color:var(--muted)}
+  .jbtn:hover{border-color:var(--accent);color:var(--accent)}
+  .jval{text-align:right;font-size:13.5px;font-weight:600}
+
+  /* IK */
+  .ikgrid{display:grid;grid-template-columns:auto 1fr auto 1fr;gap:7px 8px;align-items:center}
+  .ikgrid label{font-size:11.5px;color:var(--muted)}
+  .ikgrid input{font-family:var(--mono);font-size:13px;padding:5px 8px;width:100%;
+                border:1px solid var(--rule);border-radius:7px;background:var(--panel);color:var(--ink)}
+  .ikgrid input:focus{outline:2px solid var(--accent);outline-offset:-1px;border-color:var(--accent)}
+  .ikact{display:flex;gap:7px;margin-top:9px}
+  .ikact .chip{flex:1;text-align:center;padding:8px 0;font-size:13px}
+  .ikact .go{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:700}
+  .ikact .go:hover{background:#0A5A72;color:#fff}
+  .ikout{font-size:11.5px;color:var(--muted);margin-top:8px;min-height:30px}
+  .ikout .num{color:var(--ink)}
+
+  /* ── 하단: 캘리브 서랍 + 로그 ─────────────────────── */
+  .bottom{flex:0 0 auto;display:grid;grid-template-columns:minmax(0,1fr) 372px;gap:9px}
+  .logwrap{position:relative;flex:0 0 auto}
+  .minibtn{position:absolute;top:6px;right:8px;z-index:2;border:1px solid var(--rule);
+           background:var(--panel);color:var(--muted);border-radius:6px;padding:2px 9px;
+           font-family:inherit;font-size:11px;cursor:pointer}
+  .minibtn:hover{border-color:var(--accent);color:var(--accent)}
+  .minibtn.done{border-color:var(--ok);color:var(--ok)}
+  .log{background:var(--panel);border:1px solid var(--rule);border-radius:10px;
+       padding:8px 12px;font-family:var(--mono);font-size:11px;color:var(--muted);
+       white-space:pre-wrap;height:64px;overflow:auto}
+  .log b{color:var(--ink)}
+  details.calib{background:var(--panel);border:1px solid var(--rule);border-radius:10px;
+                padding:0 12px;height:64px;overflow:auto}
+  details.calib[open]{height:auto;max-height:40dvh}
+  details.calib summary{cursor:pointer;font-size:12px;font-weight:600;color:var(--muted);
+                        padding:9px 2px;list-style-position:inside}
+  details.calib summary b{color:var(--ok)}
+  details.calib summary .todo{color:var(--warn)}
+  .calbody{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;padding:2px 0 11px}
+  .step{border:1px solid var(--rule);border-radius:9px;padding:8px 10px;font-size:11.5px}
+  .step b{display:block;font-size:12px;margin-bottom:2px}
+  .step small{color:var(--muted);display:block;margin-bottom:7px;line-height:1.4}
+  .step .chip{width:100%;padding:5px 0;text-align:center}
+  .ranges{grid-column:1/-1;font-family:var(--mono);font-size:10.5px;color:var(--muted);
+          display:flex;gap:14px;flex-wrap:wrap}
+
+  @media (max-width:980px){
+    .main,.bottom{grid-template-columns:1fr}
+    .stage{min-height:46dvh}
+  }
+  @media (prefers-reduced-motion: no-preference){
+    .stop-big{transition:background .12s}
+    .chip{transition:border-color .12s,color .12s}
+  }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="topbar">
+    <div class="brand">SO-101 팔로워<span id="port">—</span></div>
+    <button class="chip" id="bConn">연결</button>
+    <button class="chip" id="bDisc">해제</button>
+    <button class="chip" id="bTon">토크 ON</button>
+    <button class="chip hot" id="bToff">토크 OFF</button>
+    <button class="stop-big" id="bStop">⏹ 정지<small>SPACE</small></button>
+  </div>
+
+  <div class="main">
+    <!-- 카메라 스테이지 -->
+    <section class="stage">
+      <div class="feeds">
+        <div class="feed">
+          <img id="cam" src="/cam" alt="손목캠"
+               onerror="this.outerHTML='<div class=nocam>손목캠 없음</div>'">
+          <span class="ftag">손목캠 · 색 검출</span>
+        </div>
+        <div class="feed">
+          <img id="dep" src="/depth" alt="깊이"
+               onerror="this.outerHTML='<div class=nocam>깊이 없음 — Astra 연결 확인</div>'">
+          <span class="ftag" id="dtag">뎁스캠 · 거리</span>
+        </div>
+      </div>
+      <div class="hud">
+        <span class="badge" id="hC"><span class="led"></span>연결</span>
+        <span class="badge" id="hK"><span class="led"></span>캘리브</span>
+        <span class="badge" id="hT"><span class="led"></span>토크</span>
+        <span class="badge" id="hR" hidden><span class="led"></span>범위 기록 중</span>
+        <span class="badge num" id="hSpd">15%</span>
+      </div>
+    </section>
+
+    <!-- 조작 컬럼 -->
+    <aside class="ops">
+      <div class="card speedrow">
+        <label>속도</label>
+        <input type="range" id="speed" min="1" max="100" value="15">
+        <span class="num" id="speedv">15%</span>
+      </div>
+      <div class="card">
+        <p class="eyebrow">관절 — 슬라이더를 끌면 그 각도로 이동</p>
+        <div id="joints"></div>
+      </div>
+      <div class="card">
+        <p class="eyebrow">IK 이동 · pan 축 기준 [m]</p>
+        <div class="ikgrid">
+          <label>x 전방</label><input id="ix" value="0.20">
+          <label>y 좌</label><input id="iy" value="0.00">
+          <label>z 상</label><input id="iz" value="-0.05">
+          <label>pitch°</label><input id="ip" value="-90">
+        </div>
+        <div class="ikact">
+          <button class="chip go" id="bIK">IK 이동</button>
+          <button class="chip" id="bHome">홈 자세</button>
+        </div>
+        <div class="ikout" id="ikout">목표를 넣고 [IK 이동] — 도달 후 죠 끝을 자로 재서 예측과 비교합니다.</div>
+      </div>
+    </aside>
+  </div>
+
+  <div class="bottom">
+    <div class="logwrap">
+      <button class="minibtn" id="bCopy" title="로그 전문을 클립보드로">복사</button>
+      <div class="log" id="log">서버 연결 대기…</div>
+    </div>
+    <details class="calib" id="calibBox">
+      <summary id="calSum">캘리브레이션</summary>
+      <div class="calbody">
+        <div class="step"><b>1 중립 기록</b><small>토크가 풀리면 팔을 손으로 가동범위 한가운데 자세로</small>
+          <button class="chip" id="bNeu">기록</button></div>
+        <div class="step"><b>2 범위</b><small>각 관절을 끝에서 끝까지 (자동 기록, wrist_roll 생략 가능)</small>
+          <button class="chip" id="bRng">기록 표시</button></div>
+        <div class="step"><b>3 저장</b><small>모터 EEPROM + JSON — lerobot CLI 호환</small>
+          <button class="chip" id="bSav">저장</button></div>
+        <div class="ranges" id="ranges"></div>
+      </div>
+    </details>
+  </div>
+</div>
+
+<script>
+const ARM=['shoulder_pan','shoulder_lift','elbow_flex','wrist_flex','wrist_roll'];
+const ALL=[...ARM,'gripper'];
+const $=id=>document.getElementById(id);
+const esc=s=>String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+
+/* 관절 행 — 슬라이더가 상태 표시이자 조작 */
+for(const m of ALL){
+  const step=m==='gripper'?5:2;
+  const [lo,hi]=m==='gripper'?[0,100]:[-110,110];
+  $('joints').insertAdjacentHTML('beforeend',
+    `<div class="jrow">
+       <span class="jname">${m.replace('_',' ')}<i>ID ${ALL.indexOf(m)+1}</i></span>
+       <button class="jbtn" data-j="${m}" data-d="${-step}">−</button>
+       <input type="range" id="s_${m}" min="${lo}" max="${hi}" step="1" value="0" disabled>
+       <button class="jbtn" data-j="${m}" data-d="${step}">+</button>
+       <span class="jval num" id="v_${m}">—</span>
+     </div>`);
+  $('ranges').insertAdjacentHTML('beforeend',`<span id="r_${m}"></span>`);
+}
+document.querySelectorAll('.jbtn').forEach(b=>b.onclick=()=>
+  cmd({op:'jog',joint:b.dataset.j,delta:+b.dataset.d}));
+
+async function cmd(body){
+  try{
+    const r=await fetch('/cmd',{method:'POST',headers:{'Content-Type':'application/json'},
+                                body:JSON.stringify(body)});
+    return await r.json();
+  }catch(e){ $('log').textContent='서버와 연결이 끊겼습니다 — panel_server.py 를 확인하세요'; }
+}
+$('bConn').onclick=()=>cmd({op:'connect'});
+$('bDisc').onclick=()=>cmd({op:'disconnect'});
+$('bTon').onclick =()=>cmd({op:'torque',on:true});
+$('bToff').onclick=()=>cmd({op:'torque',on:false});
+$('bStop').onclick=()=>cmd({op:'stop'});
+$('bCopy').onclick=async()=>{
+  const txt=window.__logRaw||$('log').innerText;
+  try{ await navigator.clipboard.writeText(txt); }
+  catch(e){ const ta=document.createElement('textarea'); ta.value=txt;
+            document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove(); }
+  const b=$('bCopy'); b.textContent='복사됨'; b.classList.add('done');
+  setTimeout(()=>{b.textContent='복사'; b.classList.remove('done');},1400);
+};
+$('bNeu').onclick =()=>cmd({op:'neutral'});
+$('bSav').onclick =()=>cmd({op:'save_calib'});
+let recording=false;
+$('bRng').onclick =()=>cmd({op:'range',start:!recording});
+$('bHome').onclick=()=>cmd({op:'home'});
+document.addEventListener('keydown',e=>{
+  if(e.code==='Space'&&e.target.tagName!=='INPUT'){e.preventDefault();cmd({op:'stop'});}
+});
+
+/* 관절 슬라이더: 드래그 중엔 동기화를 멈추고, 놓는 순간 목표를 보낸다 */
+const dragging={};
+for(const m of ALL){
+  const s=$('s_'+m);
+  s.addEventListener('pointerdown',()=>dragging[m]=true);
+  s.addEventListener('change',()=>{ cmd({op:'goto',joint:m,value:+s.value});
+                                    setTimeout(()=>dragging[m]=false,400); });
+}
+$('speed').addEventListener('input',()=>$('speedv').textContent=$('speed').value+'%');
+$('speed').addEventListener('change',()=>cmd({op:'speed',pct:+$('speed').value}));
+
+$('bIK').onclick=async()=>{
+  const r=await cmd({op:'ik',x:$('ix').value,y:$('iy').value,z:$('iz').value,pitch:$('ip').value});
+  if(!r) return;
+  $('ikout').innerHTML = r.ok
+    ? `q = <span class="num">[${r.q.join(', ')}]</span><br>`
+      +`예측 TCP <span class="num">(${r.fk_pan.join(', ')})</span> — 3초 보간 이동 중`
+    : `${r.msg}`;
+};
+
+/* 상태 폴링 */
+let calibInit=false;
+async function tick(){
+  let st;
+  try{ st=await (await fetch('/state')).json(); }
+  catch(e){ $('hC').className='badge'; return; }
+  recording=st.recording;
+  $('port').textContent=st.connected?'● 온라인':'○ 오프라인';
+  $('hC').className='badge'+(st.connected?' on':'');
+  $('hK').className='badge'+(st.calibrated?' on':' warn');
+  $('hT').className='badge'+(st.torque?' on':'');
+  $('hR').hidden=!st.recording;
+  $('hSpd').textContent=(st.speed_pct||15)+'%';
+  const dt=$('dtag'), dp=st.depth;
+  if(dt&&dp) dt.textContent = dp.ok
+    ? `뎁스캠 · 중앙 ${dp.center_mm}mm · 최근접 ${dp.min_mm}mm · 유효 ${dp.valid_pct}%`
+    : `뎁스캠 · ${dp.msg||'대기'}`;
+  if(st.speed_pct&&document.activeElement!==$('speed')){
+    $('speed').value=st.speed_pct; $('speedv').textContent=st.speed_pct+'%';
+  }
+
+  /* 캘리브 서랍: 첫 응답에서 상태에 맞춰 열고 닫는다 */
+  if(!calibInit){ $('calibBox').open=!st.calibrated; calibInit=true; }
+  $('calSum').innerHTML='캘리브레이션 — '+(st.calibrated
+    ?'<b>완료</b> · 다시 하려면 펼치기'
+    :'<span class="todo">필요 — 펼쳐서 1→2→3 순서로</span>');
+
+  const calibView=st.calibrated&&!st.recording;
+  for(const m of ALL){
+    const v=st.pos[m];
+    const s=$('s_'+m);
+    s.disabled=!calibView||!st.torque;
+    if(v===undefined){ $('v_'+m).textContent='—'; continue; }
+    $('v_'+m).textContent=calibView?v.toFixed(1)+(m==='gripper'?'':'°'):v.toFixed(0)+'t';
+    if(calibView&&!dragging[m]) s.value=v;
+    const rg=st.range[m];
+    $('r_'+m).textContent=rg?`${m} ${rg[0].toFixed(0)}~${rg[1].toFixed(0)}`:'';
+  }
+  const lines=(st.log||[]);
+  window.__logRaw=lines.join('\n');
+  $('log').innerHTML=lines.map((l,i,a)=>i===a.length-1?`<b>${esc(l)}</b>`:esc(l)).join('\n');
+  $('log').scrollTop=$('log').scrollHeight;
+}
+setInterval(tick,200); tick();
+</script>
+</body>
+</html>

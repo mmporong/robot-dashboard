@@ -1,0 +1,32 @@
+{
+  "signs": {
+    "shoulder_pan": 1,
+    "shoulder_lift": 1,
+    "elbow_flex": 1,
+    "wrist_flex": 1,
+    "wrist_roll": 1
+  },
+  "offsets": {
+    "shoulder_pan": 0.0,
+    "shoulder_lift": 0.0,
+    "elbow_flex": 0.0,
+    "wrist_flex": 0.0,
+    "wrist_roll": 0.0
+  },
+  "note": "2026-08-14 확정: 5관절 전부 +1. wrist_flex는 조그 목측으로 -1로 잘못 판정했다가 IK 자세 사진(수직 아래 명령에 위로 45° 결과)으로 +1 확정 — 방향 판정은 목측보다 자세 사진이 정확하다",
+  "home_q": [
+    -0.0499,
+    0.0176,
+    0.168,
+    -0.0361,
+    0.102
+  ],
+  "gripper": {
+    "open_is_positive": true,
+    "observed_range_deg": [
+      0,
+      100
+    ],
+    "note": "2026-08-18 실측: + 방향이 열림. 15.6→45.1 명령에 죠가 크게 벌어짐. 관측 당시 wrist_roll 이 누워 있어 죠가 좌우로 벌어졌고 움직인 쪽은 한쪽 턱 — 파지 자세에서는 roll 을 세워 상하로 물리게 한다"
+  }
+}
