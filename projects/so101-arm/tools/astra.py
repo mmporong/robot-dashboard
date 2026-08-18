@@ -68,7 +68,15 @@ class _Dispatch:
 
 
 class Astra:
-    def __init__(self, timeout_ms=2000):
+    def __init__(self, timeout_ms=2000, color=None):
+        """color: True 강제 켬 · False 끔 · None 이면 환경변수 ASTRA_COLOR(기본 켬).
+
+        Astra S 는 USB 2.0 장치라 640x480 깊이와 640x480 컬러를 동시에 흘리면
+        대역폭이 빡빡하다. 정합처럼 색이 필요할 때만 켜고 평소에는 끌 수 있게
+        분리해 둔다 — 깊이만 쓰는 화면에는 컬러가 필요 없다.
+        """
+        if color is None:
+            color = os.environ.get('ASTRA_COLOR', '1') not in ('0', 'false', 'False')
         # 심볼이 두 라이브러리에 나뉘어 있다 — 세션·리더는 libastra_core.so,
         # 프레임·스트림 접근은 libastra.so. 어느 쪽에 있는지 찾아 부른다.
         self._libs = [C.CDLL(str(LIB / n), mode=C.RTLD_GLOBAL)
@@ -102,7 +110,7 @@ class Astra:
         self._has_color = False
         self._last_color = None
         try:
-            if a.astra_reader_get_colorstream(
+            if color and a.astra_reader_get_colorstream(
                     self._reader, C.byref(self._color_stream)) == 0:
                 a.astra_stream_start(self._color_stream)
                 self._has_color = True
@@ -216,7 +224,17 @@ class Astra:
 
     def close(self):
         # 종료 순서를 지켜도 SDK 가 코어를 뱉는 일이 있어(18.04 바이너리) 각각 감싼다.
-        # 프로세스가 끝나면 커널이 USB 를 회수하므로 실패해도 다음 실행에 지장이 없다.
+        #
+        # ✎ 2026-08-18: "프로세스가 끝나면 커널이 USB 를 회수한다"는 전제가 틀렸다.
+        # 스트림을 멈추지 않고 리더를 파괴하다 double free 로 죽은 뒤, 장치가
+        # 열거는 되지만 control request 를 받지 않는 상태로 굳었다 —— 재연결로도
+        # 안 풀리고 전원을 완전히 끊어야 돌아왔다. 그래서 스트림부터 멈춘다.
+        for st in (getattr(self, '_color_stream', None), getattr(self, '_stream', None)):
+            if st:
+                try:
+                    self._lib.astra_stream_stop(C.byref(st))
+                except Exception:
+                    pass
         for call in (lambda: self._lib.astra_reader_destroy(C.byref(self._reader)),
                      lambda: self._lib.astra_streamset_close(C.byref(self._sensor)),
                      lambda: self._lib.astra_terminate()):
