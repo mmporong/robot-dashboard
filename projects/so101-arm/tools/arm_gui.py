@@ -323,6 +323,28 @@ class Worker(threading.Thread):
         target = {j: mapping['signs'][j] * math.degrees(q_rad[i])
                   + mapping['offsets'][j] for i, j in enumerate(ARM)}
         cur = self.bus.sync_read('Present_Position', ARM)
+
+        # ── wrist_roll 은 ±180 이 같은 자세다. 목표를 현재 위치에 가장 가까운 등가
+        # 각도로 바꾸지 않으면, 0.26° 차이를 359.74° **역회전**으로 수행한다.
+        #
+        # 실측 2026-08-19: 현재 179.74° 에서 목표 -180.0° 을 그대로 보간했더니 팔이
+        # 반대로 돌기 시작해 92.88° 에서 멈췄다(손목캠이 팔에 눌리는 경로). 전날
+        # "wrist_roll → 180" 명령에 손목이 크게 돌아 카메라가 부서질 뻔한 것도 같은
+        # 원인이다. mapping.json 의 offsets.wrist_roll = -180 을 넣은 뒤로는 IK 목표가
+        # 항상 각도 경계에 놓이므로 이 보정 없이는 상시 발생한다.
+        #
+        # 등가 각도가 캘리브 범위(±180) 밖으로 나가면 되돌린다 — 그때는 먼 길이
+        # 유일한 경로다.
+        for j in ('wrist_roll',):
+            d = target[j] - cur[j]
+            if d > 180 and -180 <= target[j] - 360 <= 180:
+                target[j] -= 360
+            elif d < -180 and -180 <= target[j] + 360 <= 180:
+                target[j] += 360
+            moved = abs(target[j] - cur[j])
+            if moved > 90:
+                self.say(f'⚠ {j} 를 {moved:.0f}° 돌립니다 — 손목캠 간섭을 확인하세요')
+
         steps = max(2, int(seconds * 50))
         for i in range(1, steps + 1):
             if self.abort.is_set():               # 정지 버튼 — 즉시 끊는다
