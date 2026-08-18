@@ -1,0 +1,41 @@
+# Orbbec Astra (2bc5:0401) — 오디오 인터페이스에서 snd-usb-audio 를 떼어 낸다.
+#
+# ## 왜 필요한가
+#
+# Astra 는 인터페이스 세 개를 노출한다: If0 = Vendor Specific(깊이·컬러), If1/If2 =
+# Audio(내장 마이크). 커널 오디오 드라이버가 If1/If2 를 claim 하면 libusb 의
+# libusb_set_configuration() 이 LIBUSB_ERROR_BUSY(-6) 로 떨어진다 — 커널은 어느 한
+# 인터페이스라도 드라이버가 물고 있는 동안 configuration 변경을 거부하기 때문이다.
+# Astra SDK 는 그 실패를 "Failed to send a USB control request!" 로 보고해서, 메시지만
+# 보면 권한이나 케이블 문제처럼 읽힌다.
+#
+# 2026-08-18 실측 (libusb 로 단계별 확인):
+#   if1 kernel_driver_active → 1        (snd-usb-audio)
+#   if2 kernel_driver_active → 1        (snd-usb-audio)
+#   set_config(1)            → -6 BUSY
+# 두 인터페이스를 unbind 하자 BUSY 가 사라졌다.
+#
+# ## 왜 udev 인가 (수동 unbind 로는 부족하다)
+#
+# 손으로 unbind 해도 케이블을 다시 꽂는 순간 커널이 재바인딩한다. 진단 중 재연결이
+# 잦으면 "고쳤는데 또 안 된다"가 반복되며 원인 판단이 흐려진다. 붙는 시점에 자동으로
+# 떼어야 한다.
+#
+# 공식 규칙(AstraSDK/install/orbbec-usb.rules)은 권한(MODE 0666)만 다루고 이 문제를
+# 처리하지 않는다. Orbbec 포럼에도 같은 증상이 미해결로 남아 있다.
+#
+# ## 두 줄인 이유
+#
+# 드라이버가 붙는 순서는 상황에 따라 다르다. add 시점에 이미 붙어 있을 수도 있고,
+# bind 이벤트가 따로 올 수도 있어 양쪽 다 건다. 이미 떨어져 있으면 unbind 는 조용히
+# 실패하므로 중복 실행은 무해하다.
+#
+# 설치:
+#   sudo cp 99-orbbec-noaudio.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   (그 뒤 카메라를 다시 꽂으면 적용된다)
+#
+# 마이크를 쓰게 되면 이 파일을 지우고 대신 SDK 를 열기 직전에만 unbind 할 것.
+
+ACTION=="bind", SUBSYSTEM=="usb", DRIVER=="snd-usb-audio", ATTRS{idVendor}=="2bc5", ATTRS{idProduct}=="0401", RUN+="/bin/sh -c 'echo -n %k > /sys/bus/usb/drivers/snd-usb-audio/unbind'"
+ACTION=="add", SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_interface", ATTRS{idVendor}=="2bc5", ATTRS{idProduct}=="0401", ATTR{bInterfaceClass}=="01", RUN+="/bin/sh -c 'echo -n %k > /sys/bus/usb/drivers/snd-usb-audio/unbind'"
