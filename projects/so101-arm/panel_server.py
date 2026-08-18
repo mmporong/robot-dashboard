@@ -112,11 +112,30 @@ class Depth(threading.Thread):
     실패해도 패널 전체가 죽지 않도록 예외를 삼키고 상태만 남긴다.
     """
 
+    # 빨강 HSV 두 구간(색상환 양 끝) — **뎁스캠 전용 값이다.**
+    # 손목캠(pick_red.py)의 ((0,150,100),(6,…)) / ((174,150,100),(179,…)) 를 그대로
+    # 쓰면 이 카메라에서는 검출 0 이 된다. 2026-08-18 같은 장면 실측:
+    #   빨간 물체  H 168~175 (중앙 174) · S 중앙 211 · V 중앙 87
+    #   사람 팔    H   5~  6 (중앙   6) · S 중앙 117 · V 중앙 74
+    # ① V 하한 100 이 물체(중앙 87)를 통째로 잘라내고 있었다 → 55 로 내린다.
+    # ② H 상단 구간이 174~179 라 물체 화소의 절반(168~173)을 놓쳤다 → 166 부터.
+    # ③ 살색이 빨강 저채도 쪽에 걸려 사람 팔이 물체보다 큰 덩어리로 잡힌다.
+    #    S 하한 140 이면 팔은 전부 빠지고 물체만 남는다(실측: S≥140 에서 팔 0px).
+    # 카메라·조명이 바뀌면 다시 잴 것.
+    RED = [((0, 140, 55), (10, 255, 255)), ((166, 140, 55), (179, 255, 255))]
+    # 뎁스캠에서 큐브는 200px 안팎으로 작게 잡힌다(멀리서 넓게 보므로).
+    MIN_AREA = 80
+    # 작업 영역 밖(사람·벽)을 거르는 깊이 창 [m]
+    Z_RANGE = (0.35, 1.20)
+
     def __init__(self):
         super().__init__(daemon=True)
         self.lock = threading.Lock()
         self.jpeg = None
+        self.rgb_jpeg = None
         self.stats = {'ok': False, 'msg': '시작 전'}
+        self.blob = None
+        self.swap_rb = None        # 컬러가 RGB 로 오는지 BGR 로 오는지 — 첫 검출로 확정
         self.started = False
 
     def ensure(self):
@@ -128,12 +147,24 @@ class Depth(threading.Thread):
         import numpy as np
         import cv2
         sys.path.insert(0, str(TOOLS))
-        try:
-            from astra import Astra
-            cam = Astra()
-        except Exception as e:
+        from astra import Astra
+        # 카메라 열기는 재시도한다 — 직전 프로세스가 USB 를 놓는 데 시간이 걸려
+        # 첫 시도가 "깊이 프레임이 오지 않습니다"로 떨어지는 일이 있다(실측
+        # 2026-08-18 서버 재기동). 한 번 실패하고 스레드가 끝나면 서버를 통째로
+        # 다시 띄워야 하고, 그때마다 연결 경로가 토크를 풀어 팔이 내려앉는다.
+        cam = None
+        for attempt in range(1, 11):
+            try:
+                cam = Astra()
+                break
+            except Exception as e:
+                with self.lock:
+                    self.stats = {'ok': False,
+                                  'msg': f'열기 재시도 {attempt}/10 — {type(e).__name__}'}
+                time.sleep(2.0)
+        if cam is None:
             with self.lock:
-                self.stats = {'ok': False, 'msg': f'{type(e).__name__}: {str(e)[:60]}'}
+                self.stats = {'ok': False, 'msg': '카메라를 열지 못했습니다 (10회 시도)'}
             return
         while True:
             try:
@@ -145,6 +176,7 @@ class Depth(threading.Thread):
                 v = np.clip((d.astype(np.float32) - 300) / 900, 0, 1)
                 img = cv2.applyColorMap((255 * (1 - v)).astype(np.uint8), cv2.COLORMAP_TURBO)
                 img[~valid] = (40, 40, 40)         # 측정 실패는 어둡게
+                self._scan_red(cam, d, cv2, np)
                 ok, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 75])
                 if ok:
                     nz = d[valid]
@@ -160,6 +192,70 @@ class Depth(threading.Thread):
                     self.stats = {'ok': False, 'msg': f'{type(e).__name__}'}
                 time.sleep(0.3)
             time.sleep(0.08)
+
+    def _scan_red(self, cam, d, cv2, np):
+        """컬러에서 빨간 덩어리를 찾고 같은 픽셀의 깊이로 카메라 3D 좌표를 낸다.
+
+        깊이가 컬러 좌표계로 registration 돼 있어야 같은 (u, v) 가 성립한다
+        (astra.Astra.registered). 꺼져 있으면 좌표가 조용히 어긋나므로 함께 싣는다.
+        """
+        rgb = cam.color()
+        if rgb is None or rgb.ndim != 3:
+            return
+        # 미리보기는 검출 결과와 무관하게 갱신한다 — 빨간 물체가 없을 때도 화면은
+        # 나와야 조준과 원인 판단을 할 수 있다. swap_rb 미확정이면 RGB 로 가정한다.
+        disp = rgb if self.swap_rb else rgb[:, :, ::-1]
+        ok, buf = cv2.imencode('.jpg', np.ascontiguousarray(disp),
+                               [cv2.IMWRITE_JPEG_QUALITY, 75])
+        if ok:
+            with self.lock:
+                self.rgb_jpeg = buf.tobytes()
+        cand = (True, False) if self.swap_rb is None else (self.swap_rb,)
+        best = None
+        for swap in cand:
+            img = rgb[:, :, ::-1] if swap else rgb
+            hsv = cv2.cvtColor(np.ascontiguousarray(img), cv2.COLOR_BGR2HSV)
+            m = np.zeros(hsv.shape[:2], np.uint8)
+            for lo, hi in self.RED:
+                m |= cv2.inRange(hsv, np.array(lo), np.array(hi))
+            m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+            n, _, st, ct = cv2.connectedComponentsWithStats(m, 8)
+            k = max(range(1, n), key=lambda i: st[i, cv2.CC_STAT_AREA], default=None)
+            if k is None:
+                continue
+            area = int(st[k, cv2.CC_STAT_AREA])
+            if area >= self.MIN_AREA and (best is None or area > best[0]):
+                best = (area, swap, float(ct[k][0]), float(ct[k][1]))
+        if best is None:
+            with self.lock:
+                self.blob = None
+            return
+        area, swap, u, v = best
+        if self.swap_rb is None:
+            self.swap_rb = swap        # 한 번 정해지면 이후엔 그 해석만 쓴다
+        # 깊이는 한 점만 읽으면 구멍에 걸리므로 블롭 주변 창의 중앙값을 쓴다
+        h, w = d.shape
+        r = 5
+        win = d[max(0, int(v) - r):int(v) + r + 1, max(0, int(u) - r):int(u) + r + 1]
+        nz = win[win > 0]
+        z_mm = int(np.median(nz)) if nz.size else 0
+        # cam.point() 는 깊이 배열을 통째로 받으므로 여기서 직접 투영한다 —
+        # 창 중앙값을 쓰려고 (H, W) 배열을 매 프레임 새로 만들면 낭비가 크다.
+        if z_mm:
+            z = z_mm / 1000.0
+            fx = (w / 2) / math.tan(cam.hfov / 2)
+            fy = (h / 2) / math.tan(cam.vfov / 2)
+            pt = ((u - w / 2) * z / fx, (v - h / 2) * z / fy, z)
+        else:
+            pt = None
+        if pt is not None and not (self.Z_RANGE[0] <= pt[2] <= self.Z_RANGE[1]):
+            pt = None                       # 작업 영역 밖 — 좌표는 버리고 화소만 남긴다
+        with self.lock:
+            self.blob = {'u': round(u, 1), 'v': round(v, 1), 'area': area,
+                         'z_mm': z_mm, 'valid_px': int(nz.size),
+                         'cam_xyz': [round(c, 4) for c in pt] if pt else None,
+                         'registered': bool(getattr(cam, 'registered', False)),
+                         'swap_rb': bool(self.swap_rb)}
 
 
 def make_handler(worker, kin, cam, dep):
@@ -190,6 +286,33 @@ def make_handler(worker, kin, cam, dep):
                     with dep.lock:
                         s['depth'] = dict(dep.stats)
                 self._json(s)
+            elif self.path == '/blob':
+                # 정합용 측정창 — 뎁스캠이 본 빨간 물체의 카메라 좌표를 그대로 준다.
+                if dep is None:
+                    return self._json({'ok': False, 'msg': 'depth off'}, 503)
+                dep.ensure()
+                with dep.lock:
+                    b, st = dep.blob, dict(dep.stats)
+                self._json({'ok': b is not None, 'blob': b, 'depth': st})
+            elif self.path == '/rgb':
+                if dep is None:
+                    return self._json({'error': 'depth off'}, 503)
+                dep.ensure()
+                self.send_response(200)
+                self.send_header('Content-Type',
+                                 'multipart/x-mixed-replace; boundary=frame')
+                self.end_headers()
+                try:
+                    while True:
+                        with dep.lock:
+                            j = dep.rgb_jpeg
+                        if j:
+                            self.wfile.write(b'--frame\r\n'
+                                             b'Content-Type: image/jpeg\r\n\r\n')
+                            self.wfile.write(j); self.wfile.write(b'\r\n')
+                        time.sleep(0.1)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
             elif self.path == '/depth':
                 if dep is None:
                     return self._json({'error': 'depth off'}, 503)

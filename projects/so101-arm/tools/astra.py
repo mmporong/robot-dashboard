@@ -13,10 +13,21 @@ Ubuntu 24.04 에서 의존성 결측 없이 그대로 동작한다 — SFML 뷰�
 `points()` 는 카메라 광학 프레임 기준 (X 오른쪽, Y 아래, Z 전방, 단위 m)으로 돌려준다.
 로봇 좌표로 옮기려면 별도의 외부 파라미터(정합)가 필요하다.
 
+`depth()` 를 부르면 같은 프레임의 컬러도 함께 갱신되므로 `color()` 는 그 뒤에
+부르면 된다 — 두 스트림이 서로 다른 시점을 가리키는 일을 막는다.
+
+## 뎁스-컬러 정합(registration)
+
+`astra_depthstream_set_registration` 을 켜서 깊이를 **컬러 좌표계로 워프**한다.
+켜져 있으면 컬러에서 찾은 픽셀 (u, v) 의 깊이를 같은 (u, v) 로 읽을 수 있어,
+색으로 물체를 찾고 그 자리의 3D 좌표를 바로 얻는 흐름이 성립한다. 꺼져 있으면
+두 영상의 시점이 달라 같은 픽셀이 다른 지점을 가리킨다 — `registered` 로 확인할 것.
+
 사용:
     from astra import Astra
     with Astra() as cam:
         depth_mm = cam.depth()            # (H, W) int16, 0 = 측정 실패
+        rgb = cam.color()                 # (H, W, 3) uint8, 없으면 None
         x, y, z = cam.point(cx, cy)       # 픽셀 → 카메라 좌표 [m]
 """
 import ctypes as C
@@ -76,6 +87,28 @@ class Astra:
         a.astra_depthstream_get_vfov(self._stream, C.byref(vf))
         self.hfov, self.vfov = hf.value, vf.value
         a.astra_stream_start(self._stream)
+
+        # 깊이를 컬러 좌표계로 워프한다. 이게 켜져야 "컬러에서 찾은 픽셀의 깊이"가
+        # 성립한다 — 두 렌즈가 떨어져 있어 끄면 같은 (u, v) 가 다른 지점이다.
+        self.registered = False
+        try:
+            if a.astra_depthstream_set_registration(self._stream, C.c_bool(True)) == 0:
+                self.registered = True
+        except Exception:
+            pass
+
+        # 컬러 스트림은 없어도 깊이만으로 동작해야 하므로 실패를 삼킨다.
+        self._color_stream = C.c_void_p()
+        self._has_color = False
+        self._last_color = None
+        try:
+            if a.astra_reader_get_colorstream(
+                    self._reader, C.byref(self._color_stream)) == 0:
+                a.astra_stream_start(self._color_stream)
+                self._has_color = True
+        except Exception:
+            pass
+
         self._shape = None
         # 첫 프레임은 몇 번의 update 뒤에 온다(실측 3회) — 여기서 shape 도 확정된다
         t0 = time.monotonic()
@@ -118,9 +151,43 @@ class Astra:
             buf = (C.c_int16 * (n.value // 2))()
             a.astra_depthframe_copy_data(df, buf)
             self._shape = (meta.height, meta.width)
+            self._grab_color(frame)       # 깊이와 같은 프레임 — 시점이 어긋나지 않는다
             return np.ctypeslib.as_array(buf).reshape(self._shape).copy()
         finally:
             a.astra_reader_close_frame(C.byref(frame))
+
+    def _grab_color(self, frame):
+        """열려 있는 프레임에서 컬러를 꺼내 캐시한다. 없으면 조용히 넘어간다."""
+        if not self._has_color:
+            return
+        a = self._lib
+        try:
+            cf = C.c_void_p()
+            if a.astra_frame_get_colorframe(frame, C.byref(cf)) != 0:
+                return
+            meta = _Meta()
+            a.astra_colorframe_get_metadata(cf, C.byref(meta))
+            n = C.c_uint32()
+            a.astra_colorframe_get_data_byte_length(cf, C.byref(n))
+            if n.value == 0:
+                return
+            buf = (C.c_uint8 * n.value)()
+            a.astra_colorframe_copy_data(cf, buf)
+            arr = np.ctypeslib.as_array(buf)
+            px = meta.width * meta.height
+            if px and n.value % px == 0:
+                self._last_color = arr.reshape(
+                    meta.height, meta.width, n.value // px).copy()
+        except Exception:
+            self._has_color = False   # 한 번 실패하면 이후 호출을 건너뛴다
+
+    def color(self):
+        """가장 최근 깊이 프레임과 **같은 시점**의 컬러 (H, W, 3) uint8 RGB.
+
+        깊이를 아직 한 번도 안 읽었거나 장치에 컬러가 없으면 None. `depth()` 가
+        컬러도 함께 갱신하므로 별도 대기 없이 그 뒤에 부르면 된다.
+        """
+        return self._last_color
 
     # -- 기하 --
     @property
@@ -176,6 +243,10 @@ if __name__ == '__main__':
         nz = d[d > 0]
         if nz.size:
             print(f'범위 {nz.min()}~{nz.max()} mm · 중앙값 {int(np.median(nz))} mm')
+        rgb = cam.color()
+        print(f'정합(registration) {"ON" if cam.registered else "OFF"} · 컬러 '
+              + (f'{rgb.shape[1]}x{rgb.shape[0]}x{rgb.shape[2]}' if rgb is not None
+                 else '없음'))
         p = cam.point(w // 2, h // 2, d)
         if p:
             print(f'중앙 픽셀 → 카메라 좌표 ({p[0]:+.3f}, {p[1]:+.3f}, {p[2]:.3f}) m')
