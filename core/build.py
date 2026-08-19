@@ -8,6 +8,7 @@
 """
 import json
 import pathlib
+import re
 
 import project as P
 
@@ -18,9 +19,14 @@ def main():
     tpl = (HERE / P.TEMPLATE).read_text(encoding='utf-8')
     subs = {slot: json.loads((HERE / name).read_text(encoding='utf-8'))
             for slot, name in P.DATA.items()}
+    # 자리표시자 뒤에 붙은 **빈 기본값**(`[]` `{}` `null`)까지 함께 갈아치운다.
+    # 템플릿을 `const RUNS = /*__RUNS__*/[];`처럼 써 두면 빌드 전에도 문법이 성립해
+    # 브라우저로 열어 볼 수 있는데, 주석만 바꾸면 `[...][]`가 되어 통째로 죽는다
+    # (SLAM 화면이 실제로 그렇게 났다 — Unexpected token ']').
     out = tpl
     for slot, value in subs.items():
-        out = out.replace(slot, json.dumps(value, ensure_ascii=False, separators=(',', ':')))
+        blob = json.dumps(value, ensure_ascii=False, separators=(',', ':'))
+        out = re.sub(re.escape(slot) + r'\s*(?:\[\]|\{\}|null)?', lambda _: blob, out)
 
     missing = [s for s in subs if s in out]
     if missing:
