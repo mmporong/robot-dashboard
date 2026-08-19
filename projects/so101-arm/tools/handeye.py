@@ -171,6 +171,7 @@ def main():
     kin = arm_lib.load_kinematics()
     mapping = arm_lib.load_mapping()
     cam_pts, rob_pts, log = [], [], []
+    stalls = 0                    # 연속 도달 실패 횟수 — 쌓이면 중단한다
     for i, (x, y, z) in enumerate(POSES, 1):
         r = post('ik', x=x, y=y, z=z, pitch=-90)
         if not r.get('ok'):
@@ -178,13 +179,24 @@ def main():
             continue
         pos, gap = wait_reached(r['q'], mapping)   # 목표 관절각에 도달할 때까지
         if gap > 3.0:
-            print(f'[{i:2d}/{len(POSES)}] 관절이 목표에서 {gap:.1f}° 남아 건너뜀')
+            # ★ 반드시 정지시킨다. 목표를 그대로 두면 서보가 막힌 방향으로 계속
+            # 밀어 탄다 — 2026-08-19 이 자리에서 "건너뜀"만 출력해 wrist_flex 를
+            # 태웠다. 실패를 기록하는 것과 힘을 빼는 것은 다른 일이다.
+            post('stop')
+            print(f'[{i:2d}/{len(POSES)}] 관절이 목표에서 {gap:.1f}° 남음 — 정지하고 건너뜀')
+            stalls += 1
+            if stalls >= 3:
+                post('stop')
+                sys.exit('연속 도달 실패가 3회를 넘었습니다 — 간섭을 확인하세요. '
+                         '계속 밀면 서보가 탑니다.')
             continue
+        stalls = 0
         time.sleep(a.settle)                # 진동 가라앉힘
         rob = fk_of(pos, kin, mapping)      # **실제** 도달 위치
         p, n = read_blob()
         err = max(abs(c - t) for c, t in zip(rob, (x, y, z)))
         if p is None:
+            post('stop')
             print(f'[{i:2d}/{len(POSES)}] ({x:+.3f},{y:+.3f},{z:+.3f}) 관측 실패 (유효 {n})')
             continue
         if err > 0.02:
@@ -220,6 +232,7 @@ def main():
                  '카메라나 베이스를 움직이면 다시 잴 것.'),
     }, ensure_ascii=False, indent=2))
     print(f'\n저장: {OUT}')
+    post('stop')                  # 끝났으면 남은 목표를 지운다
 
 
 if __name__ == '__main__':

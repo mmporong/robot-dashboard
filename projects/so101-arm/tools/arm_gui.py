@@ -35,6 +35,12 @@ import arm_lib
 ARM = arm_lib.JOINTS                      # 5관절 (kinematics 순서)
 ALL = ARM + ['gripper']
 
+# ── 안전 임계 (2026-08-19 발연 사고 후 도입) ──────────────────────────────────
+# STS3215 의 기본 과온 한계는 70°C 다. 그보다 낮은 곳에서 스스로 멈춰야 보호가 된다.
+TEMP_WARN, TEMP_STOP = 55, 62      # °C
+TEMP_EVERY = 25                    # 폴링 몇 회마다 온도를 읽나 (매번은 비싸다)
+STALL_GAP_DEG = 3.0                # 이동 후 목표와 이만큼 벌어져 있으면 막힌 것으로 본다
+
 
 # ── 하드웨어 워커 ────────────────────────────────────────────────────
 class Worker(threading.Thread):
@@ -355,7 +361,28 @@ class Worker(threading.Thread):
             self.bus.sync_write('Goal_Position',
                                 {j: cur[j] + (target[j] - cur[j]) * s for j in ARM})
             time.sleep(0.02)
-        self.say('이동 완료 — 죠 끝을 자로 재서 기록하세요')
+
+        # ★ 도달 검증. 못 갔으면 **그 자리에서 힘을 뺀다.**
+        #
+        # 2026-08-19 이 검증이 없어 wrist_flex(ID 4) 서보를 태웠다. 정합 스크립트가
+        # 13개 지점 이동을 걸었고 전부 도달에 실패했는데, 목표가 그대로 남아 막힌
+        # 방향으로 최대 전류를 계속 흘렸다. 스톨 상태가 장시간 유지돼 발연했고
+        # 통신이 끊겨 소프트웨어로는 토크도 못 껐다.
+        #
+        # 실패를 로그로만 남기는 것과 안전한 상태로 되돌리는 것은 다른 일이다.
+        # _do_stop() 이 현재 위치를 목표로 다시 써서 미는 힘을 없앤다.
+        time.sleep(0.25)                      # 마지막 스텝이 반영될 시간
+        try:
+            fin = self.bus.sync_read('Present_Position', ARM)
+        except Exception:
+            self._do_stop(); self.say('⚠ 도달 확인 실패 — 정지했습니다'); return
+        gap = max(abs((fin[j] - target[j] + 180) % 360 - 180) for j in ARM)
+        if gap > STALL_GAP_DEG:
+            worst = max(ARM, key=lambda j: abs((fin[j] - target[j] + 180) % 360 - 180))
+            self._do_stop()
+            self.say(f'⛔ 목표에서 {gap:.1f}° 남아 정지 ({worst}) — 간섭을 확인하세요')
+        else:
+            self.say('이동 완료 — 죠 끝을 자로 재서 기록하세요')
 
     # -- 폴링 --
     def _poll(self):
@@ -368,6 +395,7 @@ class Worker(threading.Thread):
             else:
                 pos = self.bus.sync_read('Present_Position', normalize=False)
             self._fail = 0
+            self._guard(st)
             with self.lock:
                 self.state['pos'] = pos
                 # 캘리브 전에는 **항상** 범위를 쌓는다. 범위는 "관절이 어디까지
@@ -387,7 +415,51 @@ class Worker(threading.Thread):
                 self.say(f'⚠ 읽기 실패: {type(e).__name__}: {str(e)[:70]}')
             if self._fail >= 8:
                 self._fail = 0
+                # 재연결 전에 힘부터 뺀다. 통신이 끊긴 동안에도 서보는 마지막
+                # 목표를 향해 계속 밀고 있다 — 막혀 있으면 그대로 탄다.
+                try:
+                    self.bus.disable_torque()
+                    with self.lock:
+                        self.state['torque'] = False
+                    self.say('⚠ 통신 두절 — 토크를 내렸습니다')
+                except Exception:
+                    pass
                 self._reconnect()
+
+    def _guard(self, st):
+        """과열을 감시해 임계를 넘으면 스스로 토크를 내린다.
+
+        서보는 막히면 최대 전류를 흘려 몇 분 만에 위험 온도에 이른다. 사람이
+        화면을 안 보고 있어도 멈추게 하려면 이 감시가 필요하다(2026-08-19 발연 사고).
+        읽기가 비싸므로 매 폴링이 아니라 몇 초에 한 번만 본다.
+        """
+        if not st['torque']:
+            return
+        self._tick = getattr(self, '_tick', 0) + 1
+        if self._tick % TEMP_EVERY:
+            return
+        temps = {}
+        for m in ALL:
+            try:
+                temps[m] = self.bus.read('Present_Temperature', m, normalize=False)
+            except Exception:
+                pass
+        if not temps:
+            return
+        with self.lock:
+            self.state['temp'] = temps
+        hot = {m: t for m, t in temps.items() if t >= TEMP_STOP}
+        warm = {m: t for m, t in temps.items() if TEMP_WARN <= t < TEMP_STOP}
+        if hot:
+            try:
+                self.bus.disable_torque()
+            except Exception:
+                pass
+            with self.lock:
+                self.state['torque'] = False
+            self.say(f'🔥 과열 자동 정지 — {hot} (임계 {TEMP_STOP}°C). 전원을 확인하세요')
+        elif warm and self._tick % (TEMP_EVERY * 4) == 0:
+            self.say(f'⚠ 서보 온도 상승: {warm}')
 
     def _reconnect(self):
         import glob
