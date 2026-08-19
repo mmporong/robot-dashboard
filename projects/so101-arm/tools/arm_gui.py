@@ -39,7 +39,8 @@ ALL = ARM + ['gripper']
 # STS3215 의 기본 과온 한계는 70°C 다. 그보다 낮은 곳에서 스스로 멈춰야 보호가 된다.
 TEMP_WARN, TEMP_STOP = 55, 62      # °C
 TEMP_EVERY = 25                    # 폴링 몇 회마다 온도를 읽나 (매번은 비싸다)
-STALL_GAP_DEG = 3.0                # 이동 후 목표와 이만큼 벌어져 있으면 막힌 것으로 본다
+STALL_GAP_DEG = 3.0                # 목표와 이만큼 벌어져 있으면 막힌 것으로 본다
+STALL_MOVE_DEG = 0.4               # 0.5초 동안 이보다 덜 움직이면 '안 가고 있다'로 본다
 
 
 # ── 하드웨어 워커 ────────────────────────────────────────────────────
@@ -352,10 +353,32 @@ class Worker(threading.Thread):
                 self.say(f'⚠ {j} 를 {moved:.0f}° 돌립니다 — 손목캠 간섭을 확인하세요')
 
         steps = max(2, int(seconds * 50))
+        watch = None                              # 스톨 감지용 직전 위치
         for i in range(1, steps + 1):
             if self.abort.is_set():               # 정지 버튼 — 즉시 끊는다
                 self._do_stop()
                 return
+
+            # ★ 이동 **중** 스톨 감지. 보간이 끝난 뒤에만 확인하면 그때까지는 막힌
+            # 채로 계속 민다 — 서보가 타는 것은 그 구간이다(2026-08-19 사고).
+            # 0.5초마다 보고, 위치가 안 변하는데 목표가 남아 있으면 즉시 끊는다.
+            if i % 25 == 0:
+                try:
+                    now = self.bus.sync_read('Present_Position', ARM)
+                except Exception:
+                    self._do_stop(); self.say('⚠ 이동 중 읽기 실패 — 정지했습니다')
+                    return
+                if watch is not None:
+                    moved = max(abs(now[j] - watch[j]) for j in ARM)
+                    left = max(abs((now[j] - target[j] + 180) % 360 - 180) for j in ARM)
+                    if moved < STALL_MOVE_DEG and left > STALL_GAP_DEG:
+                        stuck = max(ARM, key=lambda j:
+                                    abs((now[j] - target[j] + 180) % 360 - 180))
+                        self._do_stop()
+                        self.say(f'⛔ 스톨 감지 — {stuck} 가 {left:.1f}° 남기고 멈춰 '
+                                 f'있습니다. 간섭을 확인하세요')
+                        return
+                watch = now
             a = i / steps
             s = a * a * (3 - 2 * a)
             self.bus.sync_write('Goal_Position',
@@ -395,7 +418,6 @@ class Worker(threading.Thread):
             else:
                 pos = self.bus.sync_read('Present_Position', normalize=False)
             self._fail = 0
-            self._guard(st)
             with self.lock:
                 self.state['pos'] = pos
                 # 캘리브 전에는 **항상** 범위를 쌓는다. 범위는 "관절이 어디까지
@@ -425,6 +447,14 @@ class Worker(threading.Thread):
                 except Exception:
                     pass
                 self._reconnect()
+            return                    # 읽기가 실패한 회차엔 온도 감시를 건너뛴다
+
+        # 온도 감시는 **위 try 밖**에서 부른다. 안에 두면 온도 읽기 실패가
+        # 통신 두절로 오인돼 _fail 이 올라가고 엉뚱하게 재연결을 시도한다.
+        try:
+            self._guard(st)
+        except Exception:
+            pass
 
     def _guard(self, st):
         """과열을 감시해 임계를 넘으면 스스로 토크를 내린다.
