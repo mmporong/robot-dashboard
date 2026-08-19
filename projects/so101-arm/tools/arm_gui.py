@@ -41,6 +41,7 @@ TEMP_WARN, TEMP_STOP = 55, 62      # °C
 TEMP_EVERY = 25                    # 폴링 몇 회마다 온도를 읽나 (매번은 비싸다)
 STALL_GAP_DEG = 3.0                # 목표와 이만큼 벌어져 있으면 막힌 것으로 본다
 STALL_MOVE_DEG = 0.4               # 0.5초 동안 이보다 덜 움직이면 '안 가고 있다'로 본다
+ROLL_FIRST_DEG = 20                # wrist_roll 이 이보다 크게 바뀌면 회전을 먼저 끝낸다
 
 # 전류는 **가장 빠른 스톨 신호**다. 온도는 후행 지표(이미 뜨거워진 뒤 올라간다)이고
 # 위치 기반 감지도 0.5초를 기다려야 한다.
@@ -66,6 +67,15 @@ PROTECT = {
     'Overload_Torque': 60,                # % (기본 80 → 더 이르게)
     'Protection_Time': 50,                # ×10ms = 0.5초 (기본 200=2초)
     'Protective_Torque': 20,              # 보호 후 유지 토크 [%] — 팔이 털썩 떨어지지 않게
+}
+
+# 그리퍼는 다르다. **물체를 잡고 계속 힘을 주는 것이 정상 동작**이라 과부하 임계를
+# 다른 관절처럼 올리면 보호가 걸려 물체를 놓는다. 실제로 이 팔의 그리퍼는
+# Overload_Torque 25% · Protection_Current 250 으로 낮게 세팅돼 출하됐다(2026-08-19
+# 확인) — 의도된 값이므로 존중하고, **열만 막는다.**
+PROTECT_GRIPPER = {
+    'Max_Temperature_Limit': 65,          # 기본 70 → 낮춤
+    'Protection_Time': 50,                # 2초 → 0.5초
 }
 
 
@@ -151,10 +161,11 @@ class Worker(threading.Thread):
         # 펌웨어 보호는 그 사이를 메운다.
         try:
             for m in ALL:
-                for reg, val in PROTECT.items():
+                table = PROTECT_GRIPPER if m == 'gripper' else PROTECT
+                for reg, val in table.items():
                     self.bus.write(reg, m, val, normalize=False)
             self.say(f'서보 보호 설정 완료 (과온 {PROTECT["Max_Temperature_Limit"]}°C · '
-                     f'과전류 {PROTECT["Protection_Current"]})')
+                     f'과전류 {PROTECT["Protection_Current"]} · 그리퍼는 과온만)')
         except Exception as e:
             self.say(f'⚠ 서보 보호 설정 실패: {type(e).__name__} — 과전류·과온 차단이 '
                      f'서보 기본값으로 남습니다')
@@ -375,6 +386,76 @@ class Worker(threading.Thread):
             self.bus.sync_write('Goal_Velocity', {m: 8 for m in ALL}, normalize=False)
         self.say('⏹ 정지 — 현재 자세 유지')
 
+    def _interp(self, cur, target, seconds):
+        """cur → target 으로 보간 이동. 도달하면 True, 중단하면 False."""
+        steps = max(2, int(seconds * 50))
+        watch = None                              # 스톨 감지용 직전 위치
+        self._hi = 0                              # 과전류 연속 관측 횟수
+        for i in range(1, steps + 1):
+            if self.abort.is_set():               # 정지 버튼 — 즉시 끊는다
+                self._do_stop()
+                return False
+
+            # ★ 이동 **중** 스톨 감지. 보간이 끝난 뒤에만 확인하면 그때까지는 막힌
+            # 채로 계속 민다 — 서보가 타는 것은 그 구간이다(2026-08-19 사고).
+            # 0.5초마다 보고, 위치가 안 변하는데 목표가 남아 있으면 즉시 끊는다.
+            if i % 10 == 0:
+                # 전류는 위치보다 먼저 반응한다. 막히면 즉시 튀므로 더 자주 본다.
+                try:
+                    cur_a = self.bus.sync_read('Present_Current', ARM, normalize=False)
+                except Exception:
+                    cur_a = None
+                if cur_a:
+                    over = {j: abs(v) for j, v in cur_a.items() if abs(v) >= CURRENT_STOP}
+                    self._hi = self._hi + 1 if over else 0
+                    if self._hi >= CURRENT_HOLD:
+                        self._kill_torque(f'과전류 {over} (임계 {CURRENT_STOP}≈'
+                                          f'{CURRENT_STOP*6.5/1000:.1f}A)')
+                        return False
+
+            if i % 25 == 0:
+                try:
+                    now = self.bus.sync_read('Present_Position', ARM)
+                except Exception:
+                    self._do_stop(); self.say('⚠ 이동 중 읽기 실패 — 정지했습니다')
+                    return False
+                if watch is not None:
+                    moved = max(abs(now[j] - watch[j]) for j in ARM)
+                    left = max(abs((now[j] - target[j] + 180) % 360 - 180) for j in ARM)
+                    if moved < STALL_MOVE_DEG and left > STALL_GAP_DEG:
+                        stuck = max(ARM, key=lambda j:
+                                    abs((now[j] - target[j] + 180) % 360 - 180))
+                        self._kill_torque(f'스톨 — {stuck} 가 {left:.1f}° 남기고 '
+                                          f'멈춰 있습니다. 간섭을 확인하세요')
+                        return False
+                watch = now
+            a = i / steps
+            s = a * a * (3 - 2 * a)
+            self.bus.sync_write('Goal_Position',
+                                {j: cur[j] + (target[j] - cur[j]) * s for j in ARM})
+            time.sleep(0.02)
+
+        # ★ 도달 검증. 못 갔으면 **그 자리에서 힘을 뺀다.**
+        #
+        # 2026-08-19 이 검증이 없어 wrist_flex(ID 4) 서보를 태웠다. 정합 스크립트가
+        # 13개 지점 이동을 걸었고 전부 도달에 실패했는데, 목표가 그대로 남아 막힌
+        # 방향으로 최대 전류를 계속 흘렸다. 스톨 상태가 장시간 유지돼 발연했고
+        # 통신이 끊겨 소프트웨어로는 토크도 못 껐다.
+        #
+        # 실패를 로그로만 남기는 것과 안전한 상태로 되돌리는 것은 다른 일이다.
+        # _do_stop() 이 현재 위치를 목표로 다시 써서 미는 힘을 없앤다.
+        time.sleep(0.25)                      # 마지막 스텝이 반영될 시간
+        try:
+            fin = self.bus.sync_read('Present_Position', ARM)
+        except Exception:
+            self._do_stop(); self.say('⚠ 도달 확인 실패 — 정지했습니다'); return False
+        gap = max(abs((fin[j] - target[j] + 180) % 360 - 180) for j in ARM)
+        if gap > STALL_GAP_DEG:
+            worst = max(ARM, key=lambda j: abs((fin[j] - target[j] + 180) % 360 - 180))
+            self._kill_torque(f'목표에서 {gap:.1f}° 남음 ({worst}) — 간섭을 확인하세요')
+            return False
+        return True
+
     def _do_move_q(self, q_rad, seconds):
         """URDF 관절각[rad] 5개로 보간 이동."""
         st = self.snapshot()
@@ -410,72 +491,30 @@ class Worker(threading.Thread):
             if moved > 90:
                 self.say(f'⚠ {j} 를 {moved:.0f}° 돌립니다 — 손목캠 간섭을 확인하세요')
 
-        steps = max(2, int(seconds * 50))
-        watch = None                              # 스톨 감지용 직전 위치
-        self._hi = 0                              # 과전류 연속 관측 횟수
-        for i in range(1, steps + 1):
-            if self.abort.is_set():               # 정지 버튼 — 즉시 끊는다
-                self._do_stop()
-                return
-
-            # ★ 이동 **중** 스톨 감지. 보간이 끝난 뒤에만 확인하면 그때까지는 막힌
-            # 채로 계속 민다 — 서보가 타는 것은 그 구간이다(2026-08-19 사고).
-            # 0.5초마다 보고, 위치가 안 변하는데 목표가 남아 있으면 즉시 끊는다.
-            if i % 10 == 0:
-                # 전류는 위치보다 먼저 반응한다. 막히면 즉시 튀므로 더 자주 본다.
-                try:
-                    cur_a = self.bus.sync_read('Present_Current', ARM, normalize=False)
-                except Exception:
-                    cur_a = None
-                if cur_a:
-                    over = {j: abs(v) for j, v in cur_a.items() if abs(v) >= CURRENT_STOP}
-                    self._hi = self._hi + 1 if over else 0
-                    if self._hi >= CURRENT_HOLD:
-                        self._kill_torque(f'과전류 {over} (임계 {CURRENT_STOP}≈'
-                                          f'{CURRENT_STOP*6.5/1000:.1f}A)')
-                        return
-
-            if i % 25 == 0:
-                try:
-                    now = self.bus.sync_read('Present_Position', ARM)
-                except Exception:
-                    self._do_stop(); self.say('⚠ 이동 중 읽기 실패 — 정지했습니다')
-                    return
-                if watch is not None:
-                    moved = max(abs(now[j] - watch[j]) for j in ARM)
-                    left = max(abs((now[j] - target[j] + 180) % 360 - 180) for j in ARM)
-                    if moved < STALL_MOVE_DEG and left > STALL_GAP_DEG:
-                        stuck = max(ARM, key=lambda j:
-                                    abs((now[j] - target[j] + 180) % 360 - 180))
-                        self._kill_torque(f'스톨 — {stuck} 가 {left:.1f}° 남기고 '
-                                          f'멈춰 있습니다. 간섭을 확인하세요')
-                        return
-                watch = now
-            a = i / steps
-            s = a * a * (3 - 2 * a)
-            self.bus.sync_write('Goal_Position',
-                                {j: cur[j] + (target[j] - cur[j]) * s for j in ARM})
-            time.sleep(0.02)
-
-        # ★ 도달 검증. 못 갔으면 **그 자리에서 힘을 뺀다.**
+        # ★ 회전을 먼저, 이동을 나중에.
         #
-        # 2026-08-19 이 검증이 없어 wrist_flex(ID 4) 서보를 태웠다. 정합 스크립트가
-        # 13개 지점 이동을 걸었고 전부 도달에 실패했는데, 목표가 그대로 남아 막힌
-        # 방향으로 최대 전류를 계속 흘렸다. 스톨 상태가 장시간 유지돼 발연했고
-        # 통신이 끊겨 소프트웨어로는 토크도 못 껐다.
+        # 2026-08-19 사고의 순서 문제다. wrist_roll 이 98°(누운 자세)라 죠가 좌우로
+        # 벌어진 채 팔이 내려가 **한쪽 턱이 책상에 닿았고**, 그 상태에서 IK 가 roll 을
+        # 180° 로 돌리라고 명령했다. 눌린 죠는 돌 수 없다 — 82° 를 남기고 스톨,
+        # 과열, 발연으로 이어졌다.
         #
-        # 실패를 로그로만 남기는 것과 안전한 상태로 되돌리는 것은 다른 일이다.
-        # _do_stop() 이 현재 위치를 목표로 다시 써서 미는 힘을 없앤다.
-        time.sleep(0.25)                      # 마지막 스텝이 반영될 시간
-        try:
-            fin = self.bus.sync_read('Present_Position', ARM)
-        except Exception:
-            self._do_stop(); self.say('⚠ 도달 확인 실패 — 정지했습니다'); return
-        gap = max(abs((fin[j] - target[j] + 180) % 360 - 180) for j in ARM)
-        if gap > STALL_GAP_DEG:
-            worst = max(ARM, key=lambda j: abs((fin[j] - target[j] + 180) % 360 - 180))
-            self._kill_torque(f'목표에서 {gap:.1f}° 남음 ({worst}) — 간섭을 확인하세요')
-        else:
+        # 5관절을 한꺼번에 명령하면 "눌린 채 돌리기"가 언제든 다시 나온다. roll 변화가
+        # 크면 나머지를 그대로 둔 채 **roll 만 먼저** 돌리고, 그다음 본 이동을 한다.
+        # 각 단계마다 스톨·과전류 감시가 그대로 걸린다.
+        roll_gap = abs((target['wrist_roll'] - cur['wrist_roll'] + 180) % 360 - 180)
+        if roll_gap > ROLL_FIRST_DEG:
+            self.say(f'wrist_roll 을 {roll_gap:.0f}° 먼저 돌립니다 '
+                     f'(죠가 눌린 채 회전하지 않도록)')
+            first = dict(cur)
+            first['wrist_roll'] = target['wrist_roll']
+            if not self._interp(cur, first, max(1.5, roll_gap / 60)):
+                return                            # 회전이 막혔으면 본 이동을 하지 않는다
+            try:
+                cur = self.bus.sync_read('Present_Position', ARM)
+            except Exception:
+                self._do_stop(); self.say('⚠ 회전 후 읽기 실패 — 정지'); return
+
+        if self._interp(cur, target, seconds):
             self.say('이동 완료 — 죠 끝을 자로 재서 기록하세요')
 
     # -- 폴링 --
