@@ -360,6 +360,18 @@ class Worker(threading.Thread):
         if not st['torque']:
             self.say('⚠ 토크 ON 을 먼저 눌러 주세요')
             return
+        # ★ 슬라이더도 캘리브 범위를 넘으면 막는다. 여기는 목표만 쓰고 반환해서
+        # 이동 감시가 없다 — 범위 밖으로 보내면 아무도 못 잡는 스톨이 된다.
+        if joint in ARM:
+            try:
+                cur = self.bus.sync_read('Present_Position', ARM)
+            except Exception:
+                cur = {}
+            probe = dict(cur); probe[joint] = float(value)
+            why, _bad = self._clamp_to_calib(probe)
+            if why:
+                self.say(f'⛔ 거부 — {why}')
+                return
         self.bus.sync_write('Goal_Position', {joint: float(value)})
         self.say(f'{joint} → {float(value):.0f}')
 
@@ -427,6 +439,7 @@ class Worker(threading.Thread):
         steps = max(2, int(seconds * 50))
         watch = None                              # 스톨 감지용 직전 위치
         self._hi = 0                              # 과전류 연속 관측 횟수
+        self._peak = {}                           # 이번 이동의 관절별 전류 피크
         for i in range(1, steps + 1):
             if self.abort.is_set():               # 정지 버튼 — 즉시 끊는다
                 self._do_stop()
@@ -442,6 +455,13 @@ class Worker(threading.Thread):
                 except Exception:
                     cur_a = None
                 if cur_a:
+                    # 이동 중 전류 피크를 기록한다. 임계(CURRENT_STOP)는 데이터시트
+                    # 추정이라 **정상 동작 값을 알아야** 맞출 수 있는데, _guard 는
+                    # 6초 주기라 짧은 이동에서는 피크를 통째로 놓친다.
+                    for j, v in cur_a.items():
+                        a = abs(v)
+                        if a > self._peak.get(j, 0):
+                            self._peak[j] = a
                     over = {j: abs(v) for j, v in cur_a.items() if abs(v) >= CURRENT_STOP}
                     self._hi = self._hi + 1 if over else 0
                     if self._hi >= CURRENT_HOLD:
@@ -558,7 +578,12 @@ class Worker(threading.Thread):
                 self._do_stop(); self.say('⚠ 회전 후 읽기 실패 — 정지'); return
 
         if self._interp(cur, target, seconds):
-            self.say('이동 완료 — 죠 끝을 자로 재서 기록하세요')
+            pk = getattr(self, '_peak', {})
+            top = sorted(pk.items(), key=lambda x: -x[1])[:3]
+            note = ' · '.join(f'{j[:8]}={v}' for j, v in top if v) or '전류 0'
+            with self.lock:
+                self.state['last_peak'] = dict(pk)
+            self.say(f'이동 완료 — 전류피크 {note} (임계 {CURRENT_STOP})')
 
     # -- 폴링 --
     def _poll(self):
