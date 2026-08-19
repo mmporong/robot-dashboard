@@ -177,7 +177,14 @@ class Astra:
             a.astra_depthframe_copy_data(df, buf)
             self._shape = (meta.height, meta.width)
             self._grab_color(frame)       # 깊이와 같은 프레임 — 시점이 어긋나지 않는다
-            return np.ctypeslib.as_array(buf).reshape(self._shape).copy()
+            # ★ 좌우 반전 해제. OpenNI 계열 SDK 는 기본이 거울상(mirror)인데
+            # 이 래퍼가 해제하지 않아 왔다 — 거울상 좌표는 어떤 회전으로도
+            # 실세계와 정합되지 않아 hand-eye 가 전부 발산했다(2026-08-20 확정:
+            # 방위각·평면을 함께 u-반전하자 잔차 36→3.9mrad, 카메라 위치가
+            # 지하 -0.50m → 실물과 맞는 +0.35m). 컬러(_grab_color)와 반드시
+            # **같은 방향으로** 뒤집는다.
+            d = np.ctypeslib.as_array(buf).reshape(self._shape)
+            return np.ascontiguousarray(d[:, ::-1])
         finally:
             a.astra_reader_close_frame(C.byref(frame))
 
@@ -208,8 +215,9 @@ class Astra:
             arr = np.ctypeslib.as_array(buf)
             px = meta.width * meta.height
             if px and n.value % px == 0:
-                self._last_color = arr.reshape(
-                    meta.height, meta.width, n.value // px).copy()
+                # 깊이와 같은 이유로 좌우 반전 해제 (depth() 주석 참조)
+                c = arr.reshape(meta.height, meta.width, n.value // px)
+                self._last_color = np.ascontiguousarray(c[:, ::-1])
         except Exception as e:
             self._color_fail += 1
             self.color_error = f'{type(e).__name__}: {e}'
