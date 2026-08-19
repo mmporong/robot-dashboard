@@ -113,6 +113,8 @@ class Astra:
         self._color_stream = C.c_void_p()
         self._has_color = False
         self._last_color = None
+        self._color_fail = 0
+        self.color_error = None
         try:
             if color and a.astra_reader_get_colorstream(
                     self._reader, C.byref(self._color_stream)) == 0:
@@ -180,7 +182,14 @@ class Astra:
             a.astra_reader_close_frame(C.byref(frame))
 
     def _grab_color(self, frame):
-        """열려 있는 프레임에서 컬러를 꺼내 캐시한다. 없으면 조용히 넘어간다."""
+        """열려 있는 프레임에서 컬러를 꺼내 캐시한다. 없으면 조용히 넘어간다.
+
+        일시적 실패로 컬러를 영구히 끄지 않는다. 종전에는 한 번만 실패해도
+        `_has_color = False` 로 두었는데, 그러면 color() 가 **마지막 프레임을 계속
+        돌려주어** 겉보기엔 화면이 멈춘 것으로만 보인다(실측 2026-08-19: 깊이는
+        갱신되는데 컬러 md5 가 고정, 그 탓에 블롭 좌표가 옛 프레임 기준이라 깊이가
+        0 으로 나와 cam_xyz 가 None 이 됐다). 연속 실패가 쌓일 때만 포기한다.
+        """
         if not self._has_color:
             return
         a = self._lib
@@ -201,8 +210,13 @@ class Astra:
             if px and n.value % px == 0:
                 self._last_color = arr.reshape(
                     meta.height, meta.width, n.value // px).copy()
-        except Exception:
-            self._has_color = False   # 한 번 실패하면 이후 호출을 건너뛴다
+        except Exception as e:
+            self._color_fail += 1
+            self.color_error = f'{type(e).__name__}: {e}'
+            if self._color_fail >= 30:        # 연속 실패가 쌓이면 그때 포기
+                self._has_color = False
+        else:
+            self._color_fail = 0
 
     def color(self):
         """가장 최근 깊이 프레임과 **같은 시점**의 컬러 (H, W, 3) uint8 RGB.

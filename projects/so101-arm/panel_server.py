@@ -139,6 +139,8 @@ class Depth(threading.Thread):
         self.started = False
         self.cam = None
         self._closing = False
+        self._color_sig = None
+        self._color_same = 0      # 컬러가 몇 프레임째 그대로인가
 
     def shutdown(self):
         """종료 시 장치를 반드시 놓는다.
@@ -207,13 +209,19 @@ class Depth(threading.Thread):
                     # 프레임이 계속 안 오면 장치가 빠졌거나 세션이 죽은 것이다.
                     # 여기서 다시 열지 않으면 스레드는 살아 있는데 화면만 굳는다.
                     fails += 1
-                    if fails >= 60:
+                    # 임계를 넉넉히 둔다. 짧게 잡으면 일시적 프레임 누락에도 재연결을
+                    # 걸어 버리는데, 재연결은 성공률이 100% 가 아니라 멀쩡한 세션을
+                    # 잃는 쪽이 손해가 크다(실측 2026-08-19: 60회(≈5초) 임계로 정상
+                    # 스트림이 끊겼고, 닫자마자 다시 열려다 9회 연속 실패했다).
+                    if fails >= 300:          # ≈ 25초 무프레임
                         with self.lock:
                             self.stats = {'ok': False, 'msg': '프레임 끊김 — 다시 여는 중'}
                         try:
                             cam.close()
                         except Exception:
                             pass
+                        self.cam = None
+                        time.sleep(3.0)       # USB 가 풀릴 시간 — 없으면 자기 핸들과 충돌
                         cam = self.cam = open_cam()
                         fails = 0
                     time.sleep(0.05); continue
@@ -249,9 +257,22 @@ class Depth(threading.Thread):
         rgb = cam.color()
         if rgb is None or rgb.ndim != 3:
             return
+        # 컬러가 갱신되는지 추적한다. 깊이만 살아 있고 컬러가 옛 프레임에 고정되면
+        # 블롭 좌표가 현재 깊이 맵과 어긋나 cam_xyz 가 조용히 None 이 된다 —
+        # 화면만 보면 "멈춘 것 같다"로 끝나므로 수치로 드러내 둔다.
+        sig = int(rgb[::32, ::32, 0].sum())
+        if sig == self._color_sig:
+            self._color_same += 1
+        else:
+            self._color_sig, self._color_same = sig, 0
         # 미리보기는 검출 결과와 무관하게 갱신한다 — 빨간 물체가 없을 때도 화면은
         # 나와야 조준과 원인 판단을 할 수 있다. swap_rb 미확정이면 RGB 로 가정한다.
-        disp = rgb if self.swap_rb else rgb[:, :, ::-1]
+        # swap_rb 는 "원본이 RGB라 BGR 로 뒤집어야 한다"는 뜻이다. cv2.imencode 는
+        # BGR 을 기대하므로 뒤집은 쪽을 넘겨야 한다 — 종전에는 조건이 반대로 걸려
+        # 미리보기에서 R 과 B 가 바뀌어 나왔다(사람 피부가 파랗게 보였다).
+        # 검출 경로는 처음부터 옳았고 표시만 틀렸던 것이라, 색으로 원인을 짚기
+        # 어려웠다.
+        disp = rgb[:, :, ::-1] if self.swap_rb else rgb
         ok, buf = cv2.imencode('.jpg', np.ascontiguousarray(disp),
                                [cv2.IMWRITE_JPEG_QUALITY, 75])
         if ok:
@@ -280,12 +301,26 @@ class Depth(threading.Thread):
         area, swap, u, v = best
         if self.swap_rb is None:
             self.swap_rb = swap        # 한 번 정해지면 이후엔 그 해석만 쓴다
-        # 깊이는 한 점만 읽으면 구멍에 걸리므로 블롭 주변 창의 중앙값을 쓴다
+        # 깊이는 한 점만 읽으면 구멍에 걸리므로 블롭 주변 창의 중앙값을 쓴다.
+        #
+        # 창을 고정 크기로 두면 안 된다. 구조광 방식이라 프로젝터와 카메라의 시차로
+        # **물체 주변에 그림자가 생기고**, 작은 물체는 그 그림자에 통째로 들어간다
+        # (실측 2026-08-19: 죠 아래 큐브 자리 11x11 창의 유효 화소가 0 이라 z_mm=0,
+        # cam_xyz 가 None 이 됐다 — 검출은 정확한데 깊이만 비어 있었다).
+        # 유효 화소가 나올 때까지 넓히고, 어디까지 넓혔는지 함께 싣는다.
         h, w = d.shape
-        r = 5
-        win = d[max(0, int(v) - r):int(v) + r + 1, max(0, int(u) - r):int(u) + r + 1]
-        nz = win[win > 0]
-        z_mm = int(np.median(nz)) if nz.size else 0
+        z_mm, nz, used_r = 0, np.array([], dtype=d.dtype), 0
+        for r in (5, 9, 14, 20):
+            win = d[max(0, int(v) - r):int(v) + r + 1,
+                    max(0, int(u) - r):int(u) + r + 1]
+            cand = win[win > 0]
+            if cand.size >= 8:
+                z_mm, nz, used_r = int(np.median(cand)), cand, r
+                break
+            if cand.size > nz.size:
+                nz, used_r = cand, r
+        if z_mm == 0 and nz.size:
+            z_mm = int(np.median(nz))
         # cam.point() 는 깊이 배열을 통째로 받으므로 여기서 직접 투영한다 —
         # 창 중앙값을 쓰려고 (H, W) 배열을 매 프레임 새로 만들면 낭비가 크다.
         if z_mm:
@@ -299,10 +334,12 @@ class Depth(threading.Thread):
             pt = None                       # 작업 영역 밖 — 좌표는 버리고 화소만 남긴다
         with self.lock:
             self.blob = {'u': round(u, 1), 'v': round(v, 1), 'area': area,
-                         'z_mm': z_mm, 'valid_px': int(nz.size),
+                         'z_mm': z_mm, 'valid_px': int(nz.size), 'win_r': used_r,
                          'cam_xyz': [round(c, 4) for c in pt] if pt else None,
                          'registered': bool(getattr(cam, 'registered', False)),
-                         'swap_rb': bool(self.swap_rb)}
+                         'swap_rb': bool(self.swap_rb),
+                         'color_stale': self._color_same,
+                         'color_error': getattr(cam, 'color_error', None)}
 
 
 def make_handler(worker, kin, cam, dep):
