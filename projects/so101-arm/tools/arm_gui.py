@@ -377,15 +377,12 @@ class Worker(threading.Thread):
         # 근처에서 +5° 를 반복하는 경로가 뚫려 있다 — 범위 밖 목표는 서보가 갈 수
         # 있는 데까지 가서 나머지를 계속 미는 구조(사고와 동일)다.
         if joint in ARM:
-            cur_all = self.bus.sync_read('Present_Position', ARM)
-            cur = cur_all[joint]
-            probe = dict(cur_all)
-            probe[joint] = cur + delta
-            why, _bad = self._clamp_to_calib(probe)
+            cur = self.bus.sync_read('Present_Position', [joint])[joint]
+            tgt = cur + delta
+            why, _bad = self._clamp_to_calib({joint: tgt})
             if why:
                 self.say(f'⛔ 조그 거부 — {why}')
                 return
-            tgt = cur + delta
         else:                                     # gripper — 정규화 0~100
             cur = self.bus.sync_read('Present_Position', [joint])[joint]
             tgt = max(0.0, min(100.0, cur + delta))
@@ -408,13 +405,7 @@ class Worker(threading.Thread):
             return
         target = float(target)
         if joint in ARM:
-            try:
-                cur_all = self.bus.sync_read('Present_Position', ARM)
-            except Exception:
-                self.say('⛔ 거부 — 현재 위치를 읽지 못해 범위 검사를 할 수 없습니다')
-                return
-            probe = dict(cur_all); probe[joint] = target
-            why, _bad = self._clamp_to_calib(probe)
+            why, _bad = self._clamp_to_calib({joint: target})
             if why:
                 self.say(f'⛔ 거부 — {why}')
                 return
@@ -511,13 +502,7 @@ class Worker(threading.Thread):
         # ★ 슬라이더도 캘리브 범위를 넘으면 막는다. 여기는 목표만 쓰고 반환해서
         # 이동 감시가 없다 — 범위 밖으로 보내면 아무도 못 잡는 스톨이 된다.
         if joint in ARM:
-            try:
-                cur = self.bus.sync_read('Present_Position', ARM)
-            except Exception:
-                self.say('⛔ 거부 — 현재 위치를 읽지 못해 범위 검사를 할 수 없습니다')
-                return
-            probe = dict(cur); probe[joint] = float(value)
-            why, _bad = self._clamp_to_calib(probe)
+            why, _bad = self._clamp_to_calib({joint: float(value)})
             if why:
                 self.say(f'⛔ 거부 — {why}')
                 return
@@ -577,8 +562,12 @@ class Worker(threading.Thread):
         if cal is None:
             return '캘리브 파일을 읽지 못해 범위 검사를 할 수 없습니다', None
         bounds = arm_lib.calib_bounds(cal)
+        # target 에 있는 관절만 검사한다 — jog/goto 는 한 관절만 명령하고, 명령하지
+        # 않는 관절은 목표가 안 써지므로 검사 대상이 아니다. 안착 자세가 범위 끝에
+        # 걸쳐 있을 때(실측: elbow_flex 97.7° > 상한 95.6°) 전체 자세를 검사하면
+        # 다른 관절을 범위 **안으로** 움직이는 것까지 전부 오거부된다.
         for j in ARM:
-            if j not in bounds:
+            if j not in bounds or j not in target:
                 continue
             lo = bounds[j][0] + margin
             hi = bounds[j][1] - margin
