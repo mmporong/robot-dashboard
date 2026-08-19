@@ -80,6 +80,10 @@ class Camera(threading.Thread):
             return prefer
         return pick[0][1] if pick else 0
 
+    def snapshot_jpeg(self):
+        with self.lock:
+            return self.jpeg
+
     def run(self):
         import cv2
         cap = cv2.VideoCapture(self.index)
@@ -141,6 +145,10 @@ class Depth(threading.Thread):
         self._closing = False
         self._color_sig = None
         self._color_same = 0      # 컬러가 몇 프레임째 그대로인가
+
+    def snapshot_jpeg(self, attr):
+        with self.lock:
+            return getattr(self, attr)
 
     def shutdown(self):
         """종료 시 장치를 반드시 놓는다.
@@ -342,6 +350,52 @@ class Depth(threading.Thread):
                          'color_error': getattr(cam, 'color_error', None)}
 
 
+# 동시에 열 수 있는 MJPEG 스트림 수. 브라우저 새로고침마다 좀비 연결이 쌓이면
+# 그 스레드들이 0.1초마다 write 를 시도하며 GIL 을 다투고, 정작 카메라를 읽는
+# 스레드가 굶는다(실측 2026-08-19: 스레드 68개까지 늘어 깊이 통계가 12초 동안
+# 한 번도 갱신되지 않았다 — 화면이 "멈춘" 것처럼 보인 진짜 원인).
+MAX_STREAMS = 4
+_stream_sem = threading.BoundedSemaphore(MAX_STREAMS)
+
+
+def serve_mjpeg(handler, get_jpeg, fps=10):
+    """최신 JPEG 를 multipart 로 흘린다. 끊긴 연결은 즉시 정리한다.
+
+    ① write 뒤에 flush 한다 — 안 하면 커널 버퍼가 찰 때까지 끊김을 감지하지 못해
+       좀비 스레드가 남는다.
+    ② 같은 프레임은 다시 보내지 않는다 — 대역과 CPU 를 아끼고, 브라우저가 바뀐
+       프레임만 받는다.
+    ③ 동시 스트림 수를 제한한다. 넘치면 503 으로 거절하는 편이 전체를 굶기는 것보다 낫다.
+    """
+    if not _stream_sem.acquire(blocking=False):
+        handler.send_response(503)
+        handler.send_header('Content-Type', 'text/plain; charset=utf-8')
+        handler.end_headers()
+        handler.wfile.write('스트림이 너무 많습니다 — 열려 있는 탭을 닫아 주세요'.encode())
+        return
+    try:
+        handler.send_response(200)
+        handler.send_header('Cache-Control', 'no-store')
+        handler.send_header('Content-Type',
+                            'multipart/x-mixed-replace; boundary=frame')
+        handler.end_headers()
+        last = None
+        while True:
+            j = get_jpeg()
+            if j is not None and j is not last:
+                handler.wfile.write(b'--frame\r\nContent-Type: image/jpeg\r\n'
+                                    + f'Content-Length: {len(j)}\r\n\r\n'.encode())
+                handler.wfile.write(j)
+                handler.wfile.write(b'\r\n')
+                handler.wfile.flush()          # 끊김을 여기서 바로 잡는다
+                last = j
+            time.sleep(1.0 / fps)
+    except (BrokenPipeError, ConnectionResetError, OSError):
+        pass
+    finally:
+        _stream_sem.release()
+
+
 def make_handler(worker, kin, cam, dep):
     page = (HERE / 'panel.html').read_bytes()
 
@@ -382,61 +436,18 @@ def make_handler(worker, kin, cam, dep):
                 if dep is None:
                     return self._json({'error': 'depth off'}, 503)
                 dep.ensure()
-                self.send_response(200)
-                self.send_header('Content-Type',
-                                 'multipart/x-mixed-replace; boundary=frame')
-                self.end_headers()
-                try:
-                    while True:
-                        with dep.lock:
-                            j = dep.rgb_jpeg
-                        if j:
-                            self.wfile.write(b'--frame\r\n'
-                                             b'Content-Type: image/jpeg\r\n\r\n')
-                            self.wfile.write(j); self.wfile.write(b'\r\n')
-                        time.sleep(0.1)
-                except (BrokenPipeError, ConnectionResetError):
-                    pass
+                serve_mjpeg(self, lambda: dep.snapshot_jpeg('rgb_jpeg'))
             elif self.path == '/depth':
                 if dep is None:
                     return self._json({'error': 'depth off'}, 503)
                 dep.ensure()
-                self.send_response(200)
-                self.send_header('Content-Type',
-                                 'multipart/x-mixed-replace; boundary=frame')
-                self.end_headers()
-                try:
-                    while True:
-                        with dep.lock:
-                            j = dep.jpeg
-                        if j:
-                            self.wfile.write(b'--frame\r\n'
-                                             b'Content-Type: image/jpeg\r\n\r\n')
-                            self.wfile.write(j); self.wfile.write(b'\r\n')
-                        time.sleep(0.1)
-                except (BrokenPipeError, ConnectionResetError):
-                    pass
+                serve_mjpeg(self, lambda: dep.snapshot_jpeg('jpeg'))
             elif self.path == '/cam':
                 if cam is None:
                     return self._json({'error': 'camera off'}, 503)
                 cam.ensure()
                 # MJPEG 스트림 — 브라우저 <img>가 그대로 재생한다
-                self.send_response(200)
-                self.send_header('Content-Type',
-                                 'multipart/x-mixed-replace; boundary=frame')
-                self.end_headers()
-                try:
-                    while True:
-                        with cam.lock:
-                            j = cam.jpeg
-                        if j:
-                            self.wfile.write(b'--frame\r\n'
-                                             b'Content-Type: image/jpeg\r\n\r\n')
-                            self.wfile.write(j)
-                            self.wfile.write(b'\r\n')
-                        time.sleep(0.1)
-                except (BrokenPipeError, ConnectionResetError):
-                    pass                          # 탭을 닫으면 여기로 — 정상 종료
+                serve_mjpeg(self, cam.snapshot_jpeg)
             else:
                 self._json({'error': 'not found'}, 404)
 
@@ -534,6 +545,7 @@ def main():
         cam = None
 
     dep = Depth() if a.depth else None
+    ThreadingHTTPServer.daemon_threads = True   # 남은 스트림 스레드가 종료를 막지 않게
     srv = ThreadingHTTPServer(('127.0.0.1', a.http),
                               make_handler(worker, kin, cam, dep))
     print(f'SO-101 패널 → http://127.0.0.1:{a.http}  (시리얼 {port})')
