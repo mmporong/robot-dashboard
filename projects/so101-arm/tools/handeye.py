@@ -136,14 +136,27 @@ def read_blob(tries=12, need=5):
     """블롭이 안정될 때까지 여러 프레임을 읽어 중앙값을 쓴다.
 
     한 프레임만 믿으면 깊이 잡음과 순간적인 오검출이 그대로 대응쌍에 들어간다.
+
+    ★ 품질 게이트(2026-08-19 1차 순회 실측): 구조광 그림자로 물체 위 유효
+    깊이 화소가 없으면 데몬이 창을 r=14~20 까지 넓혀 **주변(책상) 화소의
+    중앙값**을 쓴다 — 그 값은 물체가 아니라 배경 깊이라, RMS 33mm 의 계통
+    오차가 그대로 들어왔다. 창이 작고(r≤9) 물체 화소가 충분한(≥8) 프레임만
+    채택한다. 대부분 탈락하면 물체가 깊이 센서에 너무 작은 것 — 더 큰 물체로.
     """
     pts = []
+    rejected = 0
     for _ in range(tries):
         r = get('/blob')
         b = r.get('blob')
         if b and b.get('cam_xyz'):
-            pts.append(b['cam_xyz'])
+            if b.get('win_r', 99) <= 9 and b.get('valid_px', 0) >= 8:
+                pts.append(b['cam_xyz'])
+            else:
+                rejected += 1
         time.sleep(0.15)
+    if rejected and len(pts) < need:
+        print(f'    (깊이 품질 미달 {rejected}프레임 탈락 — 물체가 깊이 센서에 '
+              f'너무 작습니다. win_r≤9·valid_px≥8 요구)')
     if len(pts) < need:
         return None, len(pts)
     a = np.array(pts)
