@@ -42,6 +42,7 @@ TEMP_EVERY = 25                    # 폴링 몇 회마다 온도를 읽나 (매�
 STALL_GAP_DEG = 3.0                # 목표와 이만큼 벌어져 있으면 막힌 것으로 본다
 STALL_MOVE_DEG = 0.4               # 0.5초 동안 이보다 덜 움직이면 '안 가고 있다'로 본다
 ROLL_FIRST_DEG = 20                # wrist_roll 이 이보다 크게 바뀌면 회전을 먼저 끝낸다
+LIMIT_MARGIN_DEG = 2.0             # 캘리브 범위 끝에서 이만큼은 남기고 멈춘다
 
 # 전류는 **가장 빠른 스톨 신호**다. 온도는 후행 지표(이미 뜨거워진 뒤 올라간다)이고
 # 위치 기반 감지도 0.5초를 기다려야 한다.
@@ -76,6 +77,12 @@ PROTECT = {
 PROTECT_GRIPPER = {
     'Max_Temperature_Limit': 65,          # 기본 70 → 낮춤
     'Protection_Time': 50,                # 2초 → 0.5초
+    'Overload_Torque': 25,                # % — **그리퍼는 낮게.** 스톨 토크의 25% 만
+                                          # 넘어도 보호가 걸리게 해 물체를 부수지도,
+                                          # 서보가 무리하지도 않게 한다. 공장 기본
+                                          # 80% 로 두면 꽉 잡는 대신 과열 위험이 크다.
+                                          # 이 팔의 원래 그리퍼가 25% 였다(실측).
+    'Protection_Current': 250,            # ≈1.6A — 다른 관절(320)보다 낮게
 }
 
 
@@ -386,6 +393,35 @@ class Worker(threading.Thread):
             self.bus.sync_write('Goal_Velocity', {m: 8 for m in ALL}, normalize=False)
         self.say('⏹ 정지 — 현재 자세 유지')
 
+    def _clamp_to_calib(self, target):
+        """목표가 **캘리브 범위** 안인지 보고, 벗어나면 (거부 사유, 관절)을 돌려준다.
+
+        IK 는 URDF 관절 한계로 해를 내는데 그 값이 서보 실측 범위보다 넓다
+        (2026-08-19 실측: shoulder_pan 하한이 21.6°, elbow_flex 상한이 9.5° 초과).
+        범위 밖을 명령하면 서보는 갈 수 있는 데까지 가서 **나머지를 계속 민다** —
+        스톨이 난 뒤 감지하는 것보다 애초에 안 보내는 편이 낫다.
+
+        캘리브 파일의 raw 범위를 도로 환산해 비교한다(중립 2048 기준, 0.0879°/count).
+        """
+        import json as _json
+        try:
+            cal = _json.loads(self.calib_path().read_text())
+        except Exception:
+            return None, None                     # 캘리브가 없으면 검사하지 않는다
+        deg = 360.0 / 4096
+        for j in ARM:
+            c = cal.get(j)
+            if not c:
+                continue
+            lo = (c['range_min'] - 2048) * deg + LIMIT_MARGIN_DEG
+            hi = (c['range_max'] - 2048) * deg - LIMIT_MARGIN_DEG
+            v = target[j]
+            if v < lo:
+                return f'{j} 목표 {v:.1f}° 가 캘리브 하한 {lo:.1f}° 밖', j
+            if v > hi:
+                return f'{j} 목표 {v:.1f}° 가 캘리브 상한 {hi:.1f}° 밖', j
+        return None, None
+
     def _interp(self, cur, target, seconds):
         """cur → target 으로 보간 이동. 도달하면 True, 중단하면 False."""
         steps = max(2, int(seconds * 50))
@@ -490,6 +526,13 @@ class Worker(threading.Thread):
             moved = abs(target[j] - cur[j])
             if moved > 90:
                 self.say(f'⚠ {j} 를 {moved:.0f}° 돌립니다 — 손목캠 간섭을 확인하세요')
+
+        # ★ 캘리브 범위를 벗어나는 목표는 아예 보내지 않는다.
+        why, _bad = self._clamp_to_calib(target)
+        if why:
+            self.say(f'⛔ 이동 거부 — {why}. IK 는 URDF 한계로 해를 내는데 서보 실측'
+                     f' 범위가 더 좁습니다')
+            return
 
         # ★ 회전을 먼저, 이동을 나중에.
         #
