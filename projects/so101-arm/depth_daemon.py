@@ -79,6 +79,8 @@ class Capture:
         self._color_same = 0      # 컬러가 몇 프레임째 그대로인가
         self._fps = 0.0
         self._fps_n, self._fps_t0 = 0, 0.0
+        self.points = []          # 바닥 평면 피팅용 3D 점 샘플 [m] (16px 격자)
+        self._pts_n = 0
 
     def request_close(self):
         if not self.closing:
@@ -184,6 +186,23 @@ class Capture:
                 cv2.putText(img, f'{stamp}  {self._fps:.0f}fps', (8, 22),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
                 self._scan_red(cam, d, cv2, np)
+                # 3D 점 샘플 (~2Hz). 뎁스는 거리를 **직접** 재는 센서다 — 바닥
+                # 높이는 접촉 탐지가 아니라 이 점들의 평면 피팅으로 잰다
+                # (floor_from_depth.py). blob 과 같은 핀홀 식·좌표계를 쓴다.
+                self._pts_n += 1
+                if self._pts_n % 5 == 0:
+                    h2, w2 = d.shape
+                    fx = (w2 / 2) / math.tan(cam.hfov / 2)
+                    fy = (h2 / 2) / math.tan(cam.vfov / 2)
+                    vv, uu = np.mgrid[0:h2:16, 0:w2:16]
+                    zz = d[::16, ::16].astype(np.float32) / 1000.0
+                    m = zz > 0
+                    xs = (uu[m] - w2 / 2) * zz[m] / fx
+                    ys = (vv[m] - h2 / 2) * zz[m] / fy
+                    pts = np.stack([xs, ys, zz[m]], 1)
+                    sampled = [[round(float(a), 4) for a in p] for p in pts]
+                    with self.lock:
+                        self.points = sampled
                 ok, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 75])
                 if ok:
                     nz = d[valid]
@@ -318,6 +337,11 @@ def make_handler(cap):
                                         if rgb else None})
             elif self.path == '/health':
                 self._json({'seq': cap.seq, 'beat_age': age})
+            elif self.path == '/points':
+                with cap.lock:
+                    pts, seq = cap.points, cap.seq
+                self._json({'seq': seq, 'beat_age': age,
+                            'n': len(pts), 'points': pts})
             else:
                 self._json({'error': 'not found'}, 404)
 

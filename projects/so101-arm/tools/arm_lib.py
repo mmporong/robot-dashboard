@@ -39,6 +39,12 @@ PAN0 = (0.1588, 0.0, 0.2124)
 # lerobot 관절명 ←→ kinematics.JOINT_NAMES 순서 대응
 JOINTS = ['shoulder_pan', 'shoulder_lift', 'elbow_flex', 'wrist_flex', 'wrist_roll']
 
+# 책상면 높이(floor_z_m)로 받아들일 수 있는 밴드 [m]. 측정 도구(probe_floor·
+# floor_from_depth)가 공유한다 — 이 밖의 값은 지배 평면 오인·정합 노후 등
+# 측정 실패이므로 저장하지 않는다. 실측 근거: -0.078 ± 여유 (2026-08-19 확정).
+# 책상·베이스를 크게 옮기면 이 밴드부터 갱신할 것.
+FLOOR_EXPECT_BAND = (-0.095, -0.060)
+
 DEFAULT_MAPPING = {
     'signs':   {j: 1 for j in JOINTS},
     'offsets': {j: 0.0 for j in JOINTS},
