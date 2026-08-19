@@ -43,17 +43,28 @@ STALL_GAP_DEG = 3.0                # 목표와 이만큼 벌어져 있으면 막
 STALL_MOVE_DEG = 0.4               # 0.5초 동안 이보다 덜 움직이면 '안 가고 있다'로 본다
 
 # 전류는 **가장 빠른 스톨 신호**다. 온도는 후행 지표(이미 뜨거워진 뒤 올라간다)이고
-# 위치 기반 감지도 0.5초를 기다려야 하는데, 전류는 막히는 즉시 최대로 튄다.
-# 단위는 STS3215 기준 6.5mA/LSB — 실측으로 조정할 것(정상 이동 시 값을 먼저 볼 것).
-CURRENT_STOP = 380                 # ≈2.5A. 이 이상이 CURRENT_HOLD 회 이어지면 정지
+# 위치 기반 감지도 0.5초를 기다려야 한다.
+#
+# STS3215 데이터시트 실사양 — 단위는 6.5mA/LSB.
+#   7.4V 19kg (리더): 무부하 150mA · 정격 650mA · 스톨 2.5A
+#   12V  30kg (팔로워, **이 팔**): 무부하 180mA · 정격 900mA · 스톨 2.7A
+#                                   입력 4~14V · Kt 11kg.cm/A
+# ★ 리더와 팔로워는 다른 모델이다. 리더(7.4V)에 12V 를 꽂으면 모터가 탄다.
+# 스톨 값(≈415)에 임계를 두면 이미 늦다. 정격(≈138)의 두 배쯤에서 끊는다.
+CURRENT_STOP = 250                 # ≈1.6A (12V 정격 900mA 의 1.8배). 실측으로 조정할 것
 CURRENT_HOLD = 2                   # 순간 피크(가속·정지)로 오작동하지 않도록 연속 확인
 
-# 서보 자체 보호 (연결 시 EEPROM 에 써 둔다). 소프트웨어 폴링보다 펌웨어가 직접
-# 끊는 편이 비교할 수 없이 빠르다 — 2026-08-19 발연은 이 설정이 없던 상태에서 났다.
+# 서보 자체 보호 (연결 시 EEPROM 에 써 둔다).
+#
+# ★ 공장 기본값은 Protection_Current=0(과전류 보호 꺼짐), Unloading_Condition=0
+# (토크 해제 조건 없음)이다. 즉 **서보가 스스로를 지킬 장치가 비활성으로 출하된다.**
+# 2026-08-19 발연은 이 상태에서 났다.
 PROTECT = {
-    'Max_Temperature_Limit': 65,          # °C. 넘으면 서보가 스스로 토크를 내린다
-    'Protection_Current': 400,            # ≈2.6A
-    'Over_Current_Protection_Time': 50,   # ×10ms = 0.5초 이상 지속되면 발동
+    'Max_Temperature_Limit': 65,          # °C (기본 70 보다 낮게)
+    'Protection_Current': 320,            # ≈2.1A. 12V 정격 900mA 의 2.3배·스톨 2.7A 아래
+    'Over_Current_Protection_Time': 50,   # ×10ms = 0.5초 (기본 2초는 너무 길다)
+    'Overload_Torque': 60,                # % (기본 80 → 더 이르게)
+    'Protection_Time': 50,                # ×10ms = 0.5초 (기본 200=2초)
     'Protective_Torque': 20,              # 보호 후 유지 토크 [%] — 팔이 털썩 떨어지지 않게
 }
 
@@ -334,6 +345,25 @@ class Worker(threading.Thread):
         self.bus.sync_write('Goal_Position', {joint: float(value)})
         self.say(f'{joint} → {float(value):.0f}')
 
+    def _kill_torque(self, why):
+        """스톨·과전류에서의 정지. **위치 명령을 쓰지 않고 토크를 끊는다.**
+
+        데이터시트 7-11: 과부하·과전류 보호는 "위치 명령을 다시 보내면 플래그가
+        해제된다". 그런데 보간 이동은 20ms마다 Goal_Position 을 쓴다 — 서보가 2초를
+        견디고 스스로 출력을 껐는데 초당 50번 "다시 가라"고 명령해 **보호를 계속
+        풀어 준다.** 2026-08-19 발연은 이 구조 때문이었다. 막힌 상황에서 _do_stop()
+        처럼 현재 위치를 다시 쓰는 것조차 보호를 해제시키므로, 여기서는 토크 자체를
+        내린다.
+        """
+        self.abort.clear()
+        try:
+            self.bus.disable_torque()
+        except Exception:
+            pass
+        with self.lock:
+            self.state['torque'] = False
+        self.say(f'⛔ {why} — 토크를 내렸습니다 (위치 명령을 보내지 않습니다)')
+
     def _do_stop(self):
         """그 자리에 정지 — 현재 위치를 목표로 다시 써서 붙든다 (토크 유지)."""
         self.abort.clear()
@@ -401,8 +431,8 @@ class Worker(threading.Thread):
                     over = {j: abs(v) for j, v in cur_a.items() if abs(v) >= CURRENT_STOP}
                     self._hi = self._hi + 1 if over else 0
                     if self._hi >= CURRENT_HOLD:
-                        self._do_stop()
-                        self.say(f'⛔ 과전류 정지 — {over} (임계 {CURRENT_STOP})')
+                        self._kill_torque(f'과전류 {over} (임계 {CURRENT_STOP}≈'
+                                          f'{CURRENT_STOP*6.5/1000:.1f}A)')
                         return
 
             if i % 25 == 0:
@@ -417,9 +447,8 @@ class Worker(threading.Thread):
                     if moved < STALL_MOVE_DEG and left > STALL_GAP_DEG:
                         stuck = max(ARM, key=lambda j:
                                     abs((now[j] - target[j] + 180) % 360 - 180))
-                        self._do_stop()
-                        self.say(f'⛔ 스톨 감지 — {stuck} 가 {left:.1f}° 남기고 멈춰 '
-                                 f'있습니다. 간섭을 확인하세요')
+                        self._kill_torque(f'스톨 — {stuck} 가 {left:.1f}° 남기고 '
+                                          f'멈춰 있습니다. 간섭을 확인하세요')
                         return
                 watch = now
             a = i / steps
@@ -445,8 +474,7 @@ class Worker(threading.Thread):
         gap = max(abs((fin[j] - target[j] + 180) % 360 - 180) for j in ARM)
         if gap > STALL_GAP_DEG:
             worst = max(ARM, key=lambda j: abs((fin[j] - target[j] + 180) % 360 - 180))
-            self._do_stop()
-            self.say(f'⛔ 목표에서 {gap:.1f}° 남아 정지 ({worst}) — 간섭을 확인하세요')
+            self._kill_torque(f'목표에서 {gap:.1f}° 남음 ({worst}) — 간섭을 확인하세요')
         else:
             self.say('이동 완료 — 죠 끝을 자로 재서 기록하세요')
 
