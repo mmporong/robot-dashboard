@@ -23,7 +23,6 @@ CLI 세 단계(lerobot-calibrate → jog_test → ik_verify)를 버튼으로 옮
 """
 import json
 import math
-import pathlib
 import queue
 import threading
 import time
@@ -41,8 +40,12 @@ TEMP_WARN, TEMP_STOP = 55, 62      # °C
 TEMP_EVERY = 25                    # 폴링 몇 회마다 온도를 읽나 (매번은 비싸다)
 STALL_GAP_DEG = 3.0                # 목표와 이만큼 벌어져 있으면 막힌 것으로 본다
 STALL_MOVE_DEG = 0.4               # 0.5초 동안 이보다 덜 움직이면 '안 가고 있다'로 본다
+STALL_LAG_DEG = 15.0               # 움직이고는 있어도 보간 목표에서 이만큼 뒤처지면 끊는다
+                                   # — 마찰로 기어가는 부분 스톨(creeping stall)도 서보를 태운다
 ROLL_FIRST_DEG = 20                # wrist_roll 이 이보다 크게 바뀌면 회전을 먼저 끝낸다
 LIMIT_MARGIN_DEG = 2.0             # 캘리브 범위 끝에서 이만큼은 남기고 멈춘다
+TORQUE_ON_TOL_DEG = 3.0            # 토크 켜기 전 검사의 **바깥** 허용 — raw 카운트로 환산해 쓴다
+STOP_TEST_MAX_S = 3.0              # stop_test 대기 상한 — 워커가 오래 자면 감시가 전부 멎는다
 
 # 전류는 **가장 빠른 스톨 신호**다. 온도는 후행 지표(이미 뜨거워진 뒤 올라간다)이고
 # 위치 기반 감지도 0.5초를 기다려야 한다.
@@ -144,6 +147,7 @@ class Worker(threading.Thread):
         motors = {j: Motor(i + 1, 'sts3215', norm) for i, j in enumerate(ARM)}
         motors['gripper'] = Motor(6, 'sts3215', MotorNormMode.RANGE_0_100)
         calib = {}
+        self._calib_cache = None                  # 파일이 바뀌었을 수 있다 — 다시 읽게
         p = self.calib_path()
         if p.exists():
             calib = {k: MotorCalibration(**v)
@@ -206,11 +210,19 @@ class Worker(threading.Thread):
         # 공장 기본 상한이 65라 종전 매핑(5%→119, 100%→2000)은 전 구간이 무시됐다.
         # 상한을 254로 올려 두면 1 unit ≈ 0.087°/s 로 선형 제어된다(실측 2026-08-18:
         # vel 120→10.4°/s · 200→17.0°/s). 254 가 1바이트 최대라 상한 속도는 ≈22°/s.
-        pct = self.snapshot()['speed_pct']
-        vel = max(3, min(254, int(15 + pct / 100 * 239)))   # 1%→17(1.5°/s) · 100%→254(22°/s)
+        vel = self._profile_vel()
         self.bus.sync_write('Goal_Velocity', {m: vel for m in ALL}, normalize=False)
         self.bus.sync_write('Acceleration', {m: 15 for m in ALL}, normalize=False)
         self.bus.sync_write('Torque_Limit', {m: 600 for m in ALL}, normalize=False)
+
+    def _profile_vel(self):
+        """speed_pct → Goal_Velocity 유닛. 1%→17(≈1.5°/s) · 100%→254(≈22°/s).
+
+        1 unit ≈ 0.087°/s (실측 2026-08-18: vel 120→10.4°/s · 200→17.0°/s).
+        스톨 감지도 이 값으로 "속도 상한상 최대 얼마나 움직일 수 있었나"를 계산한다.
+        """
+        pct = self.snapshot()['speed_pct']
+        return max(3, min(254, int(15 + pct / 100 * 239)))
 
     def _do_speed(self, pct):
         pct = max(5, min(100, int(pct)))
@@ -226,17 +238,64 @@ class Worker(threading.Thread):
             return
         if on:
             self._apply_motion_profile()          # 힘이 들어가기 전에 속도부터 묶는다
+            # ★ 토크를 켜는 것 자체가 위험 동작이다. 켜는 순간 서보는 마지막
+            # Goal_Position 을 향해 움직인다 — 이전 이동의 목표가 남아 있으면
+            # 그리로 튄다(2026-08-19: 그리퍼가 범위 밖이라 스스로 움직여 기구가
+            # 물렸다). 켜기 전에 목표를 현재 위치로 덮고, 현재 자세가 캘리브
+            # 범위를 크게 벗어났으면(바깥 여유 TORQUE_ON_TOL_DEG) 거부한다.
+            #
+            # 검사·기록은 전부 **raw 카운트**로 한다. 정규화 읽기는 그리퍼
+            # (RANGE_0_100)에서 범위 밖을 0/100 으로 **클램프해 버려** 범위 밖을
+            # 볼 수 없고, 그 클램프값을 목표로 되쓰면 켜는 순간 경계까지 스스로
+            # 움직인다 — 막으려던 바로 그 동작이다 (lerobot _normalize 실측).
+            try:
+                raw = self.bus.sync_read('Present_Position', normalize=False)
+            except Exception as e:
+                self.say(f'⚠ 현재 위치를 못 읽어 토크를 켜지 않습니다: {type(e).__name__}')
+                return
+            if self.snapshot()['calibrated']:
+                cal = self._load_calib()
+                if cal is None:
+                    self.say('⛔ 토크 거부 — 캘리브 파일을 읽지 못해 자세 검사를 할 수 없습니다')
+                    return
+                tol = int(TORQUE_ON_TOL_DEG * 4095 / 360)
+                for m in ALL:
+                    c = cal.get(m)
+                    if not c:
+                        continue
+                    if not (c['range_min'] - tol <= raw[m] <= c['range_max'] + tol):
+                        self.say(f'⛔ 토크 거부 — {m} 현재 raw {raw[m]} 가 캘리브 범위 '
+                                 f'{c["range_min"]}~{c["range_max"]} 밖. 손으로 범위 '
+                                 f'안까지 옮긴 뒤 켜세요')
+                        return
+            self.bus.sync_write('Goal_Position', raw, normalize=False)
+            # 감시(_guard)가 붙도록 플래그를 **인가 전에** 세운다. 중간에 실패하면
+            # 일부만 통전된 채 플래그가 안 서서 과열·과전류 감시와 정지 버튼이
+            # 전부 비켜 간다.
+            with self.lock:
+                self.state['torque'] = True
             # 한 서보씩 순차 인가 — 6개 동시 돌입 전류로 전원이 주저앉아 보드가
             # USB에서 떨어진 실측(2026-08-14 15:51)이 있다
             import time as _t
-            for m in ALL:
-                self.bus.enable_torque(m)
-                _t.sleep(0.15)
+            try:
+                for m in ALL:
+                    self.bus.enable_torque(m)
+                    _t.sleep(0.15)
+            except Exception as e:
+                try:
+                    self.bus.disable_torque()
+                except Exception:
+                    pass
+                with self.lock:
+                    self.state['torque'] = False
+                self.say(f'⚠ 토크 인가 실패({type(e).__name__}) — 전체를 도로 내렸습니다')
+                return
+            self.say('토크 ON')
         else:
             self.bus.disable_torque()
-        with self.lock:
-            self.state['torque'] = on
-        self.say(f'토크 {"ON" if on else "OFF"}')
+            with self.lock:
+                self.state['torque'] = False
+            self.say('토크 OFF')
 
     def _do_neutral(self):
         import time as _t
@@ -301,6 +360,7 @@ class Worker(threading.Thread):
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(json.dumps({k: vars(v) for k, v in calib.items()},
                                 indent=2))
+        self._calib_cache = None                  # 범위가 바뀌었다 — 게이트도 새로
         with self.lock:
             self.state['calibrated'] = True
         self.say(f'캘리브레이션 저장 완료 → {p.name}')
@@ -313,24 +373,88 @@ class Worker(threading.Thread):
         if not st['torque']:
             self.say('⚠ 토크 ON 을 먼저 눌러 주세요')
             return
-        cur = self.bus.sync_read('Present_Position', [joint])[joint]
-        self.bus.sync_write('Goal_Position', {joint: cur + delta})
+        # ★ 조그도 캘리브 범위를 넘으면 막는다. goto·move_q 만 검사하면 한계
+        # 근처에서 +5° 를 반복하는 경로가 뚫려 있다 — 범위 밖 목표는 서보가 갈 수
+        # 있는 데까지 가서 나머지를 계속 미는 구조(사고와 동일)다.
+        if joint in ARM:
+            cur_all = self.bus.sync_read('Present_Position', ARM)
+            cur = cur_all[joint]
+            probe = dict(cur_all)
+            probe[joint] = cur + delta
+            why, _bad = self._clamp_to_calib(probe)
+            if why:
+                self.say(f'⛔ 조그 거부 — {why}')
+                return
+            tgt = cur + delta
+        else:                                     # gripper — 정규화 0~100
+            cur = self.bus.sync_read('Present_Position', [joint])[joint]
+            tgt = max(0.0, min(100.0, cur + delta))
+            if abs(tgt - cur) < 0.5:
+                self.say(f'⛔ {joint} 가 이미 한계입니다 ({cur:.1f})')
+                return
+        self.bus.sync_write('Goal_Position', {joint: tgt})
         self.say(f'{joint} {delta:+.0f}')
 
     def _do_stop_test(self, joint, target, wait_s):
-        """이동을 걸고 wait_s 뒤 스스로 정지 — 워커 안에서 재므로 HTTP·폴링 지연이 없다."""
+        """이동을 걸고 잠시 뒤 스스로 정지 — 워커 안에서 재므로 HTTP·폴링 지연이 없다.
+
+        진단용이지만 팔을 움직이는 명령이므로 다른 이동과 **같은 게이트**를 탄다.
+        종전엔 범위 검사도, 대기 상한도, 중단 확인도 없었다 — 임의 목표·임의
+        대기시간을 받아 워커를 통째로 재우는 동안 온도·전류 감시와 정지 버튼이
+        전부 멎는, 사고와 같은 조건을 만들 수 있었다.
+        """
         if not (self.snapshot()['calibrated'] and self.snapshot()['torque']):
             self.say('⚠ 캘리브·토크 ON 후에 쓸 수 있어요')
             return
+        target = float(target)
+        if joint in ARM:
+            try:
+                cur_all = self.bus.sync_read('Present_Position', ARM)
+            except Exception:
+                self.say('⛔ 거부 — 현재 위치를 읽지 못해 범위 검사를 할 수 없습니다')
+                return
+            probe = dict(cur_all); probe[joint] = target
+            why, _bad = self._clamp_to_calib(probe)
+            if why:
+                self.say(f'⛔ 거부 — {why}')
+                return
+        elif not (0.0 <= target <= 100.0):
+            self.say(f'⛔ 거부 — gripper 목표 {target:.1f} 가 0~100 밖')
+            return
+        wait_s = min(float(wait_s), STOP_TEST_MAX_S)
         rd = lambda: self.bus.sync_read('Present_Position', [joint])[joint]
-        p0 = rd(); t0 = time.monotonic()
-        self.bus.sync_write('Goal_Position', {joint: float(target)})
-        time.sleep(wait_s)
-        p1 = rd(); t1 = time.monotonic()
-        self._do_stop()                                  # 실제 정지 경로 그대로
-        t2 = time.monotonic()
-        time.sleep(1.5)
-        p2 = rd()
+        try:
+            p0 = rd()
+        except Exception:
+            self._kill_torque('stop_test 시작 읽기 실패 — 통신 이상')
+            return
+        t0 = time.monotonic()
+        self.bus.sync_write('Goal_Position', {joint: target})
+        # 통짜 sleep 금지 — 자는 동안 abort(정지 버튼)와 과전류를 못 본다.
+        hi = 0
+        end = t0 + wait_s
+        while time.monotonic() < end:
+            if self.abort.is_set():
+                self._do_stop()
+                return
+            try:
+                c = abs(self.bus.read('Present_Current', joint, normalize=False))
+            except Exception:
+                c = 0
+            hi = hi + 1 if c >= CURRENT_STOP else 0
+            if hi >= CURRENT_HOLD:
+                self._kill_torque(f'과전류 {joint}={c} (stop_test 중, 임계 {CURRENT_STOP})')
+                return
+            time.sleep(0.1)
+        try:
+            p1 = rd(); t1 = time.monotonic()
+            self._do_stop()                              # 실제 정지 경로 그대로
+            t2 = time.monotonic()
+            time.sleep(1.5)
+            p2 = rd()
+        except Exception:
+            self._kill_torque('stop_test 측정 읽기 실패 — 통신 이상')
+            return
         self.say(f'속도 {(abs(p1-p0)/(t1-t0)):.1f}°/s · 정지호출 {1000*(t2-t1):.0f}ms · '
                  f'정지시 {p1:.1f}° → 최종 {p2:.1f}° (여유 {abs(p2-p1):.1f}°) · 목표였던 {target}°')
 
@@ -344,9 +468,33 @@ class Worker(threading.Thread):
             self.say('⚠ 캘리브레이션 후에 쓸 수 있어요')
             return
         self._apply_motion_profile()
+        # 켜기 전에 목표를 현재 위치로 덮는다 — 이전 목표가 남아 있으면 토크가
+        # 들어가는 순간 그리로 튄다 (_do_torque 와 같은 이유). 검사·기록은 raw 로:
+        # 정규화 읽기는 범위 밖을 0/100 으로 클램프해 버려, 그 값을 목표로 되쓰면
+        # 켜는 순간 경계까지 스스로 움직인다(2026-08-19 기구가 물린 사고 형태).
+        raw_g = self.bus.sync_read('Present_Position', ['gripper'],
+                                   normalize=False)['gripper']
+        cal = self._load_calib()
+        if cal is None or 'gripper' not in cal:
+            self.say('⛔ 거부 — 캘리브 파일을 읽지 못해 그리퍼 자세 검사를 할 수 없습니다')
+            return
+        c = cal['gripper']
+        tol = int(TORQUE_ON_TOL_DEG * 4095 / 360)
+        if not (c['range_min'] - tol <= raw_g <= c['range_max'] + tol):
+            self.say(f'⛔ 거부 — gripper 현재 raw {raw_g} 가 캘리브 범위 '
+                     f'{c["range_min"]}~{c["range_max"]} 밖. 손으로 되돌린 뒤 시도하세요')
+            return
+        self.bus.sync_write('Goal_Position', {'gripper': raw_g}, normalize=False)
         self.bus.enable_torque('gripper')
+        # ★ 그리퍼 하나만 켜도 통전은 통전이다 — 플래그를 세워야 _guard 의
+        # 과열·과전류 감시가 붙는다. 파지 유지가 정확히 지속 부하 상황이라 이
+        # 모터가 가장 감시가 필요한데, 종전엔 여기서 플래그가 안 서서 무기한
+        # 무감시 통전이었다. 물체를 놓치면 안 되므로 토크를 도로 내리지는 않는다.
+        with self.lock:
+            self.state['torque'] = True
         before = self.bus.sync_read('Present_Position', ['gripper'])['gripper']
-        self.bus.sync_write('Goal_Position', {'gripper': before + delta})
+        tgt = max(0.0, min(100.0, before + delta))      # 정규화 0~100 을 넘지 않게
+        self.bus.sync_write('Goal_Position', {'gripper': tgt})
         time.sleep(2.0)
         after = self.bus.sync_read('Present_Position', ['gripper'])['gripper']
         self.say(f'그리퍼 {before:.1f} → {after:.1f} (명령 {delta:+.0f})')
@@ -366,12 +514,16 @@ class Worker(threading.Thread):
             try:
                 cur = self.bus.sync_read('Present_Position', ARM)
             except Exception:
-                cur = {}
+                self.say('⛔ 거부 — 현재 위치를 읽지 못해 범위 검사를 할 수 없습니다')
+                return
             probe = dict(cur); probe[joint] = float(value)
             why, _bad = self._clamp_to_calib(probe)
             if why:
                 self.say(f'⛔ 거부 — {why}')
                 return
+        elif not (0.0 <= float(value) <= 100.0):   # gripper — 정규화 0~100
+            self.say(f'⛔ 거부 — gripper 목표 {float(value):.1f} 가 0~100 밖')
+            return
         self.bus.sync_write('Goal_Position', {joint: float(value)})
         self.say(f'{joint} → {float(value):.0f}')
 
@@ -405,34 +557,51 @@ class Worker(threading.Thread):
             self.bus.sync_write('Goal_Velocity', {m: 8 for m in ALL}, normalize=False)
         self.say('⏹ 정지 — 현재 자세 유지')
 
-    def _clamp_to_calib(self, target):
+    def _clamp_to_calib(self, target, margin=LIMIT_MARGIN_DEG):
         """목표가 **캘리브 범위** 안인지 보고, 벗어나면 (거부 사유, 관절)을 돌려준다.
 
-        IK 는 URDF 관절 한계로 해를 내는데 그 값이 서보 실측 범위보다 넓다
-        (2026-08-19 실측: shoulder_pan 하한이 21.6°, elbow_flex 상한이 9.5° 초과).
-        범위 밖을 명령하면 서보는 갈 수 있는 데까지 가서 **나머지를 계속 민다** —
-        스톨이 난 뒤 감지하는 것보다 애초에 안 보내는 편이 낫다.
+        margin 은 범위 안쪽으로 남기는 여유[°]다. 음수를 주면 바깥 허용이 된다 —
+        토크 켜기 검사처럼 "크게 벗어났는지"만 볼 때 쓴다.
 
-        캘리브 파일의 raw 범위를 도로 환산해 비교한다(중립 2048 기준, 0.0879°/count).
+        IK 는 URDF 관절 한계로 해를 내는데 그 값이 서보 실측 범위보다 넓다
+        (2026-08-19 실측: shoulder_pan ±98.9° 인데 URDF 는 ±110°). 범위 밖을
+        명령하면 lerobot 은 클램프 없이 그대로 내보내고(_unnormalize 의 DEGREES
+        분기), 이후는 펌웨어 한계에 부딪혀 스톨 감지가 전 관절 토크를 떨어뜨리는
+        것으로 끝난다 — 애초에 안 보내는 편이 낫다.
+
+        경계는 arm_lib.calib_bounds — lerobot DEGREES 정규화(범위 중점 기준,
+        360/4095)와 같은 식이다. 캘리브 파일을 못 읽으면 **거부**한다(fail-closed).
+        여기가 뚫리면 이 게이트에 기대는 jog·goto·move_q 전부가 조용히 무방비가 된다.
         """
-        import json as _json
-        try:
-            cal = _json.loads(self.calib_path().read_text())
-        except Exception:
-            return None, None                     # 캘리브가 없으면 검사하지 않는다
-        deg = 360.0 / 4096
+        cal = self._load_calib()
+        if cal is None:
+            return '캘리브 파일을 읽지 못해 범위 검사를 할 수 없습니다', None
+        bounds = arm_lib.calib_bounds(cal)
         for j in ARM:
-            c = cal.get(j)
-            if not c:
+            if j not in bounds:
                 continue
-            lo = (c['range_min'] - 2048) * deg + LIMIT_MARGIN_DEG
-            hi = (c['range_max'] - 2048) * deg - LIMIT_MARGIN_DEG
+            lo = bounds[j][0] + margin
+            hi = bounds[j][1] - margin
             v = target[j]
             if v < lo:
                 return f'{j} 목표 {v:.1f}° 가 캘리브 하한 {lo:.1f}° 밖', j
             if v > hi:
                 return f'{j} 목표 {v:.1f}° 가 캘리브 상한 {hi:.1f}° 밖', j
         return None, None
+
+    def _load_calib(self):
+        """캘리브 파일을 읽어 캐시한다 — 조그 버튼마다 디스크를 파싱하지 않게.
+
+        연결·저장이 캐시를 비운다. 못 읽으면 None — 호출부는 거부해야 한다.
+        """
+        cal = getattr(self, '_calib_cache', None)
+        if cal is None:
+            try:
+                cal = json.loads(self.calib_path().read_text())
+            except Exception:
+                return None
+            self._calib_cache = cal
+        return cal
 
     def _interp(self, cur, target, seconds):
         """cur → target 으로 보간 이동. 도달하면 True, 중단하면 False."""
@@ -473,16 +642,47 @@ class Worker(threading.Thread):
                 try:
                     now = self.bus.sync_read('Present_Position', ARM)
                 except Exception:
-                    self._do_stop(); self.say('⚠ 이동 중 읽기 실패 — 정지했습니다')
+                    # 읽기가 안 되면 통신이 흔들리는 것이다 — 그동안에도 서보는
+                    # 마지막 목표를 향해 계속 민다. _do_stop 은 위치를 다시 써서
+                    # 서보 보호를 해제시키고, 그 안의 읽기도 같이 실패하면 토크가
+                    # 켜진 채 옛 목표만 남는다. 여기서는 무조건 토크를 끊는다.
+                    self._kill_torque('이동 중 읽기 실패 — 통신 이상, 토크를 끊습니다')
                     return False
                 if watch is not None:
-                    moved = max(abs(now[j] - watch[j]) for j in ARM)
-                    left = max(abs((now[j] - target[j] + 180) % 360 - 180) for j in ARM)
-                    if moved < STALL_MOVE_DEG and left > STALL_GAP_DEG:
-                        stuck = max(ARM, key=lambda j:
-                                    abs((now[j] - target[j] + 180) % 360 - 180))
-                        self._kill_torque(f'스톨 — {stuck} 가 {left:.1f}° 남기고 '
-                                          f'멈춰 있습니다. 간섭을 확인하세요')
+                    # ★ 관절별로 본다. 전체 max 로 묶으면(종전 방식) 한 관절이
+                    # 막혀도 다른 관절이 움직이는 동안은 "moved 가 크다"로 읽혀
+                    # 감지가 안 된다 — 사고가 정확히 그 모양이었다(wrist_roll 만
+                    # 막히고 나머지는 내려가는 중).
+                    #
+                    # 비교 기준은 최종 목표가 아니라 **이 순간의 보간 목표**다.
+                    # 최종 목표와 비교하면 이동 초반엔 누구나 멀리 있어 오탐하고,
+                    # 임계를 키우면 그만큼 늦게 잡는다. 보간 목표는 막힌 관절에서만
+                    # 앞서 나가므로 초반에도 정확하다.
+                    ai = i / steps
+                    si = ai * ai * (3 - 2 * ai)
+                    goal_now = {j: cur[j] + (target[j] - cur[j]) * si for j in ARM}
+                    lag = {j: abs((now[j] - goal_now[j] + 180) % 360 - 180)
+                           for j in ARM}
+                    # 두 갈래로 잡는다:
+                    # · 완전 스톨 — 거의 안 움직였는데 보간 목표가 앞서 있다
+                    # · 기는 스톨 — 움직이고는 있어도 뒤처짐이 STALL_LAG_DEG 를
+                    #   넘었다. 마찰로 1°/s 씩 기는 부분 스톨은 이동량 조건을
+                    #   통과해 버리는데, 그 상태도 스톨 전류를 흘려 서보를 태운다.
+                    #   단 **속도 상한 때문에** 뒤처지는 정상 이동은 면제한다 —
+                    #   상한이 허용하는 이동량의 절반 이상을 소화하고 있으면
+                    #   막힌 게 아니라 최고 속도로 가는 중이다. (진짜 부분 스톨은
+                    #   전류 감시(0.2초)가 더 먼저 잡는 것이 보통이다.)
+                    win_cap = self._profile_vel() * 0.087 * 0.5   # 0.5초 창 최대 이동 [°]
+                    stuck = [j for j in ARM
+                             if (abs(now[j] - watch[j]) < STALL_MOVE_DEG
+                                 and lag[j] > STALL_GAP_DEG)
+                             or (lag[j] > STALL_LAG_DEG
+                                 and abs(now[j] - watch[j]) < 0.5 * win_cap)]
+                    if stuck:
+                        worst = max(stuck, key=lambda j: lag[j])
+                        self._kill_torque(f'스톨 — {worst} 가 보간 목표에서 '
+                                          f'{lag[worst]:.1f}° 뒤처져 있습니다. '
+                                          f'간섭을 확인하세요')
                         return False
                 watch = now
             a = i / steps
@@ -504,7 +704,9 @@ class Worker(threading.Thread):
         try:
             fin = self.bus.sync_read('Present_Position', ARM)
         except Exception:
-            self._do_stop(); self.say('⚠ 도달 확인 실패 — 정지했습니다'); return False
+            # 통신 이상 — _do_stop 은 위치 재전송으로 서보 보호를 해제시킨다. 끊는다.
+            self._kill_torque('도달 확인 읽기 실패 — 통신 이상, 토크를 끊습니다')
+            return False
         gap = max(abs((fin[j] - target[j] + 180) % 360 - 180) for j in ARM)
         if gap > STALL_GAP_DEG:
             worst = max(ARM, key=lambda j: abs((fin[j] - target[j] + 180) % 360 - 180))
@@ -575,7 +777,8 @@ class Worker(threading.Thread):
             try:
                 cur = self.bus.sync_read('Present_Position', ARM)
             except Exception:
-                self._do_stop(); self.say('⚠ 회전 후 읽기 실패 — 정지'); return
+                self._kill_torque('회전 후 읽기 실패 — 통신 이상, 토크를 끊습니다')
+                return
 
         if self._interp(cur, target, seconds):
             pk = getattr(self, '_peak', {})

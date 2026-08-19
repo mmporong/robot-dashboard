@@ -29,6 +29,7 @@ import time
 
 HERE = pathlib.Path(__file__).parent
 MAPPING = HERE / 'mapping.json'
+GAIN = HERE / 'servo_gain.json'
 KINEMATICS_DIR = pathlib.Path(
     '~/jdamr_cube_ws/src/jdamr_cube_ros/capstone_pick/capstone_pick').expanduser()
 
@@ -49,6 +50,51 @@ def load_mapping():
     if not MAPPING.exists():
         MAPPING.write_text(json.dumps(DEFAULT_MAPPING, ensure_ascii=False, indent=2))
     return json.loads(MAPPING.read_text())
+
+
+def calib_bounds(calib):
+    """캘리브 dict → 관절별 정규화 경계 {joint: (lo°, hi°)}.
+
+    lerobot DEGREES 정규화와 **같은 식**이어야 한다(motors_bus._normalize):
+        deg = (raw - mid) * 360 / max_res,  mid = (range_min+range_max)/2, max_res = 4095
+    처음엔 중립 2048·4096 으로 환산했다가 shoulder_pan 에서 12.5° 오차단
+    (하한 -98.9° 인데 -86.4° 로 계산)이 났다 — 식을 바꾸지 말고 이걸 쓸 것.
+    결과는 중점 기준이라 항상 ±대칭이다.
+    """
+    out = {}
+    for j, c in calib.items():
+        if not isinstance(c, dict) or 'range_min' not in c:
+            continue
+        mid = (c['range_min'] + c['range_max']) / 2
+        out[j] = ((c['range_min'] - mid) * 360.0 / 4095,
+                  (c['range_max'] - mid) * 360.0 / 4095)
+    return out
+
+
+def load_gain(*required):
+    """servo_gain.json 로드. required 로 넘긴 키가 stale 표시돼 있으면 멈춘다.
+
+    실측 상수는 캠 위치·캘리브레이션이 바뀌면 조용히 틀린 값이 된다 — 파일의
+    `stale_*` 딕셔너리가 그 무효 목록이다. json.loads 로 직접 읽으면 이 표시를
+    지나치므로, 실측 상수를 쓰는 스크립트는 반드시 이 함수로 필수 키를 선언해서
+    로드할 것. 무효 상수로 팔을 움직이면 책상을 뚫거나(floor_z) 발산한다(y_to_px).
+    """
+    g = json.loads(GAIN.read_text())
+    stale = {}
+    for k, v in g.items():
+        if k.startswith('stale_') and isinstance(v, dict):
+            stale.update({key: why for key, why in v.items() if key != 'note'})
+    bad = [k for k in required if k in stale]
+    if bad:
+        raise SystemExit(
+            '무효화된 실측 상수를 쓰려 합니다 — 재측정 전에는 실행할 수 없습니다:\n'
+            + '\n'.join(f'  · {k}: {stale[k]}' for k in bad))
+    # 오타로 가드가 꺼지는 것을 막는다 — stale 목록에도, 실제 키에도 없는 이름은
+    # "검사할 수 없는 요구"이므로 통과가 아니라 거부다 (fail-closed).
+    unknown = [k for k in required if k not in stale and k not in g]
+    if unknown:
+        raise SystemExit(f'servo_gain.json 에 없는 키를 요구합니다(선언 오타?): {unknown}')
+    return g
 
 
 def load_kinematics():

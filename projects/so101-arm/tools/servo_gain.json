@@ -52,5 +52,10 @@
     "jaw_offset_z_m": "캠-죠 상대 위치가 바뀌어 -0.05 m 무효 — 재측정 필요",
     "baseline_px_306": "화면 기준선 306 px 무효 — 재측정 필요",
     "note": "2026-08-18 손목캠 옆면→죠 상단 이동으로 eye-in-hand 실측 상수가 전부 무효가 됐다."
+  },
+  "stale_after_recalib": {
+    "floor_z_m": "2026-08-19 서보 교체·재캘리브레이션으로 FK 좌표계 기준이 바뀌어 -0.1037 무효 — probe_floor.py 로 재측정 전에는 낮은 z 목표를 주지 말 것",
+    "cam_up_roll_deg": "2026-08-19 재캘리브레이션으로 wrist_roll 중립이 바뀌어 -180 무효 — 지금은 캠-위가 roll 0 근처다. 재측정 필요",
+    "note": "2026-08-19 wrist_roll(ID 5)·gripper(ID 6) 교체 후 전 관절 재캘리브레이션. 소비자 스크립트는 arm_lib.load_gain(필수키) 로 로드해 stale 키면 스스로 멈춘다."
   }
 }

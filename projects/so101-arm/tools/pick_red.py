@@ -25,7 +25,12 @@ import numpy as np
 
 BASE = 'http://127.0.0.1:8765'
 HERE = pathlib.Path(__file__).parent
-G = json.loads((HERE / 'servo_gain.json').read_text())
+sys.path.insert(0, str(HERE))
+import arm_lib                                    # noqa: E402
+
+# floor_z_m 은 하강 목표의 근거고 REF_PX(306)·align_y 의 y_to_px 도 실측 상수다 —
+# 하나라도 stale 이면 하강이 책상을 뚫거나 정렬이 발산한다. 여기서 멈춘다.
+G = arm_lib.load_gain('floor_z_m', 'y_to_px', 'baseline_px_306')
 RANGES = [((0, 150, 100), (6, 255, 255)), ((174, 150, 100), (179, 255, 255))]
 REF_PX = 306.0          # 정면에 대응하는 blob_y (실측)
 OBS_Z = 0.02            # 관찰 높이

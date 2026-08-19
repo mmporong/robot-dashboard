@@ -50,6 +50,11 @@ OUT = HERE / 'handeye.json'
 # 범위는 실제 IK 도달성을 계산해 정했다(2026-08-19): z=+0.04 이상은 리치 밖이고,
 # z=+0.02 는 x≤0.22 에서만 풀린다. 아래층은 책상면(floor_z=-0.1037)에서 5cm 여유를
 #둔 -0.05 로 잡았다 — 죠에 물린 물체가 아래로 튀어나와 있어 더 내리면 닿는다.
+#
+# ✎ 2026-08-19 재캘리브레이션 뒤 13점 전부를 신규 캘리브 범위로 정적 재검증했다
+# (IK 관절각이 전부 범위 안, wrist_roll 목표 0.0). 단 아래층의 "책상까지 5cm" 는
+# floor_z_m 실측이 전제인데 재캘리브로 무효가 됐다 — preflight 가 stale 이면 막고,
+# 책상 높이를 다시 잰 뒤에만 --force-floor 없이 돈다.
 POSES = [
     (0.18, -0.06, -0.05), (0.18, 0.00, -0.05), (0.18, 0.06, -0.05),
     (0.23, -0.06, -0.05), (0.23, 0.00, -0.05), (0.23, 0.06, -0.05),
@@ -150,10 +155,53 @@ def kabsch(P, Q):
     return R, t, float(np.sqrt((err ** 2).sum(1).mean()))
 
 
+def preflight(kin, mapping):
+    """이동을 시작하기 **전에** 13점 전부를 IK 로 풀어 캘리브 범위와 대조한다.
+
+    한 점이라도 범위 밖이면 순회 중간에 이동 거부(또는 스톨)로 끊긴다 — 그때는
+    이미 팔이 움직인 뒤다. 캘리브 파일이 바뀔 때마다 도달성이 달라지므로
+    (2026-08-19 재캘리브), 실물을 움직이기 전에 전 지점을 정적으로 확인한다.
+    """
+    calib_p = pathlib.Path('~/.cache/huggingface/lerobot/calibration/robots/'
+                           'so_follower/follower.json').expanduser()
+    try:
+        cal = json.loads(calib_p.read_text())
+    except Exception as e:
+        # fail-closed — "이동 전 정적 검증"이 목적인데 파일이 없다고 그냥
+        # 진행하면 이 함수가 IK 해 존재 확인으로 조용히 축소된다.
+        sys.exit(f'캘리브 파일을 읽지 못해 범위 검증을 할 수 없습니다'
+                 f'({type(e).__name__}): {calib_p}\n'
+                 f'서버를 다른 --id 로 띄웠다면 이 경로부터 맞추세요.')
+    # 경계 식은 arm_lib.calib_bounds — lerobot DEGREES 정규화와 같은 식 하나만 쓴다.
+    bounds = arm_lib.calib_bounds(cal)
+    margin = 2.0                       # arm_gui.LIMIT_MARGIN_DEG 와 같은 값 (수동 동기)
+    bad = []
+    for x, y, z in POSES:
+        bf = tuple(p + o for p, o in zip((x, y, z), arm_lib.PAN0))
+        q = kin.ik_best(*bf, pitch=math.radians(-90))
+        if q is None:
+            bad.append(f'({x:+.2f},{y:+.2f},{z:+.2f}) IK 해 없음')
+            continue
+        tgt = arm_lib.rad_to_servo(q, mapping)
+        for j in JOINTS:
+            v = tgt[f'{j}.pos']
+            lo = bounds[j][0] + margin
+            hi = bounds[j][1] - margin
+            if not (lo <= v <= hi):
+                bad.append(f'({x:+.2f},{y:+.2f},{z:+.2f}) {j}={v:+.1f}° '
+                           f'가 캘리브 범위({lo:+.1f}~{hi:+.1f}) 밖')
+    if bad:
+        sys.exit('프리플라이트 실패 — 아래 지점이 도달 불가입니다. POSES 를 고치세요:\n'
+                 + '\n'.join('  · ' + b for b in bad))
+    print(f'프리플라이트 통과 — {len(POSES)}점 전부 IK 해 있음 · 캘리브 범위 안')
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--dry', action='store_true', help='이동 없이 현재 관측만 확인')
     ap.add_argument('--settle', type=float, default=1.2, help='이동 후 안정 대기 [s]')
+    ap.add_argument('--force-floor', action='store_true',
+                    help='floor_z_m 이 무효(stale)여도 아래층 z=-0.05 를 강행한다')
     a = ap.parse_args()
 
     st = get('/state')
@@ -168,8 +216,22 @@ def main():
     if not st['torque']:
         sys.exit('토크 ON 후에 실행하세요')
 
+    # 아래층 z=-0.05 는 "책상면에서 5cm 여유"가 근거인데, 그 근거(floor_z_m)가
+    # 재캘리브로 무효면 실제 여유를 모른다 — 물린 물체가 책상에 닿으면 사고 재연이다.
+    if not a.force_floor:
+        try:
+            arm_lib.load_gain('floor_z_m')
+        except SystemExit as e:
+            sys.exit(f'{e}\n→ probe_floor.py 로 책상 높이를 다시 잰 뒤 실행하거나, '
+                     f'여유를 눈으로 확인했으면 --force-floor 로 강행하세요.')
+        except Exception as e:
+            # servo_gain.json 이 없거나 깨져도 가드는 fail-closed 다
+            sys.exit(f'servo_gain.json 을 읽지 못해 floor_z_m 유효성을 확인할 수 '
+                     f'없습니다({type(e).__name__}: {e}) — --force-floor 로만 강행 가능')
+
     kin = arm_lib.load_kinematics()
     mapping = arm_lib.load_mapping()
+    preflight(kin, mapping)             # 실물을 움직이기 전에 전 지점 정적 검증
     cam_pts, rob_pts, log = [], [], []
     stalls = 0                    # 연속 도달 실패 횟수 — 쌓이면 중단한다
     for i, (x, y, z) in enumerate(POSES, 1):

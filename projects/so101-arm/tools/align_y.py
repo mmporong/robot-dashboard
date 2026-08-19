@@ -31,7 +31,11 @@ import numpy as np
 
 BASE = 'http://127.0.0.1:8765'
 RANGES = [((0, 150, 100), (6, 255, 255)), ((174, 150, 100), (179, 255, 255))]
-GAIN = json.loads((pathlib.Path(__file__).parent / 'servo_gain.json').read_text())
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
+import arm_lib                                    # noqa: E402
+
+# y_to_px 가 stale 이면 이득 부호·크기를 믿을 수 없어 폐루프가 발산한다 — 멈춘다.
+GAIN = arm_lib.load_gain('y_to_px')
 Y_TO_PX = GAIN['y_to_px'][1]          # y 1m 당 blob_y 변화 [px] (실측 -4578)
 REF = list(GAIN['ref'])
 
@@ -94,7 +98,7 @@ def main():
         y = ny
         r = post('ik', x=x, y=y, z=z, pitch=-90)
         if not r.get('ok'):
-            print(f'   IK 해 없음 — 중단'); return 1
+            print('   IK 해 없음 — 중단'); return 1
         time.sleep(4.0)
     print('\n최대 반복 초과 — 수렴 실패')
     return 1
