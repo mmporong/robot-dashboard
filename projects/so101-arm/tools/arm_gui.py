@@ -42,6 +42,21 @@ TEMP_EVERY = 25                    # 폴링 몇 회마다 온도를 읽나 (매�
 STALL_GAP_DEG = 3.0                # 목표와 이만큼 벌어져 있으면 막힌 것으로 본다
 STALL_MOVE_DEG = 0.4               # 0.5초 동안 이보다 덜 움직이면 '안 가고 있다'로 본다
 
+# 전류는 **가장 빠른 스톨 신호**다. 온도는 후행 지표(이미 뜨거워진 뒤 올라간다)이고
+# 위치 기반 감지도 0.5초를 기다려야 하는데, 전류는 막히는 즉시 최대로 튄다.
+# 단위는 STS3215 기준 6.5mA/LSB — 실측으로 조정할 것(정상 이동 시 값을 먼저 볼 것).
+CURRENT_STOP = 380                 # ≈2.5A. 이 이상이 CURRENT_HOLD 회 이어지면 정지
+CURRENT_HOLD = 2                   # 순간 피크(가속·정지)로 오작동하지 않도록 연속 확인
+
+# 서보 자체 보호 (연결 시 EEPROM 에 써 둔다). 소프트웨어 폴링보다 펌웨어가 직접
+# 끊는 편이 비교할 수 없이 빠르다 — 2026-08-19 발연은 이 설정이 없던 상태에서 났다.
+PROTECT = {
+    'Max_Temperature_Limit': 65,          # °C. 넘으면 서보가 스스로 토크를 내린다
+    'Protection_Current': 400,            # ≈2.6A
+    'Over_Current_Protection_Time': 50,   # ×10ms = 0.5초 이상 지속되면 발동
+    'Protective_Torque': 20,              # 보호 후 유지 토크 [%] — 팔이 털썩 떨어지지 않게
+}
+
 
 # ── 하드웨어 워커 ────────────────────────────────────────────────────
 class Worker(threading.Thread):
@@ -119,6 +134,19 @@ class Worker(threading.Thread):
                 self.bus.write('Maximum_Velocity_Limit', m, 254, normalize=False)
         except Exception as e:
             self.say(f'⚠ 속도 상한 설정 실패: {type(e).__name__} — 속도 제한이 안 걸립니다')
+
+        # ★ 서보 자체 보호를 켠다. 토크가 꺼진 지금(EEPROM 쓰기 가능) 해야 한다.
+        # 소프트웨어 감시는 폴링 주기만큼 늦고, 이동 루프가 블로킹이면 아예 못 본다.
+        # 펌웨어 보호는 그 사이를 메운다.
+        try:
+            for m in ALL:
+                for reg, val in PROTECT.items():
+                    self.bus.write(reg, m, val, normalize=False)
+            self.say(f'서보 보호 설정 완료 (과온 {PROTECT["Max_Temperature_Limit"]}°C · '
+                     f'과전류 {PROTECT["Protection_Current"]})')
+        except Exception as e:
+            self.say(f'⚠ 서보 보호 설정 실패: {type(e).__name__} — 과전류·과온 차단이 '
+                     f'서보 기본값으로 남습니다')
         with self.lock:
             self.state['connected'] = True
             self.state['calibrated'] = bool(calib)
@@ -354,6 +382,7 @@ class Worker(threading.Thread):
 
         steps = max(2, int(seconds * 50))
         watch = None                              # 스톨 감지용 직전 위치
+        self._hi = 0                              # 과전류 연속 관측 횟수
         for i in range(1, steps + 1):
             if self.abort.is_set():               # 정지 버튼 — 즉시 끊는다
                 self._do_stop()
@@ -362,6 +391,20 @@ class Worker(threading.Thread):
             # ★ 이동 **중** 스톨 감지. 보간이 끝난 뒤에만 확인하면 그때까지는 막힌
             # 채로 계속 민다 — 서보가 타는 것은 그 구간이다(2026-08-19 사고).
             # 0.5초마다 보고, 위치가 안 변하는데 목표가 남아 있으면 즉시 끊는다.
+            if i % 10 == 0:
+                # 전류는 위치보다 먼저 반응한다. 막히면 즉시 튀므로 더 자주 본다.
+                try:
+                    cur_a = self.bus.sync_read('Present_Current', ARM, normalize=False)
+                except Exception:
+                    cur_a = None
+                if cur_a:
+                    over = {j: abs(v) for j, v in cur_a.items() if abs(v) >= CURRENT_STOP}
+                    self._hi = self._hi + 1 if over else 0
+                    if self._hi >= CURRENT_HOLD:
+                        self._do_stop()
+                        self.say(f'⛔ 과전류 정지 — {over} (임계 {CURRENT_STOP})')
+                        return
+
             if i % 25 == 0:
                 try:
                     now = self.bus.sync_read('Present_Position', ARM)
@@ -474,10 +517,28 @@ class Worker(threading.Thread):
                 temps[m] = self.bus.read('Present_Temperature', m, normalize=False)
             except Exception:
                 pass
+        curs = {}
+        for m in ALL:
+            try:
+                curs[m] = abs(self.bus.read('Present_Current', m, normalize=False))
+            except Exception:
+                pass
         if not temps:
             return
         with self.lock:
             self.state['temp'] = temps
+            if curs:
+                self.state['current'] = curs
+        hot_i = {m: c for m, c in curs.items() if c >= CURRENT_STOP}
+        if hot_i:
+            try:
+                self.bus.disable_torque()
+            except Exception:
+                pass
+            with self.lock:
+                self.state['torque'] = False
+            self.say(f'⛔ 과전류 자동 정지 — {hot_i} (임계 {CURRENT_STOP})')
+            return
         hot = {m: t for m, t in temps.items() if t >= TEMP_STOP}
         warm = {m: t for m, t in temps.items() if TEMP_WARN <= t < TEMP_STOP}
         if hot:
