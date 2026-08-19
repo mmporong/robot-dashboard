@@ -20,9 +20,11 @@ IK 는 서버에서 푼다 — 캡스톤 `kinematics.ik_best` 로 관절각을 �
     python3 panel_server.py --port-serial /dev/ttyACM1 --http 8766
 """
 import argparse
+import base64
 import json
 import math
 import pathlib
+import subprocess
 import sys
 import threading
 import time
@@ -94,6 +96,15 @@ class Camera(threading.Thread):
                 cap = cv2.VideoCapture(alt)
         if not cap.isOpened():
             return
+        # ★ MJPG 강제 + 15fps. 기본 포맷(YUYV 640x480@30)은 비압축이라 등시성
+        # 대역 ~147Mbps 를 예약하는데, 이 캠은 Astra 와 같은 USB2(480M) 버스에
+        # 있다. 그 예약이 걸리는 순간 Astra 프레임이 굶고, 구형 SDK 는 거기서
+        # 영구 교착한다(실측 2026-08-19: /cam 첫 접속에 깊이 스트림 동결).
+        # MJPG 는 수십 Mbps 라 둘이 공존한다. 어차피 /cam 은 10fps 로만 내보낸다.
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        cap.set(cv2.CAP_PROP_FPS, 15)
         while True:
             ok, frame = cap.read()
             if ok:
@@ -106,334 +117,164 @@ class Camera(threading.Thread):
 
 
 class Depth(threading.Thread):
-    """Orbbec Astra 깊이를 컬러맵 JPEG 로 만들어 최신 한 장만 유지한다.
+    """깊이 데몬(depth_daemon.py)을 감독하고 최신 프레임을 중계한다.
 
     손목캠과 달리 이쪽은 **거리를 직접 측정**한다. 손목캠이 못 푸는 전후(x) 를
     여기서 얻는 것이 이 카메라를 붙인 이유다(2026-08-18: 면적 기반 x 추정이 두 번
     실패 — 신호가 거리와 무관하게 움직였다).
 
-    SDK 가 구형이라 별도 프로세스로 띄우지 않고 같은 프로세스에서 ctypes 로 연다.
-    실패해도 패널 전체가 죽지 않도록 예외를 삼키고 상태만 남긴다.
+    ★ 캡처는 같은 프로세스가 아니라 **별도 프로세스**가 한다. Legacy SDK 는
+    같은 USB2 버스의 UVC 캠이 열리는 순간 astra_update() 안에서 영구 교착할 수
+    있는데(실측 2026-08-19: /cam 최초 접속에 깊이 스레드가 C 코드에서 멈춰
+    재연결 루프조차 안 돌았다), 교착한 스레드는 살릴 방법이 없고 서버 재시작은
+    팔 토크를 풀어 버린다. 프로세스로 떼어 두면 데몬만 갈아끼우면 된다.
+
+    이 스레드가 하는 일: 데몬 기동 → /all 을 10Hz 로 끌어와 캐시 → 하트비트가
+    멎거나 프로세스가 죽으면 재기동. 밖에서 보는 인터페이스(lock·stats·blob·
+    snapshot_jpeg·ensure·shutdown)는 종전 그대로다.
     """
 
-    # 빨강 HSV 두 구간(색상환 양 끝) — **뎁스캠 전용 값이다.**
-    # 손목캠(pick_red.py)의 ((0,150,100),(6,…)) / ((174,150,100),(179,…)) 를 그대로
-    # 쓰면 이 카메라에서는 검출 0 이 된다. 2026-08-18 같은 장면 실측:
-    #   빨간 물체  H 168~175 (중앙 174) · S 중앙 211 · V 중앙 87
-    #   사람 팔    H   5~  6 (중앙   6) · S 중앙 117 · V 중앙 74
-    # ① V 하한 100 이 물체(중앙 87)를 통째로 잘라내고 있었다 → 55 로 내린다.
-    # ② H 상단 구간이 174~179 라 물체 화소의 절반(168~173)을 놓쳤다 → 166 부터.
-    # ③ 살색이 빨강 저채도 쪽에 걸려 사람 팔이 물체보다 큰 덩어리로 잡힌다.
-    #    S 하한 140 이면 팔은 전부 빠지고 물체만 남는다(실측: S≥140 에서 팔 0px).
-    # 카메라·조명이 바뀌면 다시 잴 것.
-    RED = [((0, 140, 55), (10, 255, 255)), ((166, 140, 55), (179, 255, 255))]
-    # 뎁스캠에서 큐브는 200px 안팎으로 작게 잡힌다(멀리서 넓게 보므로).
-    MIN_AREA = 80
-    # 작업 영역 밖(사람·벽)을 거르는 깊이 창 [m]
-    Z_RANGE = (0.35, 1.20)
+    # 데몬 HTTP 가 살아 있어도 하트비트(beat_age)가 이보다 오래 멎으면 캡처가
+    # SDK 안에서 굳은 것이다 — 데몬 자체 워치독(12s)이 놓친 경우의 안전망.
+    STALE_S = 20.0
+    # /all 요청이 이 시간 동안 계속 실패하면(기동 직후 제외) 데몬을 갈아끼운다.
+    HTTP_DEAD_S = 15.0
 
-    def __init__(self):
+    def __init__(self, port=8766):
         super().__init__(daemon=True)
+        self.port = port
         self.lock = threading.Lock()
         self.jpeg = None
         self.rgb_jpeg = None
         self.stats = {'ok': False, 'msg': '시작 전'}
         self.blob = None
-        self.swap_rb = None        # 컬러가 RGB 로 오는지 BGR 로 오는지 — 첫 검출로 확정
         self.started = False
-        self.cam = None
         self._closing = False
-        self._color_sig = None
-        self._color_same = 0      # 컬러가 몇 프레임째 그대로인가
-        self._fps = 0.0
-        self._fps_n, self._fps_t0 = 0, 0.0
+        self._proc = None
+        self._log = None
 
     def snapshot_jpeg(self, attr):
         with self.lock:
             return getattr(self, attr)
-
-    def shutdown(self, timeout=6.0):
-        """종료 시 장치를 반드시 놓는다.
-
-        daemon 스레드라 프로세스가 죽으면 close() 가 안 불리는데, Astra 는 그렇게
-        버려두면 **다음 프로세스가 열지 못한다**(실측 2026-08-19: 서버를 재시작할
-        때마다 카메라만 안 붙어, 포트 전원을 껐다 켜야 복구됐다). 재시작은 연결
-        경로에서 토크를 풀어 팔을 떨어뜨리므로 이 정리가 없으면 카메라 하나 때문에
-        팔을 내려놓는 사이클이 된다.
-
-        ★ 닫는 주체는 **읽고 있는 스레드 자신**이어야 한다. 여기서 곧바로 close()
-        하면 그 스레드가 아직 SDK 안(astra_update · open_frame)에 있는 채로 세션이
-        무너져 정리가 깨지고, 결국 같은 증상이 반복된다. 플래그를 세우고 스레드가
-        스스로 닫고 나올 때까지 기다린 뒤, 그래도 남아 있을 때만 직접 닫는다.
-        """
-        self._closing = True
-        if self.is_alive():
-            self.join(timeout)        # 루프가 _closing 을 보고 스스로 close 한다
-        c, self.cam = self.cam, None
-        if c is not None:             # 스레드가 시간 안에 못 끝낸 경우의 최후 수단
-            try:
-                c.close()
-            except Exception:
-                pass
 
     def ensure(self):
         if not self.started:
             self.started = True
             self.start()
 
-    def run(self):
-        import numpy as np
-        import cv2
-        sys.path.insert(0, str(TOOLS))
-        from astra import Astra
+    def shutdown(self, timeout=10.0):
+        """데몬을 곱게 끝낸다 — SIGTERM 이면 데몬이 Astra 를 스스로 닫는다."""
+        self._closing = True
+        if self.is_alive():
+            self.join(2.0)
+        self._stop_proc(grace=timeout)
 
-        def open_cam():
-            """열릴 때까지 계속 시도한다. **포기하지 않는 것이 요점이다.**
+    def _spawn(self):
+        if self._log is None:
+            self._log = open(HERE / 'depth_daemon.log', 'ab', buffering=0)
+        self._proc = subprocess.Popen(
+            [sys.executable, '-u', str(HERE / 'depth_daemon.py'),
+             '--http', str(self.port)],
+            cwd=str(HERE), stdout=self._log, stderr=subprocess.STDOUT)
 
-            직전 프로세스가 USB 를 놓는 데 시간이 걸려 재기동 직후엔 반드시 몇 번
-            실패한다. 종전에는 10회(약 40초) 만에 포기하고 스레드가 끝났는데, 그러면
-            복구 수단이 서버 재시작뿐이고 재시작은 연결 경로에서 토크를 풀어 팔을
-            떨어뜨린다 — 카메라 하나 때문에 팔을 내려놓는 사이클이 된다(실측
-            2026-08-18~19 다섯 차례). 간격을 점증시키며 무한히 기다리는 편이 낫다.
-            """
-            delay, n = 1.0, 0
-            while True:
-                n += 1
-                try:
-                    c = Astra()
-                    with self.lock:
-                        self.stats = {'ok': False, 'msg': f'열림 (시도 {n})'}
-                    return c
-                except Exception as e:
-                    with self.lock:
-                        self.stats = {'ok': False,
-                                      'msg': f'열기 대기 {n}회 — {type(e).__name__}'}
-                    time.sleep(delay)
-                    delay = min(delay * 1.5, 10.0)
-
-        cam = self.cam = open_cam()
-        fails = 0
-        self._fps_t0 = time.monotonic()
-        while True:
-            if self._closing:                 # 종료 요청 — 장치를 놓고 나간다
-                try:
-                    cam.close()
-                except Exception:
-                    pass
-                self.cam = None               # shutdown() 이 두 번 닫지 않도록
-                return
+    def _stop_proc(self, grace=10.0):
+        """SIGTERM → 대기 → SIGKILL. grace 를 넉넉히 — 데몬이 Astra 를 닫는 데
+        시간이 걸리고, 안 닫힌 채 죽으면 다음 열기가 한동안 실패한다."""
+        p, self._proc = self._proc, None
+        if p is None or p.poll() is not None:
+            return
+        try:
+            p.terminate()
+            p.wait(grace)
+        except Exception:
             try:
-                d = cam.depth(wait_ms=800)
-                if d is None:
-                    # 프레임이 계속 안 오면 장치가 빠졌거나 세션이 죽은 것이다.
-                    # 여기서 다시 열지 않으면 스레드는 살아 있는데 화면만 굳는다.
-                    fails += 1
-                    # 임계를 넉넉히 둔다. 짧게 잡으면 일시적 프레임 누락에도 재연결을
-                    # 걸어 버리는데, 재연결은 성공률이 100% 가 아니라 멀쩡한 세션을
-                    # 잃는 쪽이 손해가 크다(실측 2026-08-19: 60회(≈5초) 임계로 정상
-                    # 스트림이 끊겼고, 닫자마자 다시 열려다 9회 연속 실패했다).
-                    if fails >= 300:          # ≈ 25초 무프레임
-                        with self.lock:
-                            self.stats = {'ok': False, 'msg': '프레임 끊김 — 다시 여는 중'}
-                        try:
-                            cam.close()
-                        except Exception:
-                            pass
-                        self.cam = None
-                        time.sleep(3.0)       # USB 가 풀릴 시간 — 없으면 자기 핸들과 충돌
-                        cam = self.cam = open_cam()
-                        fails = 0
-                    if self._closing:
-                        continue      # 루프 머리에서 정리한다
-                    time.sleep(0.05); continue
-                fails = 0
-                # 실제 카메라 프레임 레이트를 센다. 낮으면 화면이 정지처럼 보여
-                # "깊이가 멈췄다"로 오해하게 되므로 수치로 드러내 둔다.
-                self._fps_n += 1
-                now = time.monotonic()
-                if now - self._fps_t0 >= 2.0:
-                    self._fps = round(self._fps_n / (now - self._fps_t0), 1)
-                    self._fps_n, self._fps_t0 = 0, now
-                valid = d > 0
-                # 0.3~1.2m 를 색으로 편다 — 작업 영역이 이 대역에 들어온다
-                v = np.clip((d.astype(np.float32) - 300) / 900, 0, 1)
-                img = cv2.applyColorMap((255 * (1 - v)).astype(np.uint8), cv2.COLORMAP_TURBO)
-                img[~valid] = (40, 40, 40)         # 측정 실패는 어둡게
+                p.kill()
+                p.wait(3.0)
+            except Exception:
+                pass
 
-                # 살아 있음을 화면에 적는다. 깊이 센서는 mm 로 양자화돼 있어 장면이
-                # 정적이면 프레임이 **바이트 단위로 동일**해진다 — 카메라가 멀쩡히
-                # 돌아도 화면은 정지한 것과 구분되지 않는다(2026-08-19: 이 때문에
-                # 세션이 죽은 것으로 오인해 서버·USB 를 여러 차례 재기동했다).
-                # 손목캠은 이미지 노이즈로 매 프레임 달라 이 문제가 없다.
-                stamp = time.strftime('%H:%M:%S')
-                cv2.putText(img, f'{stamp}  {self._fps:.0f}fps', (8, 22),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
-                cv2.putText(img, f'{stamp}  {self._fps:.0f}fps', (8, 22),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
-                self._scan_red(cam, d, cv2, np)
-                ok, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 75])
-                if ok:
-                    nz = d[valid]
-                    with self.lock:
-                        self.jpeg = buf.tobytes()
-                        self.stats = {'ok': True,
-                                      'valid_pct': round(100 * valid.mean(), 1),
-                                      'center_mm': int(d[d.shape[0] // 2, d.shape[1] // 2]),
-                                      'min_mm': int(nz.min()) if nz.size else 0,
-                                      'fps': self._fps,
-                                      'msg': ''}
-            except Exception as e:
+    def run(self):
+        import urllib.request
+        self._spawn()
+        last_seq = -1
+        now = time.monotonic()
+        last_http_ok = last_beat_ok = now
+        while not self._closing:
+            time.sleep(0.1)
+            now = time.monotonic()
+            # ① 데몬이 스스로 죽었나 (자체 워치독의 SDK 교착 감지 등)
+            if self._proc is not None and self._proc.poll() is not None:
+                code = self._proc.returncode
                 with self.lock:
-                    self.stats = {'ok': False, 'msg': f'{type(e).__name__}'}
-                time.sleep(0.3)
-            time.sleep(0.08)
-
-    def _scan_red(self, cam, d, cv2, np):
-        """컬러에서 빨간 덩어리를 찾고 같은 픽셀의 깊이로 카메라 3D 좌표를 낸다.
-
-        깊이가 컬러 좌표계로 registration 돼 있어야 같은 (u, v) 가 성립한다
-        (astra.Astra.registered). 꺼져 있으면 좌표가 조용히 어긋나므로 함께 싣는다.
-        """
-        rgb = cam.color()
-        if rgb is None or rgb.ndim != 3:
-            return
-        # 컬러가 갱신되는지 추적한다. 깊이만 살아 있고 컬러가 옛 프레임에 고정되면
-        # 블롭 좌표가 현재 깊이 맵과 어긋나 cam_xyz 가 조용히 None 이 된다 —
-        # 화면만 보면 "멈춘 것 같다"로 끝나므로 수치로 드러내 둔다.
-        sig = int(rgb[::32, ::32, 0].sum())
-        if sig == self._color_sig:
-            self._color_same += 1
-        else:
-            self._color_sig, self._color_same = sig, 0
-        # 미리보기는 검출 결과와 무관하게 갱신한다 — 빨간 물체가 없을 때도 화면은
-        # 나와야 조준과 원인 판단을 할 수 있다. swap_rb 미확정이면 RGB 로 가정한다.
-        # swap_rb 는 "원본이 RGB라 BGR 로 뒤집어야 한다"는 뜻이다. cv2.imencode 는
-        # BGR 을 기대하므로 뒤집은 쪽을 넘겨야 한다 — 종전에는 조건이 반대로 걸려
-        # 미리보기에서 R 과 B 가 바뀌어 나왔다(사람 피부가 파랗게 보였다).
-        # 검출 경로는 처음부터 옳았고 표시만 틀렸던 것이라, 색으로 원인을 짚기
-        # 어려웠다.
-        disp = rgb[:, :, ::-1] if self.swap_rb else rgb
-        ok, buf = cv2.imencode('.jpg', np.ascontiguousarray(disp),
-                               [cv2.IMWRITE_JPEG_QUALITY, 75])
-        if ok:
-            with self.lock:
-                self.rgb_jpeg = buf.tobytes()
-        cand = (True, False) if self.swap_rb is None else (self.swap_rb,)
-        best = None
-        for swap in cand:
-            img = rgb[:, :, ::-1] if swap else rgb
-            hsv = cv2.cvtColor(np.ascontiguousarray(img), cv2.COLOR_BGR2HSV)
-            m = np.zeros(hsv.shape[:2], np.uint8)
-            for lo, hi in self.RED:
-                m |= cv2.inRange(hsv, np.array(lo), np.array(hi))
-            m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
-            n, _, st, ct = cv2.connectedComponentsWithStats(m, 8)
-            k = max(range(1, n), key=lambda i: st[i, cv2.CC_STAT_AREA], default=None)
-            if k is None:
+                    self.stats = {'ok': False, 'msg': f'데몬 재시작 중 (exit {code})'}
+                self._proc = None
+                time.sleep(3.0)               # 커널이 usbfs 를 회수할 시간
+                if self._closing:
+                    break
+                self._spawn()
+                last_http_ok = last_beat_ok = time.monotonic()
                 continue
-            area = int(st[k, cv2.CC_STAT_AREA])
-            if area >= self.MIN_AREA and (best is None or area > best[0]):
-                best = (area, swap, float(ct[k][0]), float(ct[k][1]))
-        if best is None:
-            with self.lock:
-                self.blob = None
-            return
-        area, swap, u, v = best
-        if self.swap_rb is None:
-            self.swap_rb = swap        # 한 번 정해지면 이후엔 그 해석만 쓴다
-        # 깊이는 한 점만 읽으면 구멍에 걸리므로 블롭 주변 창의 중앙값을 쓴다.
-        #
-        # 창을 고정 크기로 두면 안 된다. 구조광 방식이라 프로젝터와 카메라의 시차로
-        # **물체 주변에 그림자가 생기고**, 작은 물체는 그 그림자에 통째로 들어간다
-        # (실측 2026-08-19: 죠 아래 큐브 자리 11x11 창의 유효 화소가 0 이라 z_mm=0,
-        # cam_xyz 가 None 이 됐다 — 검출은 정확한데 깊이만 비어 있었다).
-        # 유효 화소가 나올 때까지 넓히고, 어디까지 넓혔는지 함께 싣는다.
-        h, w = d.shape
-        z_mm, nz, used_r = 0, np.array([], dtype=d.dtype), 0
-        for r in (5, 9, 14, 20):
-            win = d[max(0, int(v) - r):int(v) + r + 1,
-                    max(0, int(u) - r):int(u) + r + 1]
-            cand = win[win > 0]
-            if cand.size >= 8:
-                z_mm, nz, used_r = int(np.median(cand)), cand, r
-                break
-            if cand.size > nz.size:
-                nz, used_r = cand, r
-        if z_mm == 0 and nz.size:
-            z_mm = int(np.median(nz))
-        # cam.point() 는 깊이 배열을 통째로 받으므로 여기서 직접 투영한다 —
-        # 창 중앙값을 쓰려고 (H, W) 배열을 매 프레임 새로 만들면 낭비가 크다.
-        if z_mm:
-            z = z_mm / 1000.0
-            fx = (w / 2) / math.tan(cam.hfov / 2)
-            fy = (h / 2) / math.tan(cam.vfov / 2)
-            pt = ((u - w / 2) * z / fx, (v - h / 2) * z / fy, z)
-        else:
-            pt = None
-        if pt is not None and not (self.Z_RANGE[0] <= pt[2] <= self.Z_RANGE[1]):
-            pt = None                       # 작업 영역 밖 — 좌표는 버리고 화소만 남긴다
-        with self.lock:
-            self.blob = {'u': round(u, 1), 'v': round(v, 1), 'area': area,
-                         'z_mm': z_mm, 'valid_px': int(nz.size), 'win_r': used_r,
-                         'cam_xyz': [round(c, 4) for c in pt] if pt else None,
-                         'registered': bool(getattr(cam, 'registered', False)),
-                         'swap_rb': bool(self.swap_rb),
-                         'color_stale': self._color_same,
-                         'color_error': getattr(cam, 'color_error', None)}
-
-
-# 동시에 열 수 있는 MJPEG 스트림 수. 브라우저 새로고침마다 좀비 연결이 쌓이면
-# 그 스레드들이 0.1초마다 write 를 시도하며 GIL 을 다투고, 정작 카메라를 읽는
-# 스레드가 굶는다(실측 2026-08-19: 스레드 68개까지 늘어 깊이 통계가 12초 동안
-# 한 번도 갱신되지 않았다 — 화면이 "멈춘" 것처럼 보인 진짜 원인).
-MAX_STREAMS = 12
-_stream_sem = threading.BoundedSemaphore(MAX_STREAMS)
+            # ② 프레임·상태 끌어오기
+            try:
+                with urllib.request.urlopen(
+                        f'http://127.0.0.1:{self.port}/all', timeout=0.8) as r:
+                    d = json.loads(r.read())
+            except Exception:
+                d = None
+            if d is not None:
+                last_http_ok = now
+                if d.get('beat_age', 0) <= self.STALE_S:
+                    last_beat_ok = now
+                if d.get('seq', -1) != last_seq:
+                    last_seq = d['seq']
+                    with self.lock:
+                        if d.get('depth_jpeg'):
+                            self.jpeg = base64.b64decode(d['depth_jpeg'])
+                        if d.get('rgb_jpeg'):
+                            self.rgb_jpeg = base64.b64decode(d['rgb_jpeg'])
+                        self.stats = d.get('stats') or self.stats
+                        self.blob = d.get('blob')
+                else:                          # 프레임은 그대로여도 상태는 싣는다
+                    with self.lock:
+                        self.stats = d.get('stats') or self.stats
+            # ③ 데몬이 살아는 있는데 응답이 없거나 캡처가 굳음 → 갈아끼운다
+            if (now - last_http_ok > self.HTTP_DEAD_S
+                    or now - last_beat_ok > self.STALE_S + 5):
+                with self.lock:
+                    self.stats = {'ok': False, 'msg': '데몬 응답 없음 — 재시작'}
+                self._stop_proc()
+                time.sleep(3.0)
+                if self._closing:
+                    break
+                self._spawn()
+                last_http_ok = last_beat_ok = time.monotonic()
 
 
 def serve_mjpeg(handler, get_jpeg, fps=10):
-    """최신 JPEG 를 multipart 로 흘린다. 끊긴 연결은 즉시 정리한다.
+    """최신 JPEG 를 multipart 로 흘린다.
 
-    ① write 뒤에 flush 한다 — 안 하면 커널 버퍼가 찰 때까지 끊김을 감지하지 못해
-       좀비 스레드가 남는다.
-    ② 같은 프레임은 다시 보내지 않는다 — 대역과 CPU 를 아끼고, 브라우저가 바뀐
-       프레임만 받는다.
-    ③ 동시 스트림 수를 제한한다. 넘치면 503 으로 거절하는 편이 전체를 굶기는 것보다 낫다.
+    ★ 같은 프레임이어도 매번 보낸다. "바뀔 때만 보내기"로 최적화했다가 브라우저가
+    첫 프레임만 그리고 멈췄다(2026-08-19 실측: /cam 은 정상인데 /depth 만 정지,
+    <img> 가 새 파트를 못 받는 상태). multipart/x-mixed-replace 는 파트가 꾸준히
+    와야 <img> 가 갱신되므로, 대역을 아끼려 들지 않는다. Content-Length 도 붙이지
+    않는다 — 넣으면 브라우저가 첫 파트만 읽고 끝낸다.
     """
-    if not _stream_sem.acquire(blocking=False):
-        handler.send_response(503)
-        handler.send_header('Content-Type', 'text/plain; charset=utf-8')
-        handler.end_headers()
-        handler.wfile.write('스트림이 너무 많습니다 — 열려 있는 탭을 닫아 주세요'.encode())
-        return
+    handler.send_response(200)
+    handler.send_header('Cache-Control', 'no-store')
+    handler.send_header('Content-Type',
+                        'multipart/x-mixed-replace; boundary=frame')
+    handler.end_headers()
     try:
-        handler.send_response(200)
-        handler.send_header('Cache-Control', 'no-store')
-        handler.send_header('Content-Type',
-                            'multipart/x-mixed-replace; boundary=frame')
-        handler.end_headers()
-        last, last_sent = None, 0.0
         while True:
             j = get_jpeg()
-            # 프레임이 바뀌었거나, 2초 넘게 아무것도 안 보냈으면 보낸다.
-            #
-            # 같은 프레임을 건너뛰기만 하면 화면이 정지한 동안 write 가 없어 **끊긴
-            # 연결을 영영 감지하지 못한다** — 브라우저를 새로고침할 때마다 좀비
-            # 스트림이 쌓이고, 동시 스트림 제한에 걸려 새 탭이 503 을 받는다
-            # (실측 2026-08-19: 제한 4개에 연결 8개가 남아 화면이 아예 안 떴다).
-            # 주기적 재전송이 곧 끊김 감지 수단이다.
-            due = (time.monotonic() - last_sent) > 2.0
-            if j is not None and (j is not last or due):
-                handler.wfile.write(b'--frame\r\nContent-Type: image/jpeg\r\n'
-                                    + f'Content-Length: {len(j)}\r\n\r\n'.encode())
+            if j:
+                handler.wfile.write(b'--frame\r\n'
+                                    b'Content-Type: image/jpeg\r\n\r\n')
                 handler.wfile.write(j)
                 handler.wfile.write(b'\r\n')
-                handler.wfile.flush()          # 끊김을 여기서 바로 잡는다
-                last, last_sent = j, time.monotonic()
             time.sleep(1.0 / fps)
     except (BrokenPipeError, ConnectionResetError, OSError):
-        pass
-    finally:
-        _stream_sem.release()
+        pass                              # 탭을 닫으면 여기로 — 정상 종료
 
 
 def make_handler(worker, kin, cam, dep):
@@ -561,6 +402,8 @@ def main():
     ap.add_argument('--http', type=int, default=8765)
     ap.add_argument('--no-depth', dest='depth', action='store_false',
                     help='Orbbec 깊이 스트림을 끈다')
+    ap.add_argument('--depth-port', type=int, default=8766,
+                    help='깊이 캡처 데몬(depth_daemon.py)의 HTTP 포트')
     ap.add_argument('--cam', type=int, default=4,
                     help='V4L2 인덱스 (/dev/videoN). -1이면 캠 끔')
     a = ap.parse_args()
@@ -584,7 +427,7 @@ def main():
     else:
         cam = None
 
-    dep = Depth() if a.depth else None
+    dep = Depth(a.depth_port) if a.depth else None
     ThreadingHTTPServer.daemon_threads = True   # 남은 스트림 스레드가 종료를 막지 않게
     srv = ThreadingHTTPServer(('127.0.0.1', a.http),
                               make_handler(worker, kin, cam, dep))

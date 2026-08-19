@@ -39,16 +39,24 @@ import urllib.request
 import numpy as np
 
 BASE = 'http://127.0.0.1:8765'
+JOINTS = ['shoulder_pan', 'shoulder_lift', 'elbow_flex', 'wrist_flex', 'wrist_roll']
 HERE = pathlib.Path(__file__).parent
+sys.path.insert(0, str(HERE))
+import arm_lib                                    # noqa: E402
 OUT = HERE / 'handeye.json'
 
-# 작업 영역 안에서 세 축을 모두 흔든 격자. z 를 두 층으로 둬 평면 퇴화를 막는다.
+# 작업 영역 안에서 세 축을 모두 흔든 격자. z 를 **세 층**으로 둬 평면 퇴화를 막는다.
+#
+# 범위는 실제 IK 도달성을 계산해 정했다(2026-08-19): z=+0.04 이상은 리치 밖이고,
+# z=+0.02 는 x≤0.22 에서만 풀린다. 아래층은 책상면(floor_z=-0.1037)에서 5cm 여유를
+#둔 -0.05 로 잡았다 — 죠에 물린 물체가 아래로 튀어나와 있어 더 내리면 닿는다.
 POSES = [
-    (0.18, -0.06, 0.02), (0.18, 0.00, 0.02), (0.18, 0.06, 0.02),
-    (0.23, -0.06, 0.02), (0.23, 0.00, 0.02), (0.23, 0.06, 0.02),
-    (0.18, -0.04, 0.09), (0.18, 0.04, 0.09),
-    (0.23, -0.04, 0.09), (0.23, 0.04, 0.09),
-    (0.205, 0.00, 0.055),
+    (0.18, -0.06, -0.05), (0.18, 0.00, -0.05), (0.18, 0.06, -0.05),
+    (0.23, -0.06, -0.05), (0.23, 0.00, -0.05), (0.23, 0.06, -0.05),
+    (0.18, -0.05, -0.01), (0.18, 0.05, -0.01),
+    (0.23, -0.05, -0.01), (0.23, 0.05, -0.01),
+    (0.19, -0.03,  0.02), (0.19, 0.03,  0.02),
+    (0.21, 0.00,  0.02),
 ]
 
 
@@ -61,6 +69,50 @@ def post(op, **kw):
 
 def get(path):
     return json.loads(urllib.request.urlopen(f'{BASE}{path}', timeout=15).read())
+
+
+def wait_reached(q_rad, mapping, timeout=30.0, tol=1.0, hold=3):
+    """IK 가 낸 목표 관절각에 실제로 도달할 때까지 기다린다.
+
+    두 가지를 다 틀렸던 자리다.
+    ① IK 목표를 그대로 로봇 좌표로 쓰면 안 된다 — 명령이지 도달 위치가 아니다.
+       속도 제한이 걸린 채 큰 이동을 주면 보간 시간(3초)이 지나도 팔이 계속 가고
+       있어, 고정 대기 후 측정하면 직전 위치를 그 지점의 값으로 기록하게 된다
+       (실측 2026-08-19: 13점 중 9점의 카메라 좌표가 3mm 안에 뭉쳐 RMS 52mm).
+    ② "관절 변화가 멈추면 도착"으로 판단해서도 안 된다. 명령 직후엔 아직 출발
+       전이라 변화가 0 이고, 그대로 "이미 도착"으로 읽어 13점 전부 같은 자리에서
+       측정했다. **목표값과의 거리**로 판정해야 한다.
+    """
+    want = arm_lib.rad_to_servo(q_rad, mapping)
+    want = {k.replace('.pos', ''): v for k, v in want.items()}
+
+    def gap_of(pos):
+        # ±180 은 같은 자세다. 정규화하지 않으면 wrist_roll 목표 -180 과 실제 +180 이
+        # 278° 차이로 읽혀 도달을 영영 인정하지 못한다(실측 2026-08-19).
+        return max(abs((pos[j] - want[j] + 180) % 360 - 180) for j in JOINTS)
+
+    near = 0
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        pos = get('/state')['pos']
+        gap = gap_of(pos)
+        if gap < tol:
+            near += 1
+            if near >= hold:
+                return pos, gap
+        else:
+            near = 0
+        time.sleep(0.3)
+    pos = get('/state')['pos']
+    return pos, gap_of(pos)
+
+
+def fk_of(pos, kin, mapping):
+    """관측된 관절각 → pan 축 기준 TCP 좌표 [m]."""
+    obs = {f'{j}.pos': pos[j] for j in JOINTS}
+    q = arm_lib.servo_to_rad(obs, mapping)
+    fk = kin.fk_pos(q)
+    return [round(v - o, 5) for v, o in zip(fk, arm_lib.PAN0)]
 
 
 def read_blob(tries=12, need=5):
@@ -116,23 +168,35 @@ def main():
     if not st['torque']:
         sys.exit('토크 ON 후에 실행하세요')
 
+    kin = arm_lib.load_kinematics()
+    mapping = arm_lib.load_mapping()
     cam_pts, rob_pts, log = [], [], []
     for i, (x, y, z) in enumerate(POSES, 1):
         r = post('ik', x=x, y=y, z=z, pitch=-90)
         if not r.get('ok'):
             print(f'[{i:2d}/{len(POSES)}] ({x}, {y}, {z}) IK 실패 — {r.get("msg")}')
             continue
-        time.sleep(3.2 + a.settle)          # 보간 이동 3초 + 진동 안정
+        pos, gap = wait_reached(r['q'], mapping)   # 목표 관절각에 도달할 때까지
+        if gap > 3.0:
+            print(f'[{i:2d}/{len(POSES)}] 관절이 목표에서 {gap:.1f}° 남아 건너뜀')
+            continue
+        time.sleep(a.settle)                # 진동 가라앉힘
+        rob = fk_of(pos, kin, mapping)      # **실제** 도달 위치
         p, n = read_blob()
+        err = max(abs(c - t) for c, t in zip(rob, (x, y, z)))
         if p is None:
             print(f'[{i:2d}/{len(POSES)}] ({x:+.3f},{y:+.3f},{z:+.3f}) 관측 실패 (유효 {n})')
             continue
+        if err > 0.02:
+            print(f'[{i:2d}/{len(POSES)}] 목표와 {1000*err:.0f}mm 어긋나 건너뜀 '
+                  f'(도달 {rob})')
+            continue
         cam_pts.append(p)
-        rob_pts.append(r['fk_pan'])
-        log.append({'target': [x, y, z], 'fk': r['fk_pan'],
+        rob_pts.append(rob)
+        log.append({'target': [x, y, z], 'reached': rob,
                     'cam': [round(v, 4) for v in p], 'frames': n})
-        print(f'[{i:2d}/{len(POSES)}] 로봇 ({x:+.3f},{y:+.3f},{z:+.3f}) '
-              f'↔ 카메라 ({p[0]:+.3f},{p[1]:+.3f},{p[2]:+.3f})  [{n}프레임]')
+        print(f'[{i:2d}/{len(POSES)}] 로봇 ({rob[0]:+.3f},{rob[1]:+.3f},{rob[2]:+.3f}) '
+              f'↔ 카메라 ({p[0]:+.3f},{p[1]:+.3f},{p[2]:+.3f})  [{n}프레임, 오차 {1000*err:.0f}mm]')
 
     if len(cam_pts) < 6:
         sys.exit(f'대응쌍이 {len(cam_pts)}개뿐입니다 — 최소 6개가 필요합니다')
