@@ -22,3 +22,6 @@ __pycache__/
 # rosbag2 가 옆에 두는 metadata.yaml 때문에 디렉터리가 통째로 미추적으로 남는다
 # (실제로 375MB가 올라갈 뻔했다).
 projects/*/mcap/
+
+# so101-arm 런타임 로그
+projects/so101-arm/*.log
