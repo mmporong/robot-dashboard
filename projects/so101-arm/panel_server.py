@@ -145,12 +145,14 @@ class Depth(threading.Thread):
         self._closing = False
         self._color_sig = None
         self._color_same = 0      # 컬러가 몇 프레임째 그대로인가
+        self._fps = 0.0
+        self._fps_n, self._fps_t0 = 0, 0.0
 
     def snapshot_jpeg(self, attr):
         with self.lock:
             return getattr(self, attr)
 
-    def shutdown(self):
+    def shutdown(self, timeout=6.0):
         """종료 시 장치를 반드시 놓는다.
 
         daemon 스레드라 프로세스가 죽으면 close() 가 안 불리는데, Astra 는 그렇게
@@ -158,10 +160,17 @@ class Depth(threading.Thread):
         때마다 카메라만 안 붙어, 포트 전원을 껐다 켜야 복구됐다). 재시작은 연결
         경로에서 토크를 풀어 팔을 떨어뜨리므로 이 정리가 없으면 카메라 하나 때문에
         팔을 내려놓는 사이클이 된다.
+
+        ★ 닫는 주체는 **읽고 있는 스레드 자신**이어야 한다. 여기서 곧바로 close()
+        하면 그 스레드가 아직 SDK 안(astra_update · open_frame)에 있는 채로 세션이
+        무너져 정리가 깨지고, 결국 같은 증상이 반복된다. 플래그를 세우고 스레드가
+        스스로 닫고 나올 때까지 기다린 뒤, 그래도 남아 있을 때만 직접 닫는다.
         """
         self._closing = True
+        if self.is_alive():
+            self.join(timeout)        # 루프가 _closing 을 보고 스스로 close 한다
         c, self.cam = self.cam, None
-        if c is not None:
+        if c is not None:             # 스레드가 시간 안에 못 끝낸 경우의 최후 수단
             try:
                 c.close()
             except Exception:
@@ -204,12 +213,14 @@ class Depth(threading.Thread):
 
         cam = self.cam = open_cam()
         fails = 0
+        self._fps_t0 = time.monotonic()
         while True:
             if self._closing:                 # 종료 요청 — 장치를 놓고 나간다
                 try:
                     cam.close()
                 except Exception:
                     pass
+                self.cam = None               # shutdown() 이 두 번 닫지 않도록
                 return
             try:
                 d = cam.depth(wait_ms=800)
@@ -232,13 +243,33 @@ class Depth(threading.Thread):
                         time.sleep(3.0)       # USB 가 풀릴 시간 — 없으면 자기 핸들과 충돌
                         cam = self.cam = open_cam()
                         fails = 0
+                    if self._closing:
+                        continue      # 루프 머리에서 정리한다
                     time.sleep(0.05); continue
                 fails = 0
+                # 실제 카메라 프레임 레이트를 센다. 낮으면 화면이 정지처럼 보여
+                # "깊이가 멈췄다"로 오해하게 되므로 수치로 드러내 둔다.
+                self._fps_n += 1
+                now = time.monotonic()
+                if now - self._fps_t0 >= 2.0:
+                    self._fps = round(self._fps_n / (now - self._fps_t0), 1)
+                    self._fps_n, self._fps_t0 = 0, now
                 valid = d > 0
                 # 0.3~1.2m 를 색으로 편다 — 작업 영역이 이 대역에 들어온다
                 v = np.clip((d.astype(np.float32) - 300) / 900, 0, 1)
                 img = cv2.applyColorMap((255 * (1 - v)).astype(np.uint8), cv2.COLORMAP_TURBO)
                 img[~valid] = (40, 40, 40)         # 측정 실패는 어둡게
+
+                # 살아 있음을 화면에 적는다. 깊이 센서는 mm 로 양자화돼 있어 장면이
+                # 정적이면 프레임이 **바이트 단위로 동일**해진다 — 카메라가 멀쩡히
+                # 돌아도 화면은 정지한 것과 구분되지 않는다(2026-08-19: 이 때문에
+                # 세션이 죽은 것으로 오인해 서버·USB 를 여러 차례 재기동했다).
+                # 손목캠은 이미지 노이즈로 매 프레임 달라 이 문제가 없다.
+                stamp = time.strftime('%H:%M:%S')
+                cv2.putText(img, f'{stamp}  {self._fps:.0f}fps', (8, 22),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3, cv2.LINE_AA)
+                cv2.putText(img, f'{stamp}  {self._fps:.0f}fps', (8, 22),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
                 self._scan_red(cam, d, cv2, np)
                 ok, buf = cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, 75])
                 if ok:
@@ -249,6 +280,7 @@ class Depth(threading.Thread):
                                       'valid_pct': round(100 * valid.mean(), 1),
                                       'center_mm': int(d[d.shape[0] // 2, d.shape[1] // 2]),
                                       'min_mm': int(nz.min()) if nz.size else 0,
+                                      'fps': self._fps,
                                       'msg': ''}
             except Exception as e:
                 with self.lock:
@@ -354,7 +386,7 @@ class Depth(threading.Thread):
 # 그 스레드들이 0.1초마다 write 를 시도하며 GIL 을 다투고, 정작 카메라를 읽는
 # 스레드가 굶는다(실측 2026-08-19: 스레드 68개까지 늘어 깊이 통계가 12초 동안
 # 한 번도 갱신되지 않았다 — 화면이 "멈춘" 것처럼 보인 진짜 원인).
-MAX_STREAMS = 4
+MAX_STREAMS = 12
 _stream_sem = threading.BoundedSemaphore(MAX_STREAMS)
 
 
@@ -379,16 +411,24 @@ def serve_mjpeg(handler, get_jpeg, fps=10):
         handler.send_header('Content-Type',
                             'multipart/x-mixed-replace; boundary=frame')
         handler.end_headers()
-        last = None
+        last, last_sent = None, 0.0
         while True:
             j = get_jpeg()
-            if j is not None and j is not last:
+            # 프레임이 바뀌었거나, 2초 넘게 아무것도 안 보냈으면 보낸다.
+            #
+            # 같은 프레임을 건너뛰기만 하면 화면이 정지한 동안 write 가 없어 **끊긴
+            # 연결을 영영 감지하지 못한다** — 브라우저를 새로고침할 때마다 좀비
+            # 스트림이 쌓이고, 동시 스트림 제한에 걸려 새 탭이 503 을 받는다
+            # (실측 2026-08-19: 제한 4개에 연결 8개가 남아 화면이 아예 안 떴다).
+            # 주기적 재전송이 곧 끊김 감지 수단이다.
+            due = (time.monotonic() - last_sent) > 2.0
+            if j is not None and (j is not last or due):
                 handler.wfile.write(b'--frame\r\nContent-Type: image/jpeg\r\n'
                                     + f'Content-Length: {len(j)}\r\n\r\n'.encode())
                 handler.wfile.write(j)
                 handler.wfile.write(b'\r\n')
                 handler.wfile.flush()          # 끊김을 여기서 바로 잡는다
-                last = j
+                last, last_sent = j, time.monotonic()
             time.sleep(1.0 / fps)
     except (BrokenPipeError, ConnectionResetError, OSError):
         pass
