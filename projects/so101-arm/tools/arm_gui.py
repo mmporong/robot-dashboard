@@ -539,12 +539,30 @@ class Worker(threading.Thread):
         """그 자리에 정지 — 현재 위치를 목표로 다시 써서 붙든다 (토크 유지)."""
         self.abort.clear()
         if self.snapshot()['torque']:
-            cur = self.bus.sync_read('Present_Position')
-            self.bus.sync_write('Goal_Position', cur)
+            # raw 로 읽고 쓴다 — 정규화는 그리퍼(RANGE_0_100)의 범위 밖을 0/100
+            # 으로 클램프해, 되쓰면 경계까지 스스로 움직인다(감사 M2 — 토크 켜기
+            # 검사를 raw 로 바꾼 것과 같은 이유).
+            # ★ 목표 재기록은 ARM 만. 그리퍼 목표를 현재 위치로 덮으면 물체를
+            # 물고 있던 **파지 예압이 사라져** 순회 중 물체가 빠진다(감사 M1③).
+            # 정지의 목적은 팔 이동을 멈추는 것이고 그리퍼는 이동에 안 낀다.
+            raw = self.bus.sync_read('Present_Position', normalize=False)
+            self.bus.sync_write('Goal_Position', {m: raw[m] for m in ARM},
+                                normalize=False)
             # 남은 명령이 있어도 다음 이동이 기어가도록 속도를 바닥으로 내린다.
-            # 속도는 [토크 ON]·[속도] 조작 때 프로파일이 다시 올린다.
+            # ★ 복원 책임: _do_move_q 가 이동 시작 전 _restore_velocity() 를
+            # 부른다(감사 C1 — 복원 없이 이동하면 스톨 감지의 win_cap 이 프로파일
+            # 기준이라 정상 이동을 1~2초 만에 오탐 킬한다).
             self.bus.sync_write('Goal_Velocity', {m: 8 for m in ALL}, normalize=False)
         self.say('⏹ 정지 — 현재 자세 유지')
+
+    def _restore_velocity(self):
+        """Goal_Velocity 만 프로파일 값으로 복원 — _do_stop 이 8 로 내린 것.
+
+        _apply_motion_profile 을 쓰지 않는 이유: 그쪽은 Torque_Limit 600 도 함께
+        재기록하는데, 눌렸을 수 있는 상태에서 힘 한도를 올리면 안 된다
+        (probe_floor 1차 실행의 교훈 — finally 원복이 더 세게 밀었다)."""
+        self.bus.sync_write('Goal_Velocity',
+                            {m: self._profile_vel() for m in ALL}, normalize=False)
 
     def _clamp_to_calib(self, target, margin=LIMIT_MARGIN_DEG):
         """목표가 **캘리브 범위** 안인지 보고, 벗어나면 (거부 사유, 관절)을 돌려준다.
@@ -641,6 +659,11 @@ class Worker(threading.Thread):
                     # 켜진 채 옛 목표만 남는다. 여기서는 무조건 토크를 끊는다.
                     self._kill_torque('이동 중 읽기 실패 — 통신 이상, 토크를 끊습니다')
                     return False
+                # 읽은 위치를 상태에도 반영한다 — _poll 은 큐가 빈 순간에만 돌아
+                # 이동(최장 25초) 동안 /state.pos 가 얼어붙고, 그러면 handeye 의
+                # wait_reached 가 진행 중인 이동을 타임아웃 오판한다(감사 M4).
+                with self.lock:
+                    self.state['pos'] = dict(self.state['pos'], **now)
                 if watch is not None:
                     # ★ 관절별로 본다. 전체 max 로 묶으면(종전 방식) 한 관절이
                     # 막혀도 다른 관절이 움직이는 동안은 "moved 가 크다"로 읽혀
@@ -680,8 +703,14 @@ class Worker(threading.Thread):
                 watch = now
             a = i / steps
             s = a * a * (3 - 2 * a)
-            self.bus.sync_write('Goal_Position',
-                                {j: cur[j] + (target[j] - cur[j]) * s for j in ARM})
+            try:
+                self.bus.sync_write('Goal_Position',
+                                    {j: cur[j] + (target[j] - cur[j]) * s for j in ARM})
+            except Exception:
+                # 쓰기 실패 = 통신 이상. 방치하면 토크 ON·마지막 목표가 남는다 —
+                # 오늘 실측된 "id1 쓰기 무응답"이 정확히 이 분기다(감사 M3).
+                self._kill_torque('이동 중 쓰기 실패 — 통신 이상, 토크를 끊습니다')
+                return False
             time.sleep(0.02)
 
         # ★ 도달 검증. 못 갔으면 **그 자리에서 힘을 뺀다.**
@@ -710,6 +739,8 @@ class Worker(threading.Thread):
             except Exception:
                 self._kill_torque('도달 확인 읽기 실패 — 통신 이상, 토크를 끊습니다')
                 return False
+            with self.lock:
+                self.state['pos'] = dict(self.state['pos'], **fin)
             for j, v in cur_a.items():
                 if abs(v) > self._peak.get(j, 0):
                     self._peak[j] = abs(v)
@@ -783,6 +814,15 @@ class Worker(threading.Thread):
         if why:
             self.say(f'⛔ 이동 거부 — {why}. IK 는 URDF 한계로 해를 내는데 서보 실측'
                      f' 범위가 더 좁습니다')
+            return
+
+        # ★ 속도 복원 — 직전에 stop 이 있었으면 상한이 8(≈0.7°/s)로 내려가 있다.
+        # 복원 없이 이동하면 스톨 감지 기준(win_cap)과 실제 상한이 어긋나 정상
+        # 이동이 오탐 킬로 끝난다(감사 C1: 관측 실패 → stop → 다음 지점 낙하).
+        try:
+            self._restore_velocity()
+        except Exception:
+            self._kill_torque('속도 복원 쓰기 실패 — 통신 이상, 토크를 끊습니다')
             return
 
         # ★ 회전을 먼저, 이동을 나중에.

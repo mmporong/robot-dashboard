@@ -106,7 +106,12 @@ def wait_reached(q_rad, mapping, timeout=30.0, tol=1.0, hold=3):
     near = 0
     t0 = time.monotonic()
     while time.monotonic() - t0 < timeout:
-        pos = get('/state')['pos']
+        st = get('/state')
+        pos = st['pos']
+        # 서버 안전장치가 토크를 내렸으면 더 기다릴 이유가 없다 — 즉시 반환해
+        # 호출부의 상태 검사로 넘긴다(종전엔 지점당 30초씩 헛기다렸다).
+        if not (st.get('torque', True) and st.get('connected', True)):
+            return pos, gap_of(pos)
         gap = gap_of(pos)
         if gap < tol:
             near += 1
@@ -257,16 +262,30 @@ def main():
     preflight(kin, mapping)             # 실물을 움직이기 전에 전 지점 정적 검증
     cam_pts, rob_pts, log = [], [], []
     stalls = 0                    # 연속 도달 실패 횟수 — 쌓이면 중단한다
+    prev_pair = None              # 파지 이탈 검출용 (직전 로봇·카메라 좌표)
+    loose = 0
     for i, (x, y, z) in enumerate(POSES, 1):
         r = post('ik', x=x, y=y, z=z, pitch=-90)
         if not r.get('ok'):
             print(f'[{i:2d}/{len(POSES)}] ({x}, {y}, {z}) IK 실패 — {r.get("msg")}')
             continue
         pos, gap = wait_reached(r['q'], mapping)   # 목표 관절각에 도달할 때까지
+        # 서버 쪽 사정부터 본다 — 안전장치가 이미 토크를 내렸으면(스톨 킬 등)
+        # stop 도 재시도도 의미가 없고, 침묵 속에 헛도는 것이 사고 당시의
+        # "아무도 몰랐다"다(감사 ③④). gap 분기 **밖**에서 검사한다 — 보간
+        # 막바지에 킬이 나면 gap ≤ 3 으로 빠져나와 검사를 건너뛸 수 있다(n1).
+        st2 = get('/state')
+        if not (st2.get('connected') and st2.get('torque')):
+            tail = ' / '.join(st2.get('log', [])[-2:])
+            sys.exit(f'[{i:2d}/{len(POSES)}] 서버 안전장치 발동 또는 통신 이상 '
+                     f'(connected={st2.get("connected")} torque={st2.get("torque")})\n'
+                     f'  최근 로그: {tail}\n'
+                     f'  → 토크가 내려간 것이면 원인 해소 후 재시작. 응답이 아예 '
+                     f'없으면 서보 전원을 차단하세요 (눌림 지속 시 버스가 죽는다).')
         if gap > 3.0:
             # ★ 반드시 정지시킨다. 목표를 그대로 두면 서보가 막힌 방향으로 계속
-            # 밀어 탄다 — 2026-08-19 이 자리에서 "건너뜀"만 출력해 wrist_flex 를
-            # 태웠다. 실패를 기록하는 것과 힘을 빼는 것은 다른 일이다.
+            # 밀어 탄다 — 2026-08-19 이 자리에서 "건너뜀"만 출력해 서보를 태웠다.
+            # 실패를 기록하는 것과 힘을 빼는 것은 다른 일이다.
             post('stop')
             print(f'[{i:2d}/{len(POSES)}] 관절이 목표에서 {gap:.1f}° 남음 — 정지하고 건너뜀')
             stalls += 1
@@ -281,13 +300,31 @@ def main():
         p, n = read_blob()
         err = max(abs(c - t) for c, t in zip(rob, (x, y, z)))
         if p is None:
-            post('stop')
+            # ★ 관측 실패는 이동 실패가 아니다 — stop 을 보내지 않는다(감사 M1).
+            # stop 은 ①위치 재전송으로 펌웨어 보호 플래그를 풀고 ②(수정 전에는)
+            # 그리퍼 예압을 지웠으며 ③속도를 8 로 내려 다음 이동을 오탐 킬로
+            # 몰았다(C1). 팔은 도달 자세를 목표=도달점으로 유지 중이라 안전하다.
             print(f'[{i:2d}/{len(POSES)}] ({x:+.3f},{y:+.3f},{z:+.3f}) 관측 실패 (유효 {n})')
             continue
         if err > 0.02:
             print(f'[{i:2d}/{len(POSES)}] 목표와 {1000*err:.0f}mm 어긋나 건너뜀 '
                   f'(도달 {rob})')
             continue
+        # ★ 파지 이탈 검출 — 물체가 죠에서 빠지면 책상 위 빨간 블롭은 계속
+        # 보이므로 read_blob 은 성공한다. 그러면 13점이 조용히 오염된다(감사 M8).
+        # 로봇이 수 cm 움직였는데 카메라 좌표가 안 따라오면 물체가 팔에 없는 것.
+        if prev_pair is not None:
+            drob = float(np.linalg.norm(np.array(rob) - np.array(prev_pair[0])))
+            dcam = float(np.linalg.norm(np.array(p) - np.array(prev_pair[1])))
+            if drob > 0.02 and dcam < 0.3 * drob:
+                loose += 1
+                if loose >= 2:
+                    sys.exit(f'[{i:2d}/{len(POSES)}] 물체 이탈 의심 — 로봇 이동 '
+                             f'{1000*drob:.0f}mm 에 카메라 이동 {1000*dcam:.0f}mm '
+                             f'(2회 연속). 물체를 다시 물리고 재시작하세요.')
+            else:
+                loose = 0
+        prev_pair = (rob, list(p))
         cam_pts.append(p)
         rob_pts.append(rob)
         log.append({'target': [x, y, z], 'reached': rob,
@@ -321,4 +358,22 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        # Ctrl-C 로 빠져도 팔을 정리한다 — 정지 없이 스크립트만 사라지면
+        # 진행 중이던 목표가 남는다(감사 M6). stop 은 ARM 목표만 현재 위치로
+        # 덮으므로(그리퍼 예압 유지) 안전하다.
+        try:
+            post('stop')
+        except Exception:
+            pass
+        sys.exit('\n사용자 중단 — 정지를 보냈습니다 (토크 유지, 현재 자세 고정)')
+    except Exception:
+        # 예기치 못한 예외도 정지 시도 후 원래 트레이스백을 살려 던진다(n2).
+        # SystemExit 은 BaseException 이라 여기 안 걸린다 — 정상 종료 경로 유지.
+        try:
+            post('stop')
+        except Exception:
+            pass
+        raise
