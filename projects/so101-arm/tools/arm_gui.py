@@ -56,7 +56,11 @@ STOP_TEST_MAX_S = 3.0              # stop_test 대기 상한 — 워커가 오�
 #                                   입력 4~14V · Kt 11kg.cm/A
 # ★ 리더와 팔로워는 다른 모델이다. 리더(7.4V)에 12V 를 꽂으면 모터가 탄다.
 # 스톨 값(≈415)에 임계를 두면 이미 늦다. 정격(≈138)의 두 배쯤에서 끊는다.
-CURRENT_STOP = 250                 # ≈1.6A (12V 정격 900mA 의 1.8배). 실측으로 조정할 것
+CURRENT_STOP = 250                 # ≈1.6A (12V 정격 900mA 의 1.8배).
+                                   # 실측 2026-08-19 (무부하·속도 25%·상층 7회 이동):
+                                   # 피크 최대 10 (0.07A) — 무부하 정상과는 25배 여유.
+                                   # 단 정격 부하가 138 이라 부하 이동 실측 전에는
+                                   # 250 아래로 내리지 말 것.
 CURRENT_HOLD = 2                   # 순간 피크(가속·정지)로 오작동하지 않도록 연속 확인
 
 # 서보 자체 보호 (연결 시 EEPROM 에 써 둔다).
@@ -689,19 +693,55 @@ class Worker(threading.Thread):
         #
         # 실패를 로그로만 남기는 것과 안전한 상태로 되돌리는 것은 다른 일이다.
         # _do_stop() 이 현재 위치를 목표로 다시 써서 미는 힘을 없앤다.
-        time.sleep(0.25)                      # 마지막 스텝이 반영될 시간
-        try:
-            fin = self.bus.sync_read('Present_Position', ARM)
-        except Exception:
-            # 통신 이상 — _do_stop 은 위치 재전송으로 서보 보호를 해제시킨다. 끊는다.
-            self._kill_torque('도달 확인 읽기 실패 — 통신 이상, 토크를 끊습니다')
-            return False
-        gap = max(abs((fin[j] - target[j] + 180) % 360 - 180) for j in ARM)
-        if gap > STALL_GAP_DEG:
-            worst = max(ARM, key=lambda j: abs((fin[j] - target[j] + 180) % 360 - 180))
-            self._kill_torque(f'목표에서 {gap:.1f}° 남음 ({worst}) — 간섭을 확인하세요')
-            return False
-        return True
+        # ★ 속도 상한 때문에 보간이 끝나도 서보가 **아직 따라오는 중**일 수 있다
+        # (실측 2026-08-19: 25% 속도에서 19° 이동이 4.8° 남은 채 보간 종료 →
+        # 즉시 킬 → 팔 낙하). 움직임이 이어지는 동안은 기다리고, **멈췄는데**
+        # gap 이 남았을 때만 끊는다. 대기 중에도 과전류·정지 버튼은 계속 본다.
+        deadline = None                       # 첫 관측의 잔여 거리로 동적으로 잡는다
+        watch = None
+        while True:
+            time.sleep(0.5)
+            if self.abort.is_set():
+                self._do_stop()
+                return False
+            try:
+                fin = self.bus.sync_read('Present_Position', ARM)
+                cur_a = self.bus.sync_read('Present_Current', ARM, normalize=False)
+            except Exception:
+                self._kill_torque('도달 확인 읽기 실패 — 통신 이상, 토크를 끊습니다')
+                return False
+            for j, v in cur_a.items():
+                if abs(v) > self._peak.get(j, 0):
+                    self._peak[j] = abs(v)
+            over = {j: abs(v) for j, v in cur_a.items() if abs(v) >= CURRENT_STOP}
+            self._hi = self._hi + 1 if over else 0
+            if self._hi >= CURRENT_HOLD:
+                self._kill_torque(f'과전류 {over} (도달 대기 중, 임계 {CURRENT_STOP})')
+                return False
+            gaps = {j: abs((fin[j] - target[j] + 180) % 360 - 180) for j in ARM}
+            gap = max(gaps.values())
+            if gap <= STALL_GAP_DEG:
+                return True
+            if deadline is None:              # 잔여 거리 / 속도 상한 × 1.5 + 여유
+                vmax = max(self._profile_vel() * 0.087, 0.5)
+                deadline = time.monotonic() + max(8.0, gap / vmax * 1.5 + 2.0)
+            # ★ 관절별로 본다 — 이동 중 감지기와 같은 이유. 전체 max 로 "움직이는
+            # 중"을 판정하면 한 관절이 끼여 멈춰 있어도 다른 관절이 캐치업하는
+            # 동안 대기가 이어져, 끼인 관절이 그 시간만큼 계속 밀린다(사고 국면).
+            if watch is not None:
+                stalled = [j for j in ARM
+                           if gaps[j] > STALL_GAP_DEG
+                           and abs(fin[j] - watch[j]) < STALL_MOVE_DEG]
+                if stalled:
+                    worst = max(stalled, key=lambda j: gaps[j])
+                    self._kill_torque(f'목표에서 {gaps[worst]:.1f}° 남음 ({worst}) — '
+                                      f'간섭을 확인하세요')
+                    return False
+            if time.monotonic() > deadline:
+                worst = max(gaps, key=gaps.get)
+                self._kill_torque(f'도달 대기 시간 초과 — {worst} {gaps[worst]:.1f}° 남음')
+                return False
+            watch = fin
 
     def _do_move_q(self, q_rad, seconds):
         """URDF 관절각[rad] 5개로 보간 이동."""

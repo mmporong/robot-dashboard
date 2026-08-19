@@ -25,7 +25,8 @@ import time
 import glob
 
 HERE = pathlib.Path(__file__).parent
-Z_START = -0.06          # 여기서부터 내려간다 (충분히 위)
+Z_START = -0.05          # 여기서부터 내려간다 (2026-08-19 실측: 새 좌표계에서
+                         # 죠가 책상에 닿은 안착 자세의 TCP z ≈ -0.078 — 3cm 위)
 Z_MIN = -0.20            # 이보다 내려가면 중단 (안전)
 STEP = 0.002             # 한 스텝 2mm
 LOAD_MARGIN = 200        # 기준선 대비 이만큼 오르면 접촉
@@ -63,7 +64,10 @@ def main():
         q = K.ik_best(*bf, pitch=math.radians(-90))
         if q is None:
             return False
-        bus.sync_write('Goal_Position', arm_lib.rad_to_servo(q, mapping))
+        # rad_to_servo 는 lerobot 액션 키('joint.pos')를 주지만 bus 는 모터명을 받는다
+        want = {k.replace('.pos', ''): v
+                for k, v in arm_lib.rad_to_servo(q, mapping).items()}
+        bus.sync_write('Goal_Position', want)
         return True
 
     def load():
@@ -78,50 +82,64 @@ def main():
     bus.sync_write('Goal_Velocity', {m: 40 for m in motors}, normalize=False)   # 천천히
     bus.sync_write('Acceleration', {m: 10 for m in motors}, normalize=False)
     bus.sync_write('Torque_Limit', {m: 350 for m in motors}, normalize=False)   # 약하게
+    # ★ 켜기 전에 목표를 현재 위치(raw)로 덮는다 — 이전 목표가 남아 있으면 토크가
+    # 들어가는 순간 그리로 튄다 (2026-08-19 교훈, arm_gui._do_torque 와 동일).
+    raw = bus.sync_read('Present_Position', normalize=False)
+    bus.sync_write('Goal_Position', raw, normalize=False)
     for m in list(motors):
         bus.enable_torque(m)
         time.sleep(0.12)
 
-    goto(Z_START)
-    time.sleep(4.0)
-    base = min(load() for _ in [time.sleep(0.15) or 0 for _ in range(6)])
-    print(f'무부하 기준선 {base}\n')
+    try:
+        goto(Z_START)
+        time.sleep(8.0)                      # 안착 자세에서 오는 첫 이동이 가장 길다
+        base = min(load() for _ in [time.sleep(0.15) or 0 for _ in range(6)])
+        print(f'무부하 기준선 {base}\n')
 
-    z = Z_START
-    hit = None
-    while z > Z_MIN:
-        z -= STEP
-        if not goto(z):
-            print(f'z={z:+.3f} IK 해 없음 — 중단'); break
-        time.sleep(0.55)
-        lo = load()
-        mark = ''
-        if lo > base + LOAD_MARGIN:
-            mark = '  ← 접촉'
-            hit = z
-        print(f'  z={z:+.3f}  부하 {lo:5d} (기준선 +{lo-base:4d}){mark}')
-        if hit is not None:
-            break
+        z = Z_START
+        hit = None
+        while z > Z_MIN:
+            z -= STEP
+            if not goto(z):
+                print(f'z={z:+.3f} IK 해 없음 — 중단'); break
+            time.sleep(0.55)
+            lo = load()
+            mark = ''
+            if lo > base + LOAD_MARGIN:
+                mark = '  ← 접촉'
+                hit = z
+            print(f'  z={z:+.3f}  부하 {lo:5d} (기준선 +{lo-base:4d}){mark}')
+            if hit is not None:
+                break
 
-    if hit is None:
-        print('\n접촉 없음 — Z_MIN 까지 내려갔습니다. 물체·책상 위치를 확인하세요')
-        rc = 1
-    else:
-        print(f'\n접촉 z={hit:+.4f}m → {BACKOFF*1000:.0f}mm 후퇴')
-        goto(hit + BACKOFF)
-        time.sleep(2.5)
-        p = HERE / 'servo_gain.json'
-        d = json.loads(p.read_text())
-        d['floor_z_m'] = round(hit, 4)
-        d['floor_note'] = (f'{time.strftime("%Y-%m-%d")} 접촉 실측 (x={x:.2f}, y={y:.2f}). '
-                           'pan 축 기준 책상면 높이. 파지 높이 = floor_z + 물체 반높이 + 여유. '
-                           '로봇 베이스나 책상을 옮기면 다시 잴 것.')
-        p.write_text(json.dumps(d, ensure_ascii=False, indent=2))
-        print(f'저장 → floor_z_m = {hit:.4f}')
-        rc = 0
-
-    bus.sync_write('Torque_Limit', {m: 600 for m in motors}, normalize=False)
-    bus.disconnect()
+        if hit is None:
+            print('\n접촉 없음 — Z_MIN 까지 내려갔습니다. 물체·책상 위치를 확인하세요')
+            rc = 1
+        else:
+            print(f'\n접촉 z={hit:+.4f}m → {BACKOFF*1000:.0f}mm 후퇴')
+            goto(hit + BACKOFF)
+            time.sleep(2.5)
+            p = HERE / 'servo_gain.json'
+            d = json.loads(p.read_text())
+            d['floor_z_m'] = round(hit, 4)
+            d['floor_note'] = (f'{time.strftime("%Y-%m-%d")} 접촉 실측 (x={x:.2f}, y={y:.2f}). '
+                               'pan 축 기준 책상면 높이. 파지 높이 = floor_z + 물체 반높이 + 여유. '
+                               '로봇 베이스나 책상을 옮기거나 재캘리브레이션하면 다시 잴 것.')
+            # 재측정했으므로 stale 표시를 지운다 — 남겨 두면 load_gain 가드가
+            # 새 값까지 계속 막는다. (stale_* 딕셔너리가 무효 목록의 원본이다)
+            for k in [k for k in d if k.startswith('stale_') and isinstance(d[k], dict)]:
+                d[k].pop('floor_z_m', None)
+            p.write_text(json.dumps(d, ensure_ascii=False, indent=2) + '\n')
+            print(f'저장 → floor_z_m = {hit:.4f} (stale 표시 해제)')
+            rc = 0
+    finally:
+        # 크래시로 나가도 토크 한도는 원복하고 곱게 놓는다 — disconnect 가
+        # 토크를 내리므로 팔은 그 자리에서 천천히 내려앉는다 (탐지 높이라 안전)
+        try:
+            bus.sync_write('Torque_Limit', {m: 600 for m in motors}, normalize=False)
+        except Exception:
+            pass
+        bus.disconnect()
     return rc
 
 
