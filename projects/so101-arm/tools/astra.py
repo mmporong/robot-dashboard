@@ -85,6 +85,10 @@ class Astra:
         a.astra_initialize()
         self._sensor = C.c_void_p()
         if a.astra_streamset_open(b'device/default', C.byref(self._sensor)) != 0:
+            try:
+                a.astra_terminate()
+            except Exception:
+                pass
             raise RuntimeError('Astra 를 열지 못했습니다 — USB 연결과 udev 규칙을 확인하세요')
         self._reader = C.c_void_p()
         a.astra_reader_create(self._sensor, C.byref(self._reader))
@@ -119,12 +123,23 @@ class Astra:
 
         self._shape = None
         # 첫 프레임은 몇 번의 update 뒤에 온다(실측 3회) — 여기서 shape 도 확정된다
+        #
+        # ★ 실패하면 반드시 close() 하고 나간다. 여기까지 왔다는 것은 streamset 과
+        # reader 가 이미 열렸다는 뜻이라, 그냥 예외만 던지면 usbfs 핸들이 살아남는다.
+        # 그 상태로 재시도하면 **자기가 앞서 연 핸들 때문에** 다음 시도가 실패하고,
+        # 재시도 루프가 스스로를 영구히 막는다(실측 2026-08-19: 서버가 잡은 fd 를
+        # 서버 자신이 못 열어 "열기 대기 8회"까지 갔다).
         t0 = time.monotonic()
         while True:
-            d = self._try_frame()
+            try:
+                d = self._try_frame()
+            except Exception:
+                self.close()
+                raise
             if d is not None:
                 break
             if (time.monotonic() - t0) * 1000 > timeout_ms:
+                self.close()
                 raise RuntimeError('깊이 프레임이 오지 않습니다 — 다른 프로세스가 '
                                    '카메라를 쓰고 있는지 확인하세요')
             time.sleep(0.03)

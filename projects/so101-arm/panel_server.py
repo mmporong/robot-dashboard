@@ -137,6 +137,25 @@ class Depth(threading.Thread):
         self.blob = None
         self.swap_rb = None        # 컬러가 RGB 로 오는지 BGR 로 오는지 — 첫 검출로 확정
         self.started = False
+        self.cam = None
+        self._closing = False
+
+    def shutdown(self):
+        """종료 시 장치를 반드시 놓는다.
+
+        daemon 스레드라 프로세스가 죽으면 close() 가 안 불리는데, Astra 는 그렇게
+        버려두면 **다음 프로세스가 열지 못한다**(실측 2026-08-19: 서버를 재시작할
+        때마다 카메라만 안 붙어, 포트 전원을 껐다 켜야 복구됐다). 재시작은 연결
+        경로에서 토크를 풀어 팔을 떨어뜨리므로 이 정리가 없으면 카메라 하나 때문에
+        팔을 내려놓는 사이클이 된다.
+        """
+        self._closing = True
+        c, self.cam = self.cam, None
+        if c is not None:
+            try:
+                c.close()
+            except Exception:
+                pass
 
     def ensure(self):
         if not self.started:
@@ -148,29 +167,57 @@ class Depth(threading.Thread):
         import cv2
         sys.path.insert(0, str(TOOLS))
         from astra import Astra
-        # 카메라 열기는 재시도한다 — 직전 프로세스가 USB 를 놓는 데 시간이 걸려
-        # 첫 시도가 "깊이 프레임이 오지 않습니다"로 떨어지는 일이 있다(실측
-        # 2026-08-18 서버 재기동). 한 번 실패하고 스레드가 끝나면 서버를 통째로
-        # 다시 띄워야 하고, 그때마다 연결 경로가 토크를 풀어 팔이 내려앉는다.
-        cam = None
-        for attempt in range(1, 11):
-            try:
-                cam = Astra()
-                break
-            except Exception as e:
-                with self.lock:
-                    self.stats = {'ok': False,
-                                  'msg': f'열기 재시도 {attempt}/10 — {type(e).__name__}'}
-                time.sleep(2.0)
-        if cam is None:
-            with self.lock:
-                self.stats = {'ok': False, 'msg': '카메라를 열지 못했습니다 (10회 시도)'}
-            return
+
+        def open_cam():
+            """열릴 때까지 계속 시도한다. **포기하지 않는 것이 요점이다.**
+
+            직전 프로세스가 USB 를 놓는 데 시간이 걸려 재기동 직후엔 반드시 몇 번
+            실패한다. 종전에는 10회(약 40초) 만에 포기하고 스레드가 끝났는데, 그러면
+            복구 수단이 서버 재시작뿐이고 재시작은 연결 경로에서 토크를 풀어 팔을
+            떨어뜨린다 — 카메라 하나 때문에 팔을 내려놓는 사이클이 된다(실측
+            2026-08-18~19 다섯 차례). 간격을 점증시키며 무한히 기다리는 편이 낫다.
+            """
+            delay, n = 1.0, 0
+            while True:
+                n += 1
+                try:
+                    c = Astra()
+                    with self.lock:
+                        self.stats = {'ok': False, 'msg': f'열림 (시도 {n})'}
+                    return c
+                except Exception as e:
+                    with self.lock:
+                        self.stats = {'ok': False,
+                                      'msg': f'열기 대기 {n}회 — {type(e).__name__}'}
+                    time.sleep(delay)
+                    delay = min(delay * 1.5, 10.0)
+
+        cam = self.cam = open_cam()
+        fails = 0
         while True:
+            if self._closing:                 # 종료 요청 — 장치를 놓고 나간다
+                try:
+                    cam.close()
+                except Exception:
+                    pass
+                return
             try:
                 d = cam.depth(wait_ms=800)
                 if d is None:
+                    # 프레임이 계속 안 오면 장치가 빠졌거나 세션이 죽은 것이다.
+                    # 여기서 다시 열지 않으면 스레드는 살아 있는데 화면만 굳는다.
+                    fails += 1
+                    if fails >= 60:
+                        with self.lock:
+                            self.stats = {'ok': False, 'msg': '프레임 끊김 — 다시 여는 중'}
+                        try:
+                            cam.close()
+                        except Exception:
+                            pass
+                        cam = self.cam = open_cam()
+                        fails = 0
                     time.sleep(0.05); continue
+                fails = 0
                 valid = d > 0
                 # 0.3~1.2m 를 색으로 편다 — 작업 영역이 이 대역에 들어온다
                 v = np.clip((d.astype(np.float32) - 300) / 900, 0, 1)
@@ -453,11 +500,25 @@ def main():
     srv = ThreadingHTTPServer(('127.0.0.1', a.http),
                               make_handler(worker, kin, cam, dep))
     print(f'SO-101 패널 → http://127.0.0.1:{a.http}  (시리얼 {port})')
+
+    # SIGTERM(systemctl stop · kill)에도 정리 경로를 타게 한다. 기본 동작은 즉시
+    # 종료라 finally 가 실행되지 않고, 그러면 Astra 를 열어 둔 채 프로세스만
+    # 사라져 다음 기동이 실패한다.
+    import signal
+
+    def _bye(signum, frame):
+        raise KeyboardInterrupt
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, _bye)
+
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        if dep is not None:
+            dep.shutdown()
         worker.cmd.put(('disconnect',))
         worker.stop()
 
