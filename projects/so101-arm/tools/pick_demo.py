@@ -88,9 +88,10 @@ def locate(R, t, floor, h_center):
     return float(p[0]), float(p[1])
 
 
-def wait_gripper_settle(timeout=20.0):
+def wait_gripper_settle(timeout=35.0):
     """그리퍼가 멈출 때까지 대기 — 고정 sleep 은 닫힘(~15s)을 못 기다려
-    물체를 덜 문 채 들어올렸다(실물 1차 실패)."""
+    물체를 덜 문 채 들어올렸다(실물 1차 실패). 20초는 저속 프로파일의 전개방
+    (55°, ~20초)을 못 기다려 이동 중 판정이 났다(2026-08-20 데모 실측) — 35초."""
     prev = None
     t0 = time.monotonic()
     while time.monotonic() - t0 < timeout:
@@ -206,7 +207,7 @@ def main():
     if not (st['connected'] and st['calibrated'] and st['torque']):
         sys.exit('연결·캘리브·토크 ON 후 실행하세요 (팔이 접혀 있으면 unfold_safe 먼저)')
 
-    post('speed', pct=30)   # 극저속 계단 떨림 방지 — 자유공간 이동은 30%
+    post('speed', pct=40)   # 극저속 계단 떨림 방지 — 자유공간 이동은 40%
     print('① 접근 자세로 이동')
     move_and_wait(x, y, APPROACH_Z)
     print('② 그리퍼 개방')
@@ -245,7 +246,7 @@ def main():
     # 계속 쥐어짜 수 분 뒤 펌웨어 과부하 보호(25%)가 떠서 열기가 거부된다
     # (실측 2026-08-20: RxPacketError Overload). 위치 유지 토크만으로 충분.
     post('goto', joint='gripper', value=round(g, 1))
-    post('speed', pct=30)
+    post('speed', pct=40)
     print(f'   그리퍼 {g:.1f} 에서 닫힘 완료 (0 근처면 헛집음)')
     print('⑤ 들어올리기')
     move_and_wait(x, y, LIFT_Z)

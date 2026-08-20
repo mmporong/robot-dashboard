@@ -963,11 +963,30 @@ class Worker(threading.Thread):
                 self.state['torque'] = False
             self.say(f'⛔ 과전류 자동 정지 — {hot_i} (임계 {CURRENT_STOP})')
             return
+        # 판독 타당성 필터 (2026-08-20 실측 2건: 77°C 래치·122°C 순간치 — 둘 다
+        # 실온 30°C대 케이스에서 나온 쓰레기값): 90°C 초과는 물리적으로 불가능
+        # (펌웨어가 65°C 에서 힘을 줄이는데 그걸 57°C 나 지나칠 수 없다) →
+        # 센서/버스 글리치로 보고 버린다.
+        junk = {m: t for m, t in temps.items() if t > 90}
+        if junk:
+            self.say(f'⚠ 온도 이상치 폐기 {junk} — 센서/버스 글리치 의심')
+            temps = {m: t for m, t in temps.items() if t <= 90}
         hot = {m: t for m, t in temps.items() if t >= TEMP_STOP}
         warm = {m: t for m, t in temps.items() if TEMP_WARN <= t < TEMP_STOP}
         if hot:
             prev = getattr(self, '_hot_first', None)
             if prev is None:
+                # ★ 단발 판독으로는 개입하지 않는다 — 그리퍼 122°C 순간 글리치가
+                # 방출 중 개방을 중단시켰다(2026-08-20 데모 실측). 같은 모터가
+                # 연속 2회(8초 간격) 뜨거워야 1단계 진입. 진짜 과열이어도 이
+                # 지연은 펌웨어 65°C 백스톱이 받친다.
+                pend = getattr(self, '_hot_pending', {})
+                self._hot_pending = dict(hot)
+                confirmed = {m: t for m, t in hot.items() if m in pend}
+                if not confirmed:
+                    self.say(f'⚠ 과열 의심(1회 판독) {hot} — 다음 판독으로 확인')
+                    return
+                hot = confirmed
                 try:
                     self._do_stop()
                 except Exception as e:
@@ -1005,6 +1024,7 @@ class Worker(threading.Thread):
                          f'상태 유지 중, 전원 리셋으로 레지스터 초기화 검토')
         else:
             self._hot_first = None
+            self._hot_pending = {}
             if warm and self._temp_n % 4 == 0:
                 self.say(f'⚠ 서보 온도 상승: {warm}')
 

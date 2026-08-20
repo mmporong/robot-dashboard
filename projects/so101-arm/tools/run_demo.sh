@@ -25,6 +25,9 @@ finalize() {
     sleep 3
     for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null; done
     if [ -d "$OUT/demo_${TS}_simframes" ]; then
+        # 마지막 프레임은 기록 중 잘렸을 수 있다(PNG 디코드 오류) — 버린다
+        last=$(ls "$OUT/demo_${TS}_simframes"/f*.png 2>/dev/null | tail -1)
+        [ -n "$last" ] && rm -f "$last"
         ffmpeg -y -loglevel error -framerate 10 \
             -i "$OUT/demo_${TS}_simframes/f%05d.png" \
             -c:v libx264 -pix_fmt yuv420p "$OUT/demo_${TS}_sim.mp4" \
