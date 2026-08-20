@@ -166,7 +166,7 @@ def cube_face_yaw(R, t, floor, pix_frames, band=(0.028, 0.055)):
       15mm 밴드가 윗면을 잘랐다(hull None)
     높이 밴드(기본 2.8~5.5cm)는 이 셋의 문제가 전부 없다. 깊이 없는 물체
     (고무 등)는 None — 방향 미제공이 오방향보다 낫다(fail-safe)."""
-    yaws = []
+    yaws, centers = [], []
     for pix, fx, fy, w, h in pix_frames:
         P = []
         for u, v, z_mm in pix:
@@ -185,14 +185,22 @@ def cube_face_yaw(R, t, floor, pix_frames, band=(0.028, 0.055)):
             X = P @ np.array([[c, s], [-s, c]]).T
             area = float(np.ptp(X[:, 0]) * np.ptp(X[:, 1]))
             if best is None or area < best[0]:
-                best = (area, adeg)
-        yaws.append(best[1])
+                best = (area, adeg, X)
+        _, adeg, X = best
+        # 사각형 중심 → 역회전 = 윗면 실측 중심. 블롭 무게중심은 옆면 화소
+        # 때문에 카메라 쪽으로 치우친다(실측 y +24mm — "왼쪽을 집은" 사고 원인)
+        mid = np.array([(X[:, 0].min() + X[:, 0].max()) / 2,
+                        (X[:, 1].min() + X[:, 1].max()) / 2])
+        c, s = math.cos(math.radians(adeg)), math.sin(math.radians(adeg))
+        centers.append(np.array([[c, -s], [s, c]]) @ mid)
+        yaws.append(adeg)
     if not yaws:
         return None
     zc = np.mean([np.exp(4j * math.radians(a)) for a in yaws])  # mod 90 원형 평균
     if abs(zc) < 0.5:
         return None
-    return math.degrees(np.angle(zc) / 4) % 90
+    ctr = np.mean(centers, 0)
+    return math.degrees(np.angle(zc) / 4) % 90, float(ctr[0]), float(ctr[1])
 
 
 def move_and_wait(x, y, z, timeout=25.0, roll=None):
@@ -266,8 +274,14 @@ def main():
     yaw_face = None
     if a.pose == 'cube':
         pixf = read_pix()
-        if pixf:
-            yaw_face = cube_face_yaw(R, t, floor, pixf)
+        face = cube_face_yaw(R, t, floor, pixf) if pixf else None
+        if face:
+            # ★ 큐브 목표 = 윗면 실측 중심. 교시 오프셋(체스말 기하 전용)과
+            # 블롭 중심 편향을 둘 다 우회한다 (2026-08-20 실측: 기존 목표가
+            # 중심보다 y +24mm — 왼쪽 오파지 사고).
+            yaw_face, cx, cy = face
+            print(f'   윗면 중심 보정: ({x:+.3f},{y:+.3f}) → ({cx:+.3f},{cy:+.3f})')
+            x, y = cx, cy
 
     def roll_for(yaw_deg, tx, ty):
         v = yaw_deg + 90.0 - math.degrees(math.atan2(ty, tx)) - CLOSE_AXIS
@@ -337,7 +351,7 @@ def main():
     if not (st['connected'] and st['calibrated'] and st['torque']):
         sys.exit('연결·캘리브·토크 ON 후 실행하세요 (팔이 접혀 있으면 unfold_safe 먼저)')
 
-    post('speed', pct=80)   # 자유공간 이동 80% (2026-08-20 사용자: 2배 상향)
+    post('speed', pct=100)  # 자유공간 이동 최고속 (사용자: 추가 1.5배)
     print('① 접근 자세로 이동')
     move_and_wait(x, y, APPROACH_Z, roll=roll)
     print('② 그리퍼 개방')
@@ -347,7 +361,13 @@ def main():
     post('goto', joint='gripper', value=GRIP_OPEN.get(a.pose, GRIP_OPEN_ABS))
     wait_gripper_settle()
     # 재관측(re-look) — 접근 자세에서 팔이 시야를 바꿨을 수 있어 한 번 갱신
-    loc2 = locate(R, t, floor, h_center)
+    if a.pose == 'cube':
+        pixf2 = read_pix(tries=4, need=2)
+        face2 = cube_face_yaw(R, t, floor, pixf2) if pixf2 else None
+        loc2 = (face2[1] + OFF[0], face2[2] + OFF[1]) if face2 else None
+        # ↑ 아래 공통 코드가 OFF 를 빼므로 미리 더해 상쇄한다 (큐브는 무오프셋)
+    else:
+        loc2 = locate(R, t, floor, h_center)
     d2 = (math.hypot(loc2[0] - (x + OFF[0]), loc2[1] - (y + OFF[1]))
           if loc2 else None)
     if d2 is None:
@@ -366,7 +386,7 @@ def main():
         roll = roll_for_cube(yaw_face, x, y)
     print('③ 하강 (2단 — 최종은 15% 저속)')
     move_and_wait(x, y, (APPROACH_Z + z_grip) / 2, roll=roll)
-    post('speed', pct=30)   # 최종 하강 — 접촉 정밀 구간이라 절반 속도
+    post('speed', pct=45)   # 최종 하강 — 접촉 정밀 구간이라 감속
     move_and_wait(x, y, z_grip, timeout=35.0, roll=roll)
     print('④ 파지')
     post('goto', joint='gripper', value=GRIP_CLOSE_ABS)
@@ -380,7 +400,7 @@ def main():
     # 계속 쥐어짜 수 분 뒤 펌웨어 과부하 보호(25%)가 떠서 열기가 거부된다
     # (실측 2026-08-20: RxPacketError Overload). 위치 유지 토크만으로 충분.
     post('goto', joint='gripper', value=round(g, 1))
-    post('speed', pct=80)
+    post('speed', pct=100)
     print(f'   그리퍼 {g:.1f} 에서 닫힘 완료 (0 근처면 헛집음)')
     print('⑤ 들어올리기')
     move_and_wait(x, y, LIFT_Z, roll=roll)

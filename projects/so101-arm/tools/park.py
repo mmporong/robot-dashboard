@@ -85,7 +85,7 @@ def main():
         print(f'⚠ 그리퍼가 거의 닫혀 있습니다({g:.1f}) — 물체를 문 것으로 보고 '
               f'경로 여유에 돌출 {protrude*1000:.0f}mm 를 반영합니다. '
               f'물체가 없다면 그리퍼를 열고 다시 실행하세요.')
-    post('speed', pct=50)   # 2배 상향 — 걸음별 FK 가드가 있어 50%
+    post('speed', pct=75)   # 사용자: 추가 1.5배 — 걸음별 FK 가드 있음
     for joint in ORDER:
         tgt_final = float(park[joint])
         while True:

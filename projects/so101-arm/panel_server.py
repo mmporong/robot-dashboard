@@ -472,7 +472,23 @@ def make_handler(worker, kin, cam, dep):
                             / mpj['signs']['wrist_roll'])
                     fk = kin.fk_pos(q)
                     pan = [round(p - o, 4) for p, o in zip(fk, arm_lib.PAN0)]
-                    worker.cmd.put(('move_q', list(q), 3.0))
+                    # 보간 시간을 거리 비례로 (2026-08-20): 고정 3초는 짧은
+                    # 구간을 굼뜨게, 긴 구간은 속도상한에 눌려 프로파일이
+                    # 어긋났다. 최대 관절 이동량 / (상한 × 0.85) 로 잡는다.
+                    secs = 3.0
+                    try:
+                        mpj = arm_lib.load_mapping()
+                        tgt = {j: mpj['signs'][j] * math.degrees(q[i])
+                               + mpj['offsets'][j]
+                               for i, j in enumerate(arm_lib.JOINTS)}
+                        cur = worker.snapshot().get('pos') or {}
+                        md = max(abs((tgt[j] - cur.get(j, tgt[j]) + 180)
+                                     % 360 - 180) for j in arm_lib.JOINTS)
+                        vel = worker._profile_vel() * 0.087   # [°/s]
+                        secs = min(5.0, max(0.8, md / (vel * 0.85)))
+                    except Exception:
+                        pass
+                    worker.cmd.put(('move_q', list(q), round(secs, 2)))
                     return self._json({'ok': True,
                                        'q': [round(v, 4) for v in q],
                                        'fk_pan': pan})

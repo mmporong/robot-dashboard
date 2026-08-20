@@ -233,7 +233,9 @@ class Worker(threading.Thread):
         # vel 120→10.4°/s · 200→17.0°/s). 254 가 1바이트 최대라 상한 속도는 ≈22°/s.
         vel = self._profile_vel()
         self.bus.sync_write('Goal_Velocity', {m: vel for m in ALL}, normalize=False)
-        self.bus.sync_write('Acceleration', {m: 15 for m in ALL}, normalize=False)
+        # 가속 8(×100 스텝/s²): 15 는 구간마다 급출발·급정지로 삐걱였다
+        # (2026-08-20 사용자 체감) — 램프를 ~2배 완만하게.
+        self.bus.sync_write('Acceleration', {m: 8 for m in ALL}, normalize=False)
         self.bus.sync_write('Torque_Limit', {m: 600 for m in ALL}, normalize=False)
 
     def _profile_vel(self):

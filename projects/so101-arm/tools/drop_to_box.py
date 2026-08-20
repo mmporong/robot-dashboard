@@ -26,8 +26,9 @@ BOX_XY = (0.042, -0.142)     # 통 중심(패널) — 통을 옮기면 여기와
 # 통 교체 (2026-08-20 저녁): 검은 개방형 상자 8×8cm × 높이 6.5cm.
 # 입구 8cm 는 죠(파지폭+손가락 ≈6cm)가 못 들어간다 — **테두리 위에서 방출**.
 # 테두리 = floor + 0.065 = 패널 z -0.013.
-TRANSIT_Z = 0.030            # 운반·복귀 고도 (테두리 +43mm)
-RELEASE_Z = -0.005           # 방출 고도 — 테두리 +8mm (물체 낙하 ~5cm)
+TRANSIT_Z = 0.035            # 운반·복귀 고도 (테두리 +48mm)
+RELEASE_Z = 0.010            # 방출 고도 — 테두리 +23mm (상자 크기 고려,
+                             # 사용자: 더 높은 곳에서 방출. 낙하 ~6.5cm)
 
 K = arm_lib.load_kinematics()
 MP = arm_lib.load_mapping()
@@ -62,10 +63,10 @@ def main():
     if a.dry:
         print('--dry: 검증 통과, 이동 없음')
         return
-    pd.post('speed', pct=80)   # 자유공간 운반 (2배 상향)
+    pd.post('speed', pct=100)  # 자유공간 운반 최고속
     print('① 운반 — 통 위로')
     pd.move_and_wait(*BOX_XY, TRANSIT_Z, timeout=40.0)
-    pd.post('speed', pct=50)   # 테두리 위 방출 — 정밀 불필요
+    pd.post('speed', pct=75)   # 테두리 위 방출 — 정밀 불필요
     print('② 하강')
     pd.move_and_wait(*BOX_XY, RELEASE_Z, timeout=35.0)
     print('③ 방출 (보호해제 선행)')
@@ -81,7 +82,7 @@ def main():
                  f'수동 확인 필요')
     print(f'   개방 확인 (그리퍼 {g2:.1f})')
     print('④ 복귀 상승')
-    pd.post('speed', pct=80)
+    pd.post('speed', pct=100)
     pd.move_and_wait(*BOX_XY, TRANSIT_Z, timeout=30.0)
     pd.post('stop')
     print('투하 완료 — 통 위 대기 (토크 유지)')

@@ -94,7 +94,7 @@ def main():
     # 속도를 명시적으로 세운다 — 직전에 stop 이 있었으면 상한이 8(0.7°/s)로
     # 내려가 있고, goto 는 복원을 안 하므로 8° 걸음이 11초를 넘겨 자체
     # deadline(12초) 오탐으로 bail(토크 OFF) → 팔 낙하가 성립한다(감사 n3).
-    post('speed', pct=60)   # 2배 상향 — 자유공간·걸음별 z 가드 있음
+    post('speed', pct=90)   # 사용자: 추가 1.5배 — 걸음별 z 가드 있음
     pos = {j: st['pos'][j] for j in J}
     z = fk_z(pos)
     print(f'시작 z={z:+.4f}m · 자세 {({k: round(v,1) for k,v in pos.items()})}')
