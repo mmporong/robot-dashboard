@@ -130,7 +130,27 @@ def main():
     assert rolls and all(abs(r - expect) < 6 for r in rolls), \
         f'대각 큐브 롤 기대 {expect:+.1f}±6 ≠ {rolls}'
 
-    print('\n통과 — pick_demo 방향 파지 리허설 4사례')
+    print('⑤ 큐브 깊이 표본 부족 → 강등 없이 중단 (fail-closed)')
+    blob = synth_blob(px, py, 0, h_center=0.020, axis=False)   # pix 없음
+    arm = FakeArm((0.19, 0.0, 0.02), 50.0)
+    arm.blob = blob
+    srv = ThreadingHTTPServer(('127.0.0.1', 0), make_handler(arm))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    pd.BASE = f'http://127.0.0.1:{srv.server_address[1]}'
+    old_argv, sys.argv = sys.argv, ['pick_demo.py', 'cube']
+    code = None
+    try:
+        pd.main()
+    except SystemExit as e:
+        code = e.code
+    finally:
+        sys.argv = old_argv
+        srv.shutdown(); srv.server_close()
+    assert code and '깊이 표본 부족' in str(code), f'강등 금지 미동작: {code}'
+    assert not [o for o, _ in arm.ops if o == 'ik'], '표본 부족인데 이동 발행!'
+    print('  강등금지: OK')
+
+    print('\n통과 — pick_demo 방향 파지 리허설 5사례')
 
 
 if __name__ == '__main__':

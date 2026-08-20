@@ -275,13 +275,19 @@ def main():
     if a.pose == 'cube':
         pixf = read_pix()
         face = cube_face_yaw(R, t, floor, pixf) if pixf else None
-        if face:
-            # ★ 큐브 목표 = 윗면 실측 중심. 교시 오프셋(체스말 기하 전용)과
-            # 블롭 중심 편향을 둘 다 우회한다 (2026-08-20 실측: 기존 목표가
-            # 중심보다 y +24mm — 왼쪽 오파지 사고).
-            yaw_face, cx, cy = face
-            print(f'   윗면 중심 보정: ({x:+.3f},{y:+.3f}) → ({cx:+.3f},{cy:+.3f})')
-            x, y = cx, cy
+        if face is None:
+            # ★ 강등 금지 (2026-08-20 밤 실측): 원거리(25cm+)에서 깊이가 희소해
+            # 윗면 실측이 무효가 되자 무게중심+체스 교시 오프셋으로 조용히
+            # 진행해 엉뚱한 지점을 집었다. 부정확한 추정으로는 움직이지 않는다.
+            sys.exit('큐브 깊이 표본 부족 — 윗면 실측 중심을 못 구했습니다 '
+                     '(이동 안 함). → 물체를 카메라가 잘 보는 정면 15~22cm '
+                     '지점으로 옮기고 다시 실행하세요')
+        # ★ 큐브 목표 = 윗면 실측 중심. 교시 오프셋(체스말 기하 전용)과
+        # 블롭 중심 편향을 둘 다 우회한다 (2026-08-20 실측: 기존 목표가
+        # 중심보다 y +24mm — 왼쪽 오파지 사고).
+        yaw_face, cx, cy = face
+        print(f'   윗면 중심 보정: ({x:+.3f},{y:+.3f}) → ({cx:+.3f},{cy:+.3f})')
+        x, y = cx, cy
 
     def roll_for(yaw_deg, tx, ty):
         v = yaw_deg + 90.0 - math.degrees(math.atan2(ty, tx)) - CLOSE_AXIS
@@ -317,11 +323,17 @@ def main():
     APPROACH_Z = feasible_z(APPROACH_CAND)
     LIFT_Z = feasible_z(LIFT_CAND)
     if APPROACH_Z is None or LIFT_Z is None:
+        hint = (f'팔 쪽으로 약 {100*(x-0.24):.0f}cm 당겨' if x > 0.24 else
+                f'팔에서 약 {100*(0.14-x):.0f}cm 멀리')
         sys.exit(f'접근/상승 고도 후보가 전부 IK 불가 ({x:+.3f},{y:+.3f}) — 물체가 '
-                 f'리치 경계 밖입니다 (이동 안 함)')
+                 f'리치 경계 밖입니다 (이동 안 함). → 물체를 {hint} 놓으세요 '
+                 f'(이상적 지점: 베이스 정면 15~22cm)')
     print(f'   접근 z {APPROACH_Z:+.3f} · 상승 z {LIFT_Z:+.3f} (적응 선택)')
     if not (0.10 <= x <= 0.28 and abs(y) <= 0.12):     # 가장 싼 검사 먼저
-        sys.exit(f'추정 위치가 작업 영역 밖 ({x:+.3f},{y:+.3f}) — 이동 안 함')
+        hx = ('팔 쪽으로' if x > 0.28 else '팔에서 멀리') if not (0.10 <= x <= 0.28) else ''
+        hy = ('중앙선 쪽으로' if abs(y) > 0.12 else '')
+        sys.exit(f'추정 위치가 작업 영역 밖 ({x:+.3f},{y:+.3f}) — 이동 안 함. '
+                 f'→ 물체를 {hx} {hy} 옮기세요 (정면 10~28cm·좌우 ±12cm, 이상적 15~22cm)')
     # 캘리브 범위 검사 — 이동 후 타임아웃이 아니라 이동 전에 잡는다 (m48)
     mp = arm_lib.load_mapping()
     import json as _json
