@@ -897,7 +897,17 @@ class Worker(threading.Thread):
     # -- 폴링 --
     def _poll(self):
         if not (self.bus and self.snapshot()['connected']):
+            # 끊긴 상태면 주기적으로 재연결을 계속 시도한다 (2026-08-20 밤:
+            # 12V 순간 접촉 불량으로 버스가 잠깐 침묵했다 스스로 돌아오는
+            # 급사 변종 실측 — 1회 실패 후 포기하면 사람이 connect 를 눌러야
+            # 했다). 이미 연결된 적이 있을 때만, 5초 간격.
+            if self.bus and getattr(self, '_was_connected', False):
+                now = time.monotonic()
+                if now - getattr(self, '_rc_t', 0.0) >= 5.0:
+                    self._rc_t = now
+                    self._reconnect()
             return
+        self._was_connected = True
         try:
             st = self.snapshot()
             if st['calibrated'] and not st['recording']:
