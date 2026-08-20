@@ -206,7 +206,7 @@ def main():
     if not (st['connected'] and st['calibrated'] and st['torque']):
         sys.exit('연결·캘리브·토크 ON 후 실행하세요 (팔이 접혀 있으면 unfold_safe 먼저)')
 
-    post('speed', pct=25)
+    post('speed', pct=30)   # 극저속 계단 떨림 방지 — 자유공간 이동은 30%
     print('① 접근 자세로 이동')
     move_and_wait(x, y, APPROACH_Z)
     print('② 그리퍼 개방')
@@ -245,7 +245,7 @@ def main():
     # 계속 쥐어짜 수 분 뒤 펌웨어 과부하 보호(25%)가 떠서 열기가 거부된다
     # (실측 2026-08-20: RxPacketError Overload). 위치 유지 토크만으로 충분.
     post('goto', joint='gripper', value=round(g, 1))
-    post('speed', pct=25)
+    post('speed', pct=30)
     print(f'   그리퍼 {g:.1f} 에서 닫힘 완료 (0 근처면 헛집음)')
     print('⑤ 들어올리기')
     move_and_wait(x, y, LIFT_Z)

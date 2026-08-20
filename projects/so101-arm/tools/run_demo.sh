@@ -31,7 +31,7 @@ finalize() {
             && rm -rf "$OUT/demo_${TS}_simframes"
     fi
     echo "산출물:"
-    ls -la "$OUT"/demo_${TS}_*.mp4 2>/dev/null || echo "  (영상 없음)"
+    ls -la "$OUT"/demo_${TS}_* 2>/dev/null | grep -v simframes || echo "  (없음)"
 }
 
 on_int() {
@@ -56,15 +56,27 @@ curl -s -m 5 "$API/blob" | grep -q '"u"' \
     || { echo "빨간 물체 미검출 — 체스말을 픽업 존에 놓고 다시 실행"; exit 1; }
 echo "연결·물체 검출 OK"
 
-say "녹화 시작 (통째로 — 마감 전에도 유효한 fragmented mp4)"
-FR="-movflags +frag_keyframe+empty_moov"
+say "녹화 시작 — 손목캠·정면RGB·뎁스·화면(웹패널+뮤조코)·시뮬렌더·관절각CSV"
+FR="-movflags +frag_keyframe+empty_moov"      # 중단돼도 mp4 유효
 ffmpeg -y -loglevel error -f mpjpeg -i "$API/cam" -t 900 \
        -c:v libx264 -pix_fmt yuv420p $FR "$OUT/demo_${TS}_wrist.mp4" & PIDS+=($!)
 ffmpeg -y -loglevel error -f mpjpeg -i "$API/rgb" -t 900 \
        -c:v libx264 -pix_fmt yuv420p $FR "$OUT/demo_${TS}_rgb.mp4" & PIDS+=($!)
+ffmpeg -y -loglevel error -f mpjpeg -i "$API/depth" -t 900 \
+       -c:v libx264 -pix_fmt yuv420p $FR "$OUT/demo_${TS}_depth.mp4" & PIDS+=($!)
+DISP="${DISPLAY:-:1}"
+SIZE=$(xdpyinfo -display "$DISP" 2>/dev/null | awk '/dimensions/{print $2}')
+if [ -n "$SIZE" ]; then
+    ffmpeg -y -loglevel error -f x11grab -framerate 15 -video_size "$SIZE" \
+           -i "$DISP" -t 900 -c:v libx264 -preset veryfast -pix_fmt yuv420p \
+           $FR "$OUT/demo_${TS}_screen.mp4" & PIDS+=($!)
+else
+    echo "⚠ 화면 캡처 생략 — DISPLAY($DISP) 조회 실패"
+fi
 ( cd "$TOOLS/sim" && exec "$SIMPY" -u sim_view.py \
       --record "$OUT/demo_${TS}_simframes" --seconds 900 ) \
       > "$OUT/demo_${TS}_simrec.log" 2>&1 & PIDS+=($!)
+python3 "$TOOLS/log_state.py" "$OUT/demo_${TS}_state.csv" 900 & PIDS+=($!)
 sleep 3
 
 fail=""
