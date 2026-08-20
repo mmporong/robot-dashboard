@@ -72,7 +72,7 @@ def make_handler(arm):
                             'torque': True, 'pos': dict(arm.pos), 'log': log,
                             'speed_pct': 20})
             elif self.path == '/blob':
-                self._json({'blob': None})
+                self._json({'blob': getattr(arm, 'blob', None)})
             else:
                 self._json({}, 404)
 
@@ -89,6 +89,11 @@ def make_handler(arm):
                 if q is None:
                     self._json({'ok': False, 'msg': 'IK 해 없음'})
                     return
+                if d.get('roll') is not None:      # 서버와 같은 롤 덮어쓰기
+                    q = list(q)
+                    q[4] = math.radians(
+                        (float(d['roll']) - MP['offsets']['wrist_roll'])
+                        / MP['signs']['wrist_roll'])
                 for k, v in arm_lib.rad_to_servo(q, MP).items():
                     arm.pos[k.replace('.pos', '')] = v
                 if arm.settle_gap:        # 서버 기준(3.0°)엔 도달, gap 1.5°엔 미달

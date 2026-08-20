@@ -38,6 +38,11 @@ APPROACH_CAND = (0.02, 0.005, -0.01)   # 접근 고도 후보 — 원거리 x �
 LIFT_CAND = (0.03, 0.015, 0.0)         # 안 풀린다(리치). IK 되는 첫 값을 쓴다
 GRIP_OPEN_ABS = 55          # 절대 개방각 — delta 방식은 이미 열린 상태에서 이중
 GRIP_CLOSE_ABS = 1          # 개방(99, 아랫턱 젖힘)을 만들었다(실측). 절대각으로만.
+# 죠 닫힘축 실측(2026-08-20, MuJoCo 두 손끝 사이트 — 실물 대조된 롤 오프셋
+# 반영): 닫힘축 yaw = pan + CLOSE_AXIS + roll [°]. 롤 0 에서 닫힘축은 방사
+# 방향과 거의 직교(-94.3)라 방사로 누운 물체가 잡혔다. 방향 파지는 물체
+# 장축과 닫힘축이 직교하도록 roll 을 푼다 (축은 180° 대칭 → ±90 접기).
+CLOSE_AXIS = -94.3
 
 
 def post(op, **kw):
@@ -57,27 +62,36 @@ def bail(msg):
     sys.exit(1)
 
 
-def read_bearing(tries=10, need=5):
-    """빨간 블롭의 픽셀 방위각 중앙값. 깊이 불필요."""
-    pts = []
+def read_bearing(tries=10, need=5, with_axis=False):
+    """빨간 블롭의 픽셀 방위각 중앙값 (+옵션: 주축 각·fx·fy). 깊이 불필요."""
+    pts, axes, fxy = [], [], None
     for _ in range(tries):
         b = get('/blob').get('blob') or {}
         if b.get('u') is not None and b.get('fx'):
             pts.append([(b['u'] - b['w'] / 2) / b['fx'],
                         (b['v'] - b['h'] / 2) / b['fy']])
+            fxy = (b['fx'], b['fy'])
+            if b.get('axis_deg') is not None:
+                axes.append(math.radians(b['axis_deg']))
         time.sleep(0.2)
     if len(pts) < need:
-        return None
+        return (None, None, None) if with_axis else None
     a = np.array(pts)
     med = np.median(a, axis=0)
     keep = a[np.linalg.norm(a - med, axis=1) < 0.008]
-    return keep.mean(axis=0) if len(keep) >= need else None
+    brg = keep.mean(axis=0) if len(keep) >= need else None
+    if not with_axis:
+        return brg
+    axis = None
+    if brg is not None and len(axes) >= need:
+        zc = np.mean([np.exp(2j * ang) for ang in axes])  # 180° 대칭 원형 평균
+        if abs(zc) > 0.7:                                 # 표본 일관성 게이트
+            axis = math.degrees(np.angle(zc) / 2)
+    return brg, axis, fxy
 
 
-def locate(R, t, floor, h_center):
-    brg = read_bearing()
-    if brg is None:
-        return None
+def ray_plane(brg, R, t, floor, h_center):
+    """방위각 → 광선 ∩ 평면(z = floor + h_center) 교점 (x, y)."""
     d = R @ np.array([brg[0], brg[1], 1.0])
     if abs(d[2]) < 1e-6:
         return None
@@ -86,6 +100,27 @@ def locate(R, t, floor, h_center):
         return None
     p = t + s * d
     return float(p[0]), float(p[1])
+
+
+def locate(R, t, floor, h_center):
+    brg = read_bearing()
+    if brg is None:
+        return None
+    return ray_plane(brg, R, t, floor, h_center)
+
+
+def piece_yaw(brg, axis_img_deg, fxy, R, t, floor, h_center):
+    """이미지 주축을 책상 평면에 투영해 물체 장축의 로봇좌표 yaw[°]를 얻는다.
+
+    축 위 두 픽셀(40px 간격)을 각각 광선∩평면으로 내려 잇는다 — 카메라
+    기울기·투영 왜곡이 자동으로 반영된다(이미지 각도를 그대로 쓰면 틀린다)."""
+    a = math.radians(axis_img_deg)
+    d_brg = np.array([math.cos(a) / fxy[0], math.sin(a) / fxy[1]]) * 40.0
+    p1 = ray_plane(np.asarray(brg), R, t, floor, h_center)
+    p2 = ray_plane(np.asarray(brg) + d_brg, R, t, floor, h_center)
+    if p1 is None or p2 is None:
+        return None
+    return math.degrees(math.atan2(p2[1] - p1[1], p2[0] - p1[0]))
 
 
 def wait_gripper_settle(timeout=35.0):
@@ -103,10 +138,13 @@ def wait_gripper_settle(timeout=35.0):
     return prev
 
 
-def move_and_wait(x, y, z, timeout=25.0):
+def move_and_wait(x, y, z, timeout=25.0, roll=None):
     pre = get('/state').get('log', [])
     pre_tail = pre[-1] if pre else ''            # 이 이동 전의 마지막 로그
-    r = post('ik', x=round(x, 4), y=round(y, 4), z=round(z, 4), pitch=-90)
+    kw = dict(x=round(x, 4), y=round(y, 4), z=round(z, 4), pitch=-90)
+    if roll is not None:                         # 방향 파지 — 하강 중 롤 유지
+        kw['roll'] = round(roll, 1)
+    r = post('ik', **kw)
     if not r.get('ok'):
         bail(f'IK 실패 ({x:.3f},{y:.3f},{z:.3f}): {r.get("msg")}')
     mapping = arm_lib.load_mapping()
@@ -157,12 +195,26 @@ def main():
     # 죠가 물체를 살짝 스쳤다 — "아랫턱이 물체보다 조금 더 왼쪽에 온 상태로
     # 파지돼도 된다". 다음 실물 세션에서 손목캠으로 방향 확인 후 수 mm 보정.
 
-    loc = locate(R, t, floor, h_center)
+    brg, axis_img, fxy = read_bearing(with_axis=True)
+    loc = ray_plane(brg, R, t, floor, h_center) if brg is not None else None
     if loc is None:
         sys.exit('물체 미검출 — 시야·조명 확인 (이동 안 함)')
     x, y = loc[0] - OFF[0], loc[1] - OFF[1]
+
+    # 방향 파지 (2026-08-20): 물체 장축 yaw 를 구해 죠 닫힘축이 직교하도록
+    # 손목 롤을 푼다. 축이 안 잡히면(원형 블롭·표본 불일치) 종전대로 롤 없음.
+    yaw = (piece_yaw(brg, axis_img, fxy, R, t, floor, h_center)
+           if axis_img is not None else None)
+
+    def roll_for(yaw_deg, tx, ty):
+        v = yaw_deg + 90.0 - math.degrees(math.atan2(ty, tx)) - CLOSE_AXIS
+        return ((v + 90.0) % 180.0) - 90.0
+
+    roll = roll_for(yaw, x, y) if yaw is not None else None
     print(f'물체({a.pose}) 추정: ({loc[0]:+.3f}, {loc[1]:+.3f}) '
           f'→ 오프셋 보정 ({x:+.3f}, {y:+.3f}) · 파지 z {z_grip:+.3f}')
+    print(f'   장축 yaw: {"%.1f°" % yaw if yaw is not None else "불명(원형/불일치)"}'
+          f' → 손목 롤 {"%.1f°" % roll if roll is not None else "0 (기본)"}')
 
     # 접근·상승 고도 적응 선택 + 프리플라이트 (이동 전)
     K = arm_lib.load_kinematics()
@@ -187,6 +239,9 @@ def main():
     cal = _json.loads((pathlib.Path.home() / '.cache/huggingface/lerobot/'
                        'calibration/robots/so_follower/follower.json').read_text())
     bounds = arm_lib.calib_bounds(cal)
+    if roll is not None and not (bounds['wrist_roll'][0] + 2 <= roll
+                                 <= bounds['wrist_roll'][1] - 2):
+        sys.exit(f'목표 롤 {roll:+.1f}° 가 캘리브 범위 밖 (이동 안 함)')
     for tag, (px, py, pz) in (('접근', (x, y, APPROACH_Z)),
                               ('파지', (x, y, z_grip)),
                               ('상승', (x, y, LIFT_Z))):
@@ -209,7 +264,7 @@ def main():
 
     post('speed', pct=40)   # 극저속 계단 떨림 방지 — 자유공간 이동은 40%
     print('① 접근 자세로 이동')
-    move_and_wait(x, y, APPROACH_Z)
+    move_and_wait(x, y, APPROACH_Z, roll=roll)
     print('② 그리퍼 개방')
     g_now = get('/state')['pos'].get('gripper', 50)
     post('goto', joint='gripper', value=round(g_now, 1))  # 위치 재전송 = 과부하 보호 해제
@@ -230,10 +285,12 @@ def main():
         print(f'   ⚠ 재관측 보정 {1000*d2:.0f}mm — 큽니다. 하강을 지켜보세요')
     else:
         bail(f'재관측이 {1000*d2:.0f}mm 어긋남 — 물체가 움직였거나 오검출 (m49)')
+    if yaw is not None:
+        roll = roll_for(yaw, x, y)     # 재관측으로 pan 이 바뀌었을 수 있다
     print('③ 하강 (2단 — 최종은 15% 저속)')
-    move_and_wait(x, y, (APPROACH_Z + z_grip) / 2)
+    move_and_wait(x, y, (APPROACH_Z + z_grip) / 2, roll=roll)
     post('speed', pct=15)
-    move_and_wait(x, y, z_grip, timeout=35.0)
+    move_and_wait(x, y, z_grip, timeout=35.0, roll=roll)
     print('④ 파지')
     post('goto', joint='gripper', value=GRIP_CLOSE_ABS)
     g = wait_gripper_settle()
@@ -249,7 +306,7 @@ def main():
     post('speed', pct=40)
     print(f'   그리퍼 {g:.1f} 에서 닫힘 완료 (0 근처면 헛집음)')
     print('⑤ 들어올리기')
-    move_and_wait(x, y, LIFT_Z)
+    move_and_wait(x, y, LIFT_Z, roll=roll)
     # 검증: 팔과 함께 블롭이 움직이는가 (pan 흔들기)
     b0 = read_bearing()
     post('jog', joint='shoulder_pan', delta=6)

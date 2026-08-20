@@ -257,18 +257,31 @@ class Capture:
             for lo, hi in self.RED:
                 m |= cv2.inRange(hsv, np.array(lo), np.array(hi))
             m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
-            n, _, st, ct = cv2.connectedComponentsWithStats(m, 8)
+            n, lab, st, ct = cv2.connectedComponentsWithStats(m, 8)
             k = max(range(1, n), key=lambda i: st[i, cv2.CC_STAT_AREA], default=None)
             if k is None:
                 continue
             area = int(st[k, cv2.CC_STAT_AREA])
             if area >= self.MIN_AREA and (best is None or area > best[0]):
-                best = (area, swap, float(ct[k][0]), float(ct[k][1]))
+                # 주축 각도(이미지 좌표, [-90,90)°) — 누운 물체의 방향 파지용
+                # (2026-08-20). 화소 2차 모멘트 PCA. elong(장/단축 표준편차비)이
+                # 1.3 미만이면 사실상 원형이라 각도가 무의미 → None.
+                ys, xs = np.nonzero(lab == k)
+                mx, my = xs.mean(), ys.mean()
+                cxx = ((xs - mx) ** 2).mean(); cyy = ((ys - my) ** 2).mean()
+                cxy = ((xs - mx) * (ys - my)).mean()
+                ang = 0.5 * math.atan2(2 * cxy, cxx - cyy)
+                tr, det = cxx + cyy, cxx * cyy - cxy * cxy
+                disc = max(tr * tr / 4 - det, 0.0) ** 0.5
+                l1, l2 = tr / 2 + disc, max(tr / 2 - disc, 1e-9)
+                elong = (l1 / l2) ** 0.5
+                best = (area, swap, float(ct[k][0]), float(ct[k][1]),
+                        math.degrees(ang), float(elong))
         if best is None:
             with self.lock:
                 self.blob = None
             return
-        area, swap, u, v = best
+        area, swap, u, v, axis_deg, elong = best
         if self.swap_rb is None:
             self.swap_rb = swap        # 한 번 정해지면 이후엔 그 해석만 쓴다
         # 깊이는 한 점만 읽으면 구멍에 걸리므로 블롭 주변 창의 중앙값을 쓴다.
@@ -300,6 +313,8 @@ class Capture:
             # fx·fy·w·h 도 싣는다 — 깊이가 안 잡히는 물체(고무 등)라도 픽셀
             # 방위각((u-cx)/fx)은 유효해서, handeye 가 방위각+책상평면으로 푼다.
             self.blob = {'u': round(u, 1), 'v': round(v, 1), 'area': area,
+                         'axis_deg': round(axis_deg, 1) if elong >= 1.3 else None,
+                         'elong': round(elong, 2),
                          'z_mm': z_mm, 'valid_px': int(nz.size), 'win_r': used_r,
                          'fx': round(fx, 2), 'fy': round(fy, 2), 'w': w, 'h': h,
                          'cam_xyz': [round(c, 4) for c in pt] if pt else None,

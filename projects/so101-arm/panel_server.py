@@ -461,6 +461,15 @@ def make_handler(worker, kin, cam, dep):
                     if q is None:
                         return self._json({'ok': False,
                                            'msg': 'IK 해 없음 — 리치/한계 밖'})
+                    if req.get('roll') is not None:
+                        # 손목 롤만 지정각(서보 °)으로 덮어씀 — 누운 물체 방향
+                        # 파지용(2026-08-20). 롤은 TCP 축 회전이라 위치 IK 와
+                        # 독립이고, 캘리브 범위는 Worker 게이트가 검사한다.
+                        mpj = arm_lib.load_mapping()
+                        q = list(q)
+                        q[4] = math.radians(
+                            (float(req['roll']) - mpj['offsets']['wrist_roll'])
+                            / mpj['signs']['wrist_roll'])
                     fk = kin.fk_pos(q)
                     pan = [round(p - o, 4) for p, o in zip(fk, arm_lib.PAN0)]
                     worker.cmd.put(('move_q', list(q), 3.0))
