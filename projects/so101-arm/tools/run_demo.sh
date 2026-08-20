@@ -56,9 +56,12 @@ echo "$st" | grep -q '"connected": true' || {
     curl -s -m 5 "$API/state" | grep -q '"connected": true' \
         || { echo "연결 실패 — 전원·USB 확인"; exit 1; }
 }
-curl -s -m 5 "$API/blob" | grep -q '"u"' \
-    || { echo "빨간 물체 미검출 — 체스말을 픽업 존에 놓고 다시 실행"; exit 1; }
-echo "연결·물체 검출 OK"
+say "물체 검증 (--dry — 검출·작업영역·리치까지 확인)"
+if ! timeout 60 python3 "$TOOLS/pick_demo.py" "$POSE" --dry; then
+    echo "→ 물체를 픽업 존(팔 정면 10~28cm, 좌우 ±12cm)에 놓고 다시 실행하세요"
+    exit 1
+fi
+echo "연결·물체 검증 OK"
 
 say "녹화 시작 — 손목캠·정면RGB·뎁스·화면(웹패널+뮤조코)·시뮬렌더·관절각CSV"
 FR="-movflags +frag_keyframe+empty_moov"      # 중단돼도 mp4 유효
