@@ -79,10 +79,14 @@ class Camera(threading.Thread):
             builtin = ('ASUS' in name or 'IR camera' in name)
             cands.append((builtin, idx, name))
         ext = [c for c in cands if not c[0]]
-        pick = ext or cands
-        if prefer is not None and any(c[1] == prefer for c in pick):
+        # ★ 외장 UVC 가 없으면 카메라를 끈다(None). 내장 웹캠으로 조용히
+        # 대체하면 패널에 노트북 화면이 떠서 손목캠으로 오인한다
+        # (2026-08-20 USB 허브 이설 후 실측 — 손목캠 미검출 시 video0 을 잡았다).
+        if not ext:
+            return None
+        if prefer is not None and any(c[1] == prefer for c in ext):
             return prefer
-        return pick[0][1] if pick else 0
+        return ext[0][1]
 
     def snapshot_jpeg(self):
         with self.lock:
@@ -92,6 +96,8 @@ class Camera(threading.Thread):
         cap = cv2.VideoCapture(self.index, cv2.CAP_V4L2)   # 백엔드 명시 — GStreamer 로
         if not cap.isOpened():                    # 열리면 set() 이 조용히 무시된다
             alt = self.find_index()               # 번호가 밀렸으면 다시 찾는다
+            if alt is None:
+                return None                       # 외장 캠이 사라짐 — 내장으로 안 간다
             if alt != self.index:
                 self.index = alt
                 cap = cv2.VideoCapture(alt, cv2.CAP_V4L2)
@@ -500,8 +506,12 @@ def main():
     kin = arm_lib.load_kinematics()
     if a.cam >= 0:
         idx = Camera.find_index(a.cam if a.cam != 4 else None)
-        cam = Camera(idx)
-        print(f'카메라 자동 선택: /dev/video{idx}')
+        if idx is None:
+            cam = None
+            print('손목캠 미검출(외장 UVC 없음) — /cam 비활성. USB 허브 연결·전원 확인')
+        else:
+            cam = Camera(idx)
+            print(f'카메라 자동 선택: /dev/video{idx}')
     else:
         cam = None
 

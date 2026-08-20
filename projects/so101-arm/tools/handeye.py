@@ -212,9 +212,17 @@ def solve_bearings_plane(brg, rob):
     if not (0.30 <= abs(d_cam) <= 1.20):
         return None, None, (f'평면 수직거리 {abs(d_cam):.2f}m 가 비현실적 — '
                             f'책상이 아닐 수 있습니다')
-    p0_cam = -d_cam * n_cam
+    # ★ 평면 구속은 한 점(수직 발)이 아니라 **인라이어 표본 전체의 높이**로 건다.
+    # 발 한 점 + 법선 구속만으로는 잔여 기울기 2~3° 가 남고, 발이 작업 영역
+    # 밖(카메라 아래)에 있어 그 기울기가 지렛대로 증폭된다 — 1차 실측에서
+    # 작업 영역 바닥이 20mm 어긋났다(tan2.9°×0.55m≈28mm). 표본 30점이면
+    # 책상 폭 전체가 지렛대가 되어 기울기가 평면 잡음 수준으로 조여진다.
+    Ppl_all = Pd[m_pl]
+    step = max(1, len(Ppl_all) // 30)
+    Ppl = Ppl_all[::step][:30]
     B, O = np.asarray(brg, float), np.asarray(rob, float)
     zguess = 0.65                              # 잔차 스케일용 명목 거리
+    n_res = 2 * len(O) + len(Ppl) + 1
 
     def unpack(x):
         Rc, _ = cv2.Rodrigues(np.ascontiguousarray(x[:3]))
@@ -224,16 +232,12 @@ def solve_bearings_plane(brg, rob):
         Rc, tc = unpack(x)
         pc = O @ Rc.T + tc
         if (pc[:, 2] <= 0.05).any():           # 카메라 뒤로 가는 해 배제
-            return np.full(2 * len(O) + 4, 1e3)
+            return np.full(n_res, 1e3)
         r_b = ((pc[:, :2] / pc[:, 2:3]) - B).ravel() / 0.005
-        R = Rc.T
-        n_rob = R @ n_cam
-        s = 1.0 if n_rob[2] >= 0 else -1.0
-        r_n = (s * n_rob - np.array([0, 0, 1]))[:2] / 0.02
-        p0_rob = R @ (p0_cam - tc)
-        r_h = np.array([(p0_rob[2] - floor) / 0.005])
+        z_pl = ((Ppl - tc) @ Rc)[:, 2]         # 평면 표본의 로봇 z (= R·(p-tc))
+        r_pl = (z_pl - floor) / 0.006
         r_d = np.array([(pc[:, 2].mean() - zguess) / 0.30])   # 약한 거리 정칙화
-        return np.concatenate([r_b, r_n, r_h, r_d])
+        return np.concatenate([r_b, r_pl, r_d])
 
     def lm(x0, iters=500):
         x = x0.copy(); lam = 1e-3
@@ -269,7 +273,6 @@ def solve_bearings_plane(brg, rob):
     n_rob = R @ n_cam
     n_rob = n_rob * (1 if n_rob[2] >= 0 else -1)
     tilt = float(np.degrees(np.arccos(min(1.0, n_rob[2]))))
-    plane_z = float((R @ (p0_cam - tc))[2])
     # 자기참조가 아닌 독립 검증(리뷰 M9-1): 평면 인라이어를 이 해로 로봇 좌표에
     # 옮겼을 때 물리적으로 타당한 작업면 범위에 있어야 한다. 벽·엉뚱한 면이면
     # x·y 가 흩어진다. (깊이 없는 물체에서는 교차 대조가 없어 이것이 유일한
@@ -277,6 +280,12 @@ def solve_bearings_plane(brg, rob):
     rob_pl = Pd[m_pl] @ R.T + t
     in_work = float(((rob_pl[:, 0] > -0.05) & (rob_pl[:, 0] < 0.80)
                      & (np.abs(rob_pl[:, 1]) < 0.60)).mean())
+    # plane_z 는 소비자 지표(파지 하강이 실제로 쓰는 곳)에 맞춰 **작업 영역**
+    # 중앙값으로 잰다 — 수직 발 한 점은 작업 영역 밖이라 기울기 오차를 못 본다.
+    wa = rob_pl[(rob_pl[:, 0] > 0.10) & (rob_pl[:, 0] < 0.30)
+                & (np.abs(rob_pl[:, 1]) < 0.10)]
+    plane_z = (float(np.median(wa[:, 2])) if len(wa) >= 20
+               else float(np.median(rob_pl[:, 2])))
     diag = {'bearing_med_mrad': float(np.median(res_b) * 1000),
             'bearing_max_mrad': float(res_b.max() * 1000),
             'desk_tilt_deg': tilt, 'plane_z_m': plane_z, 'floor_m': floor,
