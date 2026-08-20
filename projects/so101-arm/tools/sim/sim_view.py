@@ -115,17 +115,30 @@ def main():
             data.qpos[jadr['gripper']] = math.radians(
                 max(-10.0, min(100.0, deg['gripper'])))
         mujoco.mj_forward(model, data)
-        # 물체를 문 상태(닫힘)면 체스말을 그리퍼 끝에 붙여 같이 움직인다 —
-        # 실팔이 집으면 시뮬도 같이 집는다 (2026-08-20 사용자 지시).
-        now_holding = deg.get('gripper', 100) < GRIP_HOLD_DEG
-        if holding['v'] and not now_holding and not a.piece_at:
+        # 물체를 문 상태면 체스말을 그리퍼 끝에 붙여 같이 움직인다 — 실팔이
+        # 집으면 시뮬도 같이 집는다 (2026-08-20 사용자 지시).
+        # ★ '물었다' 판정은 각도만으로 못 한다 — 휴지 자세의 빈 죠 다묾(5°)도
+        #   <25° 라 체스말이 죠에 끼워 보였다(실측 오인). **열림→닫힘 전이
+        #   순간에 물체가 죠 7cm 이내**에 있었을 때만 파지로 본다. 시작부터
+        #   닫혀 있으면(전이 없음) 붙이지 않는다.
+        prev_g = holding.get('g')
+        now_g = deg.get('gripper', 100)
+        holding['g'] = now_g
+        now_closed = now_g < GRIP_HOLD_DEG
+        if holding['v'] and not now_closed and not a.piece_at:
             # 방출 순간 — 물체를 그 자리 수직 아래(바닥/박스 바닥)로 떨어뜨린다.
             # 뎁스캠이 박스 안을 못 보므로 blob 갱신은 기대할 수 없다.
             p = data.mocap_pos[mocap_id['piece']].copy()
             drop_z = panel_to_sim((0.0, 0.0, floor + 0.011), R, t)[2]
             data.mocap_pos[mocap_id['piece']] = (p[0], p[1], drop_z)
-        holding['v'] = now_holding
-        if now_holding and not a.piece_at:
+            holding['v'] = False
+        elif (not holding['v'] and now_closed and prev_g is not None
+              and prev_g >= GRIP_HOLD_DEG and not a.piece_at):
+            gsite = data.site('graspframe').xpos
+            d = float(np.linalg.norm(
+                np.array(data.mocap_pos[mocap_id['piece']]) - gsite))
+            holding['v'] = d < 0.07
+        if holding['v'] and not a.piece_at:
             g = data.site('graspframe').xpos
             pan_w = R @ np.array(arm_lib.PAN0) + t     # 팬 축의 월드 좌표
             dx, dy = g[0] - pan_w[0], g[1] - pan_w[1]
