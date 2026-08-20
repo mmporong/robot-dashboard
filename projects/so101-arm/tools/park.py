@@ -124,12 +124,28 @@ def main():
                 if time.monotonic() > deadline:
                     bail(f'{joint} 시간 초과')
         print(f'  {joint:14s} → {state()["pos"][joint]:+7.1f}° (목표 {tgt_final:+.1f})')
+    # 그리퍼도 다문다 (2026-08-20 사용자 지시: 휴지 자세는 그리퍼 포함).
+    # 보호해제 선행 + 정착 폴링 — pick_demo 와 같은 규약. park_deg 값(≈4.8)은
+    # 빈 죠 기준이라 지속 압착이 없다.
+    gp = float(park.get('gripper', 4.8))
+    g = state()['pos'].get('gripper')
+    if g is not None and abs(g - gp) > 2.0:
+        post('goto', joint='gripper', value=round(g, 1))
+        time.sleep(1.0)
+        post('goto', joint='gripper', value=gp)
+        prev, t0 = None, time.monotonic()
+        while time.monotonic() - t0 < 20.0:
+            time.sleep(1.2)
+            gn = state()['pos'].get('gripper')
+            if prev is not None and gn is not None and abs(gn - prev) < 0.3:
+                break
+            prev = gn
     post('stop')
     time.sleep(0.5)
     post('torque', on=False)              # 파킹 자세 도달 후에만 — 자중 안정
     time.sleep(1.5)
     fin = state()['pos']
-    print('\n파킹 완료 (토크 OFF). 최종:',
+    print('\n파킹 완료 (토크 OFF, 그리퍼 다묾). 최종:',
           {k: round(v, 1) for k, v in fin.items()})
 
 

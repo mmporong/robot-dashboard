@@ -29,7 +29,8 @@ FLOOR = arm_lib.load_gain('floor_z_m')['floor_z_m']
 
 
 class FakeArm:
-    def __init__(self, tcp, gripper, ignore_gripper=False, halt_after=0):
+    def __init__(self, tcp, gripper, ignore_gripper=False, halt_after=0,
+                 settle_gap=0.0):
         bf = tuple(p + o for p, o in zip(tcp, arm_lib.PAN0))
         q = K.ik_best(*bf, pitch=math.radians(-90))
         assert q is not None, f'시작 자세 {tcp} IK 불가 — 사례 정의 오류'
@@ -39,6 +40,9 @@ class FakeArm:
         self.ops = []                     # (op, kwargs) 발행 기록
         self.ignore_gripper = ignore_gripper   # 리뷰 C1 회귀: 개방 거부 재현
         self.halt_after = halt_after      # N번째 /state 이후 log 에 ⛔ (리뷰 M6)
+        self.settle_gap = settle_gap      # 정착 잔차 [°] — 리뷰 M5 완료신호 경로
+        self.move_seq = 0
+        self.last_done = None
         self.state_gets = 0
 
 
@@ -58,8 +62,12 @@ def make_handler(arm):
         def do_GET(self):
             if self.path == '/state':
                 arm.state_gets += 1
-                log = (['⛔ 테스트 거부'] if arm.halt_after
-                       and arm.state_gets > arm.halt_after else [])
+                if arm.halt_after and arm.state_gets > arm.halt_after:
+                    log = ['⛔ 테스트 거부']
+                elif arm.last_done:
+                    log = [arm.last_done]
+                else:
+                    log = []
                 self._json({'connected': True, 'calibrated': True,
                             'torque': True, 'pos': dict(arm.pos), 'log': log,
                             'speed_pct': 20})
@@ -83,6 +91,11 @@ def make_handler(arm):
                     return
                 for k, v in arm_lib.rad_to_servo(q, MP).items():
                     arm.pos[k.replace('.pos', '')] = v
+                if arm.settle_gap:        # 서버 기준(3.0°)엔 도달, gap 1.5°엔 미달
+                    arm.pos['shoulder_lift'] += arm.settle_gap
+                    arm.move_seq += 1
+                    arm.last_done = (f'이동 완료 — 전류피크 모의 #{arm.move_seq} '
+                                     f'(임계 250)')
                 self._json({'ok': True, 'q': list(q)})
             elif op == 'goto':
                 if not (arm.ignore_gripper and d['joint'] == 'gripper'):
@@ -180,7 +193,13 @@ def main():
     assert any(abs(kw['z'] - want) < 1e-6 for kw in iks), \
         f'standing 놓기 z {want:+.3f} 미발행: {[kw["z"] for kw in iks]}'
 
-    print('\n통과 — 전 경로 리허설 완료 (8사례)')
+    print('⑨ 서버 완료신호 — 정착 잔차 2°(gap 판정 미달)여도 완주 (리뷰 M5)')
+    arm = run_case('완료신호', (0.19, 0.02, 0.02), 2.5, [], settle_gap=2.0)
+    assert [o for o, _ in arm.ops][-1] == 'stop', '완료신호 경로에서 stop 미발행'
+    assert len([o for o, kw in arm.ops if o == 'ik']) == 5, \
+        '완료신호 경로에서 이동이 모두 발행되지 않음'
+
+    print('\n통과 — 전 경로 리허설 완료 (9사례)')
 
 
 if __name__ == '__main__':

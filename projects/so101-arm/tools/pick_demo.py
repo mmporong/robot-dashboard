@@ -103,6 +103,8 @@ def wait_gripper_settle(timeout=20.0):
 
 
 def move_and_wait(x, y, z, timeout=25.0):
+    pre = get('/state').get('log', [])
+    pre_tail = pre[-1] if pre else ''            # 이 이동 전의 마지막 로그
     r = post('ik', x=round(x, 4), y=round(y, 4), z=round(z, 4), pitch=-90)
     if not r.get('ok'):
         bail(f'IK 실패 ({x:.3f},{y:.3f},{z:.3f}): {r.get("msg")}')
@@ -121,6 +123,13 @@ def move_and_wait(x, y, z, timeout=25.0):
         gap = max(abs((st['pos'][j] - want[j] + 180) % 360 - 180) for j in J)
         if gap < 1.5:   # 실측: shoulder_lift 중력 정착 오차 1.2° — 0.8은 도달 불가.
                         # 파지 여유는 h_grip +4mm(m50)로 확보
+            return
+        # 서버 완료 신호 (14차 리뷰 M5, 2026-08-20 실측 2회): 서버 도달 기준은
+        # 3.0° 라 1.5~3.0° 정착은 gap 만으론 영영 미도달 → 타임아웃(리치 경계
+        # 상승에서 재현). 이 이동이 만든 **새** '이동 완료' 로그 + gap<3.5° 면
+        # 도달로 본다. 직전 이동과 로그 문자열이 우연히 같으면(전류피크 동일)
+        # 신호를 놓치지만, 그때는 기존 타임아웃 경로로 떨어질 뿐이다(fail-safe).
+        if '이동 완료' in tail and tail != pre_tail and gap < 3.5:
             return
         time.sleep(0.3)
     bail(f'도달 시간 초과 ({x:.3f},{y:.3f},{z:.3f})')

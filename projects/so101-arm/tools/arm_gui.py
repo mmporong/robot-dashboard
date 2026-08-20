@@ -37,7 +37,10 @@ ALL = ARM + ['gripper']
 # ── 안전 임계 (2026-08-19 발연 사고 후 도입) ──────────────────────────────────
 # STS3215 의 기본 과온 한계는 70°C 다. 그보다 낮은 곳에서 스스로 멈춰야 보호가 된다.
 TEMP_WARN, TEMP_STOP = 55, 62      # °C
-TEMP_EVERY = 25                    # 폴링 몇 회마다 온도를 읽나 (매번은 비싸다)
+TEMP_SEC = 8.0                     # 온도 판독 최소 간격 [s] — 틱 기반(유휴 간극
+                                   # 25회)은 명령이 몰리면 주기가 한없이 늘어졌다
+                                   # (15차 리뷰 M4). 이동 중(_interp 블로킹)엔 원래
+                                   # 안 읽힌다 — 그 구간은 전류·스톨 감시가 담당.
 STALL_GAP_DEG = 3.0                # 목표와 이만큼 벌어져 있으면 막힌 것으로 본다
 STALL_MOVE_DEG = 0.4               # 0.5초 동안 이보다 덜 움직이면 '안 가고 있다'로 본다
 STALL_LAG_DEG = 15.0               # 움직이고는 있어도 보간 목표에서 이만큼 뒤처지면 끊는다
@@ -145,6 +148,14 @@ class Worker(threading.Thread):
 
     # -- 명령들 --
     def _do_connect(self):
+        # USB 재열거로 ACM0↔ACM1 이 뒤바뀐다(전원 리셋마다, 실측 4회) — 기동 시
+        # 포트를 고집하면 connect 가 죽은 경로로만 시도한다. _reconnect 와 같은
+        # 정책으로, 살아 있는 포트가 따로 있으면 갈아탄다.
+        import glob
+        cands = sorted(glob.glob('/dev/ttyACM*')) or sorted(glob.glob('/dev/ttyUSB*'))
+        if cands and self.port not in cands:
+            self.say(f'포트 갱신 {self.port} → {cands[0]}')
+            self.port = cands[0]
         from lerobot.motors import Motor, MotorCalibration, MotorNormMode
         from lerobot.motors.feetech import FeetechMotorsBus
         norm = MotorNormMode.DEGREES
@@ -907,17 +918,23 @@ class Worker(threading.Thread):
             pass
 
     def _guard(self, st):
-        """과열을 감시해 임계를 넘으면 스스로 토크를 내린다.
+        """과열 감시 — 온도 경로만 등급형 (2026-08-20 재설계, 15차 리뷰 반영).
 
-        서보는 막히면 최대 전류를 흘려 몇 분 만에 위험 온도에 이른다. 사람이
-        화면을 안 보고 있어도 멈추게 하려면 이 감시가 필요하다(2026-08-19 발연 사고).
-        읽기가 비싸므로 매 폴링이 아니라 몇 초에 한 번만 본다.
+        사다리: 62°C 이동정지(토크 유지)+⛔🔥 경보 → 상승 확인 시 ⛔🔥 재경보 →
+        65°C 펌웨어 과온(Protective_Torque 20% 유지)이 실제 컷을 맡는다.
+        소프트웨어는 토크를 끊지 않는다 — 임의 자세 0% 컷은 낙하 사고고(실측:
+        래치 오독 77°C 낙하) 펌웨어 컷(20% 유지력)이 더 안전하다(15차 M2①).
+        ★ 과전류 경로는 등급화 대상이 아니다 — 눌린 팔은 즉시 컷이 맞다.
+        ★ 메시지의 ⛔ 접두사는 클라이언트 감시(bail)와의 계약 — 빼면
+          pick_demo/park/unfold 가 과열 정지를 모른 채 계속 명령한다(15차 M1).
         """
         if not st['torque']:
             return
-        self._tick = getattr(self, '_tick', 0) + 1
-        if self._tick % TEMP_EVERY:
+        now = time.monotonic()
+        if now - getattr(self, '_temp_t', 0.0) < TEMP_SEC:
             return
+        self._temp_t = now
+        self._temp_n = getattr(self, '_temp_n', 0) + 1
         temps = {}
         for m in ALL:
             try:
@@ -949,15 +966,47 @@ class Worker(threading.Thread):
         hot = {m: t for m, t in temps.items() if t >= TEMP_STOP}
         warm = {m: t for m, t in temps.items() if TEMP_WARN <= t < TEMP_STOP}
         if hot:
-            try:
-                self.bus.disable_torque()
-            except Exception:
-                pass
-            with self.lock:
-                self.state['torque'] = False
-            self.say(f'🔥 과열 자동 정지 — {hot} (임계 {TEMP_STOP}°C). 전원을 확인하세요')
-        elif warm and self._tick % (TEMP_EVERY * 4) == 0:
-            self.say(f'⚠ 서보 온도 상승: {warm}')
+            prev = getattr(self, '_hot_first', None)
+            if prev is None:
+                try:
+                    self._do_stop()
+                except Exception as e:
+                    # 완화(정지) 실패 → 강한 수단 폴백 (15차 M3). 옛 목표가 남아
+                    # 뜨거운 서보를 계속 미는 것이 컷보다 나쁘다.
+                    try:
+                        self.bus.disable_torque()
+                    except Exception:
+                        pass
+                    with self.lock:
+                        self.state['torque'] = False
+                    self.say(f'⛔🔥 과열 정지 실패({type(e).__name__}) — '
+                             f'토크 차단 폴백 {hot}')
+                    return
+                self._hot_first = dict(hot)     # 정지 성공 후에만 (15차 M3)
+                if 'gripper' in hot:
+                    # 지속 압착이 가장 뜨거운 경로 — 목표=현재로 압력 해제
+                    # (파지 예압 상실 < 소손, 15차 m). _do_stop 은 ARM 만 되쓴다.
+                    try:
+                        raw = self.bus.sync_read('Present_Position',
+                                                 normalize=False)
+                        self.bus.sync_write('Goal_Position',
+                                            {'gripper': raw['gripper']},
+                                            normalize=False)
+                    except Exception:
+                        pass
+                self.say(f'⛔🔥 과열 감지 — 이동 정지·자세 유지 {hot} (임계 '
+                         f'{TEMP_STOP}°C). 65°C 면 펌웨어가 유지력 20%로 줄입니다')
+            elif any(t >= prev.get(m, TEMP_STOP) + 2 for m, t in hot.items()):
+                if self._temp_n % 2 == 0:
+                    self.say(f'⛔🔥 과열 진행(상승 확인) {hot} — 팔을 받칠 준비. '
+                             f'65°C 펌웨어 보호(유지력 20%)가 컷을 맡습니다')
+            elif self._temp_n % 4 == 0:
+                self.say(f'⛔🔥 과열 판독 유지 {hot} — 비상승(오독 가능성). 정지 '
+                         f'상태 유지 중, 전원 리셋으로 레지스터 초기화 검토')
+        else:
+            self._hot_first = None
+            if warm and self._temp_n % 4 == 0:
+                self.say(f'⚠ 서보 온도 상승: {warm}')
 
     def _reconnect(self):
         import glob
