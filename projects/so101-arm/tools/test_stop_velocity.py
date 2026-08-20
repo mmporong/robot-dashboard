@@ -40,9 +40,15 @@ class RecBus:
 
 
 def main():
+    import json
     w = Worker('/dev/fake', 'follower')          # 실캘리브로 게이트 통과
     w.bus = RecBus()
     w.state.update(calibrated=True, torque=True, speed_pct=15)
+    # calib_path() 는 lerobot 임포트가 필요해 시스템 파이썬에선 실패한다 —
+    # 캐시를 직접 주입해 게이트(fail-closed)를 실캘리브로 통과시킨다.
+    w._calib_cache = json.loads(
+        (pathlib.Path.home() / '.cache/huggingface/lerobot/calibration/'
+         'robots/so_follower/follower.json').read_text())
 
     # ① stop: 속도 8 강하 + 목표 재기록은 ARM 한정 (그리퍼 예압 유지)
     w._do_stop()
@@ -53,8 +59,13 @@ def main():
     print('① stop: 속도 8 강하 · 목표 재기록 ARM 한정 OK')
 
     # ② 이어지는 move_q 가 첫 목표 쓰기 전에 속도를 프로파일 값으로 복원 (C1)
+    # 표적은 "서보각 0°"에 해당하는 q — q=[0]*5 는 offsets.wrist_roll=-180
+    # (2026-08-19) 이후 캘리브 게이트에 거부돼 이동 자체가 안 일어난다.
+    import arm_lib
+    q0 = arm_lib.servo_to_rad({f'{j}.pos': 0.0 for j in ARM},
+                              arm_lib.load_mapping())
     w.bus.writes.clear()
-    w._do_move_q([0.0] * 5, 0.3)                 # 현재=목표 → 즉시 완료
+    w._do_move_q(q0, 0.3)                        # 현재=목표 → 즉시 완료
     idx_vel = next(i for i, (n, _, _) in enumerate(w.bus.writes)
                    if n == 'Goal_Velocity')
     idx_goal = next(i for i, (n, _, _) in enumerate(w.bus.writes)

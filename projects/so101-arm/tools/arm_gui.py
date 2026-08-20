@@ -71,13 +71,19 @@ CURRENT_HOLD = 2                   # 순간 피크(가속·정지)로 오작동�
 # ★ 공장 기본값은 Protection_Current=0(과전류 보호 꺼짐), Unloading_Condition=0
 # (토크 해제 조건 없음)이다. 즉 **서보가 스스로를 지킬 장치가 비활성으로 출하된다.**
 # 2026-08-19 발연은 이 상태에서 났다.
+# ★ 과부하(토크%) 계열은 공장값으로 (2026-08-20 급사 4회의 진범 확정).
+# Overload_Torque 60%·Protection_Time 0.5초 조합은 중력을 이기는 **정상 저속
+# 이동**이 그대로 걸렸다 — 보호 진입 서보는 토크 20%로 무너지고(팔 주저앉음)
+# 에러 패킷으로 응답해 일괄 읽기가 통째로 실패("전 서보 무응답 급사"), 복구는
+# 전원 리셋뿐이었다. USB/전원 무죄(커널 로그 무흔적·어댑터 5A).
+# 과전류·과온은 유지 — 공장값은 Protection_Current=0(꺼짐)이라 8/19 소손 재발.
 PROTECT = {
-    'Max_Temperature_Limit': 65,          # °C (기본 70 보다 낮게)
-    'Protection_Current': 320,            # ≈2.1A. 12V 정격 900mA 의 2.3배·스톨 2.7A 아래
-    'Over_Current_Protection_Time': 50,   # ×10ms = 0.5초 (기본 2초는 너무 길다)
-    'Overload_Torque': 60,                # % (기본 80 → 더 이르게)
-    'Protection_Time': 50,                # ×10ms = 0.5초 (기본 200=2초)
-    'Protective_Torque': 20,              # 보호 후 유지 토크 [%] — 팔이 털썩 떨어지지 않게
+    'Max_Temperature_Limit': 65,          # °C (기본 70 보다 낮게) — 유지
+    'Protection_Current': 320,            # ≈2.1A — 유지 (정상 이동 피크 ≤25, 여유 12배)
+    'Over_Current_Protection_Time': 200,  # 공장값(2초) — 빠른 층은 소프트웨어 감시
+    'Overload_Torque': 80,                # 공장값 — 60% 는 정상 이동에 오발
+    'Protection_Time': 200,               # 공장값(2초) — 0.5초는 저속 이동 창 안
+    'Protective_Torque': 20,              # 보호 후 유지 토크 [%]
 }
 
 # 그리퍼는 다르다. **물체를 잡고 계속 힘을 주는 것이 정상 동작**이라 과부하 임계를
@@ -707,9 +713,27 @@ class Worker(threading.Thread):
                                  and abs(now[j] - watch[j]) < 0.5 * win_cap)]
                     if stuck:
                         worst = max(stuck, key=lambda j: lag[j])
-                        self._kill_torque(f'스톨 — {worst} 가 보간 목표에서 '
-                                          f'{lag[worst]:.1f}° 뒤처져 있습니다. '
-                                          f'간섭을 확인하세요')
+                        # ★ 스톨 대응 = 그 자리 유지 (2026-08-20 재설계). 토크
+                        # 컷은 임의 자세 낙하다(실측: roll 스톨 킬로 팔이 떨어짐).
+                        # 목표=현재 재기록이 미는 힘 자체를 없애 소손 경로가
+                        # 끊기고, 나머지 관절은 자세를 유지한다. ⛔ 는 클라이언트
+                        # bail 계약. 버스 이상 분기(쓰기 실패)는 유지도 불가하므로
+                        # 그대로 토크 컷.
+                        try:
+                            raw = self.bus.sync_read('Present_Position',
+                                                     normalize=False)
+                            self.bus.sync_write('Goal_Position',
+                                                {m: raw[m] for m in ARM},
+                                                normalize=False)
+                            self.bus.sync_write('Goal_Velocity',
+                                                {m: 8 for m in ALL},
+                                                normalize=False)
+                            self.say(f'⛔ 스톨 — {worst} 가 보간 목표에서 '
+                                     f'{lag[worst]:.1f}° 뒤처짐. 정지·자세 유지'
+                                     f'(토크 ON). 간섭 확인 후 재시도하세요')
+                        except Exception:
+                            self._kill_torque(f'스톨({worst} {lag[worst]:.1f}°) '
+                                              f'+ 정지 쓰기 실패 — 통신 이상')
                         return False
                 watch = now
             a = i / steps

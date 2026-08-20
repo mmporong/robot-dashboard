@@ -134,13 +134,18 @@ check(any('이동 완료' in m for m in w.snapshot()['log']),
 check(not any('Torque_Limit' == n for _, n, _, _ in after),
       'Torque_Limit 은 재기록하지 않는다 (probe_floor 교훈 준수)')
 
-print('\n── C1 대조군: 복원을 끄면 종전처럼 오탐 킬이 재현되는가 ──')
+print('\n── C1 대조군: 복원을 끄면 스톨 감지가 발화하는가 (대응은 정지·유지) ──')
+# 2026-08-20 재설계: 스톨 대응이 토크 킬 → 정지·자세 유지(토크 ON)로 바뀌었다
+# (임의 자세 토크 컷 = 낙하, roll 스톨 실측). 감지 발화 자체는 그대로 확인한다.
 bus = FakeBus(); w = mkworker(bus)
 w._do_stop()
 w._restore_velocity = lambda: None            # 수정 전 동작 재현
 w._do_move_q(TARGET_Q, 3.0)
-killed = w.snapshot()['torque'] is False and bus.torque_off > 0
-check(killed, f'복원 없으면 토크 킬 발생 — 로그: {w.snapshot()["log"][-1][:70]}')
+tail = [m for m in w.snapshot()['log'] if '스톨' in m]
+check(bool(tail) and w.snapshot()['torque'] is True and bus.torque_off == 0
+      and '자세 유지' in tail[-1] and tail[-1].startswith('⛔'),
+      f'복원 없으면 스톨 감지 발화 + 정지·유지(토크 보존) — 로그: '
+      f'{tail[-1][:70] if tail else "(없음)"}')
 
 print('\n── M4: 이동 중 state[pos] 가 갱신된다 ──')
 bus = FakeBus(); w = mkworker(bus)
