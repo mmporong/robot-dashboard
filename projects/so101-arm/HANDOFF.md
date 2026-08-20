@@ -162,8 +162,10 @@ LIMIT_MARGIN_DEG = 2.0
 ### 서보 보호 파라미터 (연결 시 자동 기록)
 
 ```
-표준(ID 1~5): 과온 65도 · Protection_Current 320(~2.1A) · Overload_Torque 60%
-              · Protection_Time 0.5초 · Protective_Torque 20%
+표준(ID 1~5): 과온 65도 · Protection_Current 320(~2.1A) · Overload_Torque 80%(공장값)
+              · Protection_Time 2초(공장값) · Protective_Torque 20%
+✎ 2026-08-20 밤 정정: 종전 60%·0.5초는 정상 저속 이동에 오발해 "버스 급사"
+  4회를 만든 진범으로 확정 — 과부하 계열은 공장값 복원 (커밋 e441726)
 그리퍼(ID 6): 과온 65도 · Protection_Time 0.5초 · Overload_Torque 25%
               · Protection_Current 250
 ```
@@ -520,8 +522,8 @@ systemd-run --user --scope -q -p MemoryMax=1G bash -c \
   상태로 경보만. 최후 방어선은 펌웨어 과온(65°C). 가짜 버스 4시나리오 통과.
   + _do_connect 포트 재탐색(ACM0↔ACM1 재열거, 실측 4회). **15차 리뷰 대기
   중 — 승인 후 커밋할 것** (실행본에는 이미 반영·가동 중).
-- **미러 업그레이드** (커밋 4363514): 롤 표시 오프셋 180°(실물 그리퍼 롤
-  반전 조립), 파지 동기화(닫힘<25 → graspframe 부착·방출 시 낙하), 13cm
+- **미러 업그레이드** (커밋 4363514): 롤 표시 오프셋(실물 그리퍼 롤
+  반전 조립 — 실물 대조 2회로 -90° 확정, 최초 추정 180°는 오답), 파지 동기화(닫힘<25 → graspframe 부착·방출 시 낙하), 13cm
   투하 박스, --record 무화면 녹화 모드.
 
 ### 2026-08-20 밤 — "버스 급사" 진범 확정: 과부하 보호 오발 (커밋 e441726)
