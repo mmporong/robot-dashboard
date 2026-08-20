@@ -278,6 +278,23 @@ class Capture:
                     hull_pts = hull.tolist()
                 except Exception:
                     hull_pts = None
+                # 유효 깊이 화소 표본(≤200) — 파지 쪽이 3D 로 올려 "책상 위
+                # 높이"로 윗면만 골라 면 방향을 적합한다 (2026-08-20 밤:
+                # 껍질 투영은 옆면 번짐, 깊이 밴드는 비스듬한 윗면의 깊이 폭
+                # ~3cm 에 걸려 실패 — 높이 밴드가 정공법).
+                try:
+                    dv = d[ys, xs]
+                    ok_d = dv > 0
+                    if ok_d.sum() >= 25:
+                        ui, vi, zi = xs[ok_d], ys[ok_d], dv[ok_d]
+                        if len(zi) > 200:
+                            idx = np.linspace(0, len(zi) - 1, 200).astype(int)
+                            ui, vi, zi = ui[idx], vi[idx], zi[idx]
+                        pix = np.stack([ui, vi, zi], 1).astype(int).tolist()
+                    else:
+                        pix = None
+                except Exception:
+                    pix = None
                 mx, my = xs.mean(), ys.mean()
                 cxx = ((xs - mx) ** 2).mean(); cyy = ((ys - my) ** 2).mean()
                 cxy = ((xs - mx) * (ys - my)).mean()
@@ -287,12 +304,12 @@ class Capture:
                 l1, l2 = tr / 2 + disc, max(tr / 2 - disc, 1e-9)
                 elong = (l1 / l2) ** 0.5
                 best = (area, swap, float(ct[k][0]), float(ct[k][1]),
-                        math.degrees(ang), float(elong), hull_pts)
+                        math.degrees(ang), float(elong), hull_pts, pix)
         if best is None:
             with self.lock:
                 self.blob = None
             return
-        area, swap, u, v, axis_deg, elong, hull_pts = best
+        area, swap, u, v, axis_deg, elong, hull_pts, pix = best
         if self.swap_rb is None:
             self.swap_rb = swap        # 한 번 정해지면 이후엔 그 해석만 쓴다
         # 깊이는 한 점만 읽으면 구멍에 걸리므로 블롭 주변 창의 중앙값을 쓴다.
@@ -326,6 +343,7 @@ class Capture:
             self.blob = {'u': round(u, 1), 'v': round(v, 1), 'area': area,
                          'axis_deg': round(axis_deg, 1) if elong >= 1.3 else None,
                          'elong': round(elong, 2), 'hull': hull_pts,
+                         'pix': pix,
                          'z_mm': z_mm, 'valid_px': int(nz.size), 'win_r': used_r,
                          'fx': round(fx, 2), 'fy': round(fy, 2), 'w': w, 'h': h,
                          'cam_xyz': [round(c, 4) for c in pt] if pt else None,

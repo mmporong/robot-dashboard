@@ -143,34 +143,42 @@ def wait_gripper_settle(timeout=35.0):
     return prev
 
 
-def read_hull(tries=6, need=3):
-    """블롭 볼록 껍질 표본 — [(hull, fx, fy, w, h), ...]."""
+def read_pix(tries=6, need=3):
+    """블롭 깊이 화소 표본 — [(pix, fx, fy, w, h), ...] (pix = [[u,v,z_mm],..])."""
     out = []
     for _ in range(tries):
         b = get('/blob').get('blob') or {}
-        if b.get('hull') and b.get('fx'):
-            out.append((b['hull'], b['fx'], b['fy'], b['w'], b['h']))
+        if b.get('pix') and b.get('fx'):
+            out.append((b['pix'], b['fx'], b['fy'], b['w'], b['h']))
         time.sleep(0.15)
     return out if len(out) >= need else None
 
 
-def cube_face_yaw(R, t, floor, top_h, hulls):
-    """껍질을 윗면 높이 평면에 투영해 회전사각형 적합 — 면 방향 yaw [°, mod 90).
+def cube_face_yaw(R, t, floor, pix_frames, band=(0.028, 0.055)):
+    """깊이 화소를 3D→로봇좌표로 올려 **책상 위 높이**로 윗면만 고르고,
+    그 xy 에 회전사각형을 적합해 면 방향 yaw [°, mod 90) 를 얻는다.
 
-    이미지 PCA 는 원근(윗면+옆면 합성)이 가짜 장축을 만든다(실측 -67°) —
-    로봇좌표 투영 후 최소면적 사각형은 왜곡이 없다. 옆면 화소가 껍질을
-    한쪽으로 늘리지만 지배 모서리 방향은 윗면 변이 정한다."""
+    실패 이력 (2026-08-20 밤, 순서대로):
+    · 이미지 PCA — 원근(윗면+옆면 합성)이 가짜 장축(실측 -67° vs 실제 ~5°)
+    · 껍질 평면 투영 — 옆면 화소가 카메라 방향으로 번져(실측 68×37mm,
+      실물 40×40) min-rect 가 번짐 방향에 정렬 = 실물 오파지 사고
+    · 깊이 최근접 밴드 — 비스듬한 시야에서 윗면 자체의 깊이 폭이 ~3cm 라
+      15mm 밴드가 윗면을 잘랐다(hull None)
+    높이 밴드(기본 2.8~5.5cm)는 이 셋의 문제가 전부 없다. 깊이 없는 물체
+    (고무 등)는 None — 방향 미제공이 오방향보다 낫다(fail-safe)."""
     yaws = []
-    for hull, fx, fy, w, h in hulls:
-        pts = []
-        for u, v in hull:
-            p = ray_plane(np.array([(u - w / 2) / fx, (v - h / 2) / fy]),
-                          R, t, floor, top_h)
-            if p:
-                pts.append(p)
-        if len(pts) < 4:
+    for pix, fx, fy, w, h in pix_frames:
+        P = []
+        for u, v, z_mm in pix:
+            z = z_mm / 1000.0
+            p_cam = np.array([(u - w / 2) * z / fx, (v - h / 2) * z / fy, z])
+            p_rob = R @ p_cam + t
+            hgt = p_rob[2] - floor
+            if band[0] <= hgt <= band[1]:
+                P.append(p_rob[:2])
+        if len(P) < 20:
             continue
-        P = np.array(pts)
+        P = np.array(P)
         best = None
         for adeg in range(90):
             c, s = math.cos(math.radians(adeg)), math.sin(math.radians(adeg))
@@ -257,9 +265,9 @@ def main():
            if axis_img is not None and a.pose == 'lying' else None)
     yaw_face = None
     if a.pose == 'cube':
-        hulls = read_hull()
-        if hulls:
-            yaw_face = cube_face_yaw(R, t, floor, 0.040, hulls)  # 윗면 높이 4cm
+        pixf = read_pix()
+        if pixf:
+            yaw_face = cube_face_yaw(R, t, floor, pixf)
 
     def roll_for(yaw_deg, tx, ty):
         v = yaw_deg + 90.0 - math.degrees(math.atan2(ty, tx)) - CLOSE_AXIS

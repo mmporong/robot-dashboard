@@ -45,7 +45,8 @@ def synth_blob(x, y, yaw_deg, h_center=0.011, axis=True):
             'z_mm': 0, 'valid_px': 0, 'win_r': 5, 'fx': FX, 'fy': FY,
             'w': W, 'h': H, 'cam_xyz': None, 'registered': True,
             'swap_rb': True, 'color_stale': 0, 'color_error': None,
-            'elong': 3.0 if axis else 1.05, 'axis_deg': None, 'hull': None}
+            'elong': 3.0 if axis else 1.05, 'axis_deg': None, 'hull': None,
+            'pix': None}
     if axis:
         q = np.array(p) + 0.03 * np.array([math.cos(math.radians(yaw_deg)),
                                            math.sin(math.radians(yaw_deg)), 0])
@@ -111,14 +112,18 @@ def main():
     print('④ 대각 큐브 (면 30° 회전) → 면 정렬 롤 (mod 90)')
     psi = 30.0
     c, s = math.cos(math.radians(psi)), math.sin(math.radians(psi))
-    corners = []
-    for dx, dy in ((1, 1), (1, -1), (-1, -1), (-1, 1)):
-        wx = px + (dx * 0.02) * c - (dy * 0.02) * s
-        wy = py + (dx * 0.02) * s + (dy * 0.02) * c
-        u, v = to_px((wx, wy, FLOOR + 0.04))
-        corners.append([int(round(u)), int(round(v))])
+    pix = []
+    for gx in np.linspace(-0.019, 0.019, 6):     # 윗면 격자 → 깊이 화소 표본
+        for gy in np.linspace(-0.019, 0.019, 6):
+            wx = px + gx * c - gy * s
+            wy = py + gx * s + gy * c
+            p3 = np.array([wx, wy, FLOOR + 0.04])
+            pc = R.T @ (p3 - T)
+            u = pc[0] / pc[2] * FX + W / 2
+            v = pc[1] / pc[2] * FY + H / 2
+            pix.append([int(round(u)), int(round(v)), int(round(pc[2] * 1000))])
     blob = synth_blob(px, py, 0, h_center=0.020, axis=False)
-    blob['hull'] = corners
+    blob['pix'] = pix
     arm = run_case('대각큐브', blob, pose='cube')
     rolls = [r for r in ik_rolls(arm) if r is not None]
     expect = ((psi - pan - pd.CLOSE_AXIS + 45) % 90) - 45
