@@ -143,6 +143,50 @@ def wait_gripper_settle(timeout=35.0):
     return prev
 
 
+def read_hull(tries=6, need=3):
+    """블롭 볼록 껍질 표본 — [(hull, fx, fy, w, h), ...]."""
+    out = []
+    for _ in range(tries):
+        b = get('/blob').get('blob') or {}
+        if b.get('hull') and b.get('fx'):
+            out.append((b['hull'], b['fx'], b['fy'], b['w'], b['h']))
+        time.sleep(0.15)
+    return out if len(out) >= need else None
+
+
+def cube_face_yaw(R, t, floor, top_h, hulls):
+    """껍질을 윗면 높이 평면에 투영해 회전사각형 적합 — 면 방향 yaw [°, mod 90).
+
+    이미지 PCA 는 원근(윗면+옆면 합성)이 가짜 장축을 만든다(실측 -67°) —
+    로봇좌표 투영 후 최소면적 사각형은 왜곡이 없다. 옆면 화소가 껍질을
+    한쪽으로 늘리지만 지배 모서리 방향은 윗면 변이 정한다."""
+    yaws = []
+    for hull, fx, fy, w, h in hulls:
+        pts = []
+        for u, v in hull:
+            p = ray_plane(np.array([(u - w / 2) / fx, (v - h / 2) / fy]),
+                          R, t, floor, top_h)
+            if p:
+                pts.append(p)
+        if len(pts) < 4:
+            continue
+        P = np.array(pts)
+        best = None
+        for adeg in range(90):
+            c, s = math.cos(math.radians(adeg)), math.sin(math.radians(adeg))
+            X = P @ np.array([[c, s], [-s, c]]).T
+            area = float(np.ptp(X[:, 0]) * np.ptp(X[:, 1]))
+            if best is None or area < best[0]:
+                best = (area, adeg)
+        yaws.append(best[1])
+    if not yaws:
+        return None
+    zc = np.mean([np.exp(4j * math.radians(a)) for a in yaws])  # mod 90 원형 평균
+    if abs(zc) < 0.5:
+        return None
+    return math.degrees(np.angle(zc) / 4) % 90
+
+
 def move_and_wait(x, y, z, timeout=25.0, roll=None):
     pre = get('/state').get('log', [])
     pre_tail = pre[-1] if pre else ''            # 이 이동 전의 마지막 로그
@@ -206,23 +250,38 @@ def main():
         sys.exit('물체 미검출 — 시야·조명 확인 (이동 안 함)')
     x, y = loc[0] - OFF[0], loc[1] - OFF[1]
 
-    # 방향 파지 (2026-08-20): 물체 장축 yaw 를 구해 죠 닫힘축이 직교하도록
-    # 손목 롤을 푼다. 축이 안 잡히면(원형 블롭·표본 불일치) 종전대로 롤 없음.
-    # ★ lying(누운 체스말)에만 적용 — 큐브는 원근(윗면+옆면 합성)이 가짜
-    #   장축을 만들고(실측 elong 1.5·축 -67°), 대각 파지(5.7cm)는 위험하다.
-    #   큐브는 면이 팔 쪽을 대강 향하게 놓으면 기본 롤 면 파지로 충분.
+    # 방향 파지 (2026-08-20): lying 은 장축 yaw(축 직교), cube 는 껍질 투영
+    # 회전사각형의 면 방향(90° 대칭 — 대각으로 놓여도 면에 정렬해 잡는다).
+    # 이미지 PCA 축은 큐브에서 원근 가짜 축을 만들므로 쓰지 않는다.
     yaw = (piece_yaw(brg, axis_img, fxy, R, t, floor, h_center)
            if axis_img is not None and a.pose == 'lying' else None)
+    yaw_face = None
+    if a.pose == 'cube':
+        hulls = read_hull()
+        if hulls:
+            yaw_face = cube_face_yaw(R, t, floor, 0.040, hulls)  # 윗면 높이 4cm
 
     def roll_for(yaw_deg, tx, ty):
         v = yaw_deg + 90.0 - math.degrees(math.atan2(ty, tx)) - CLOSE_AXIS
         return ((v + 90.0) % 180.0) - 90.0
 
-    roll = roll_for(yaw, x, y) if yaw is not None else None
+    def roll_for_cube(face_deg, tx, ty):
+        # 닫힘축을 면 법선에 정렬: closing ≡ yaw_face (mod 90) → ±45° 로 접는다
+        v = face_deg - math.degrees(math.atan2(ty, tx)) - CLOSE_AXIS
+        return ((v + 45.0) % 90.0) - 45.0
+
+    if yaw is not None:
+        roll = roll_for(yaw, x, y)
+    elif yaw_face is not None:
+        roll = roll_for_cube(yaw_face, x, y)
+    else:
+        roll = None
     print(f'물체({a.pose}) 추정: ({loc[0]:+.3f}, {loc[1]:+.3f}) '
           f'→ 오프셋 보정 ({x:+.3f}, {y:+.3f}) · 파지 z {z_grip:+.3f}')
-    print(f'   장축 yaw: {"%.1f°" % yaw if yaw is not None else "불명(원형/불일치)"}'
-          f' → 손목 롤 {"%.1f°" % roll if roll is not None else "0 (기본)"}')
+    ori = ('장축 %.1f°' % yaw if yaw is not None else
+           '면방향 %.1f°' % yaw_face if yaw_face is not None else '불명')
+    print(f'   방향: {ori} → 손목 롤 '
+          f'{"%.1f°" % roll if roll is not None else "0 (기본)"}')
 
     # 접근·상승 고도 적응 선택 + 프리플라이트 (이동 전)
     K = arm_lib.load_kinematics()
@@ -270,7 +329,7 @@ def main():
     if not (st['connected'] and st['calibrated'] and st['torque']):
         sys.exit('연결·캘리브·토크 ON 후 실행하세요 (팔이 접혀 있으면 unfold_safe 먼저)')
 
-    post('speed', pct=40)   # 극저속 계단 떨림 방지 — 자유공간 이동은 40%
+    post('speed', pct=80)   # 자유공간 이동 80% (2026-08-20 사용자: 2배 상향)
     print('① 접근 자세로 이동')
     move_and_wait(x, y, APPROACH_Z, roll=roll)
     print('② 그리퍼 개방')
@@ -293,11 +352,13 @@ def main():
         print(f'   ⚠ 재관측 보정 {1000*d2:.0f}mm — 큽니다. 하강을 지켜보세요')
     else:
         bail(f'재관측이 {1000*d2:.0f}mm 어긋남 — 물체가 움직였거나 오검출 (m49)')
-    if yaw is not None:
-        roll = roll_for(yaw, x, y)     # 재관측으로 pan 이 바뀌었을 수 있다
+    if yaw is not None:                # 재관측으로 pan 이 바뀌었을 수 있다
+        roll = roll_for(yaw, x, y)
+    elif yaw_face is not None:
+        roll = roll_for_cube(yaw_face, x, y)
     print('③ 하강 (2단 — 최종은 15% 저속)')
     move_and_wait(x, y, (APPROACH_Z + z_grip) / 2, roll=roll)
-    post('speed', pct=15)
+    post('speed', pct=30)   # 최종 하강 — 접촉 정밀 구간이라 절반 속도
     move_and_wait(x, y, z_grip, timeout=35.0, roll=roll)
     print('④ 파지')
     post('goto', joint='gripper', value=GRIP_CLOSE_ABS)
@@ -311,7 +372,7 @@ def main():
     # 계속 쥐어짜 수 분 뒤 펌웨어 과부하 보호(25%)가 떠서 열기가 거부된다
     # (실측 2026-08-20: RxPacketError Overload). 위치 유지 토크만으로 충분.
     post('goto', joint='gripper', value=round(g, 1))
-    post('speed', pct=40)
+    post('speed', pct=80)
     print(f'   그리퍼 {g:.1f} 에서 닫힘 완료 (0 근처면 헛집음)')
     print('⑤ 들어올리기')
     move_and_wait(x, y, LIFT_Z, roll=roll)

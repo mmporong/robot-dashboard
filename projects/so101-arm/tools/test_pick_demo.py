@@ -45,7 +45,7 @@ def synth_blob(x, y, yaw_deg, h_center=0.011, axis=True):
             'z_mm': 0, 'valid_px': 0, 'win_r': 5, 'fx': FX, 'fy': FY,
             'w': W, 'h': H, 'cam_xyz': None, 'registered': True,
             'swap_rb': True, 'color_stale': 0, 'color_error': None,
-            'elong': 3.0 if axis else 1.05, 'axis_deg': None}
+            'elong': 3.0 if axis else 1.05, 'axis_deg': None, 'hull': None}
     if axis:
         q = np.array(p) + 0.03 * np.array([math.cos(math.radians(yaw_deg)),
                                            math.sin(math.radians(yaw_deg)), 0])
@@ -55,13 +55,13 @@ def synth_blob(x, y, yaw_deg, h_center=0.011, axis=True):
     return blob
 
 
-def run_case(name, blob, expect_exit=None, expect_sub=''):
+def run_case(name, blob, expect_exit=None, expect_sub='', pose='lying'):
     arm = FakeArm((0.19, 0.0, 0.02), 50.0)      # 작업 자세·그리퍼 열림에서 시작
     arm.blob = blob
     srv = ThreadingHTTPServer(('127.0.0.1', 0), make_handler(arm))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     pd.BASE = f'http://127.0.0.1:{srv.server_address[1]}'
-    old, sys.argv = sys.argv, ['pick_demo.py', 'lying']
+    old, sys.argv = sys.argv, ['pick_demo.py', pose]
     code = None
     try:
         pd.main()
@@ -108,7 +108,24 @@ def main():
     assert rolls and all(abs(r - 4.3) < 5.0 for r in rolls), \
         f'방사 롤 기대 +4.3±5 ≠ {rolls}'
 
-    print('\n통과 — pick_demo 방향 파지 리허설 3사례')
+    print('④ 대각 큐브 (면 30° 회전) → 면 정렬 롤 (mod 90)')
+    psi = 30.0
+    c, s = math.cos(math.radians(psi)), math.sin(math.radians(psi))
+    corners = []
+    for dx, dy in ((1, 1), (1, -1), (-1, -1), (-1, 1)):
+        wx = px + (dx * 0.02) * c - (dy * 0.02) * s
+        wy = py + (dx * 0.02) * s + (dy * 0.02) * c
+        u, v = to_px((wx, wy, FLOOR + 0.04))
+        corners.append([int(round(u)), int(round(v))])
+    blob = synth_blob(px, py, 0, h_center=0.020, axis=False)
+    blob['hull'] = corners
+    arm = run_case('대각큐브', blob, pose='cube')
+    rolls = [r for r in ik_rolls(arm) if r is not None]
+    expect = ((psi - pan - pd.CLOSE_AXIS + 45) % 90) - 45
+    assert rolls and all(abs(r - expect) < 6 for r in rolls), \
+        f'대각 큐브 롤 기대 {expect:+.1f}±6 ≠ {rolls}'
+
+    print('\n통과 — pick_demo 방향 파지 리허설 4사례')
 
 
 if __name__ == '__main__':

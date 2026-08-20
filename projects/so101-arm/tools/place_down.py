@@ -125,7 +125,7 @@ def main():
         print('--dry: 검증 통과, 이동 없음')
         return
 
-    pd.post('speed', pct=15)
+    pd.post('speed', pct=30)
     print('① 하강 — 놓기 높이까지')
     if z0 > z_place + 0.02:
         pd.move_and_wait(x0, y0, (z0 + z_place) / 2)
@@ -145,11 +145,11 @@ def main():
                  f'휴지 하강을 하지 않습니다 (정지·토크 유지). 눈으로 확인하세요')
     print(f'   개방 확인 (그리퍼 {g_open:.1f})')
     print('③ 상승 → 회피 이동')
-    pd.post('speed', pct=20)
+    pd.post('speed', pct=40)
     pd.move_and_wait(x0, y0, lift_z)
     pd.move_and_wait(rx, ry, lift_z)
     print('④ 휴지 하강 (10% 저속)')
-    pd.post('speed', pct=10)
+    pd.post('speed', pct=20)
     pd.move_and_wait(rx, ry, floor + REST_HOVER, timeout=35.0)
     pd.post('stop')
     fx, fy, fz = tcp_of(pd.get('/state'))

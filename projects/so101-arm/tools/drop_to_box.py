@@ -62,10 +62,10 @@ def main():
     if a.dry:
         print('--dry: 검증 통과, 이동 없음')
         return
-    pd.post('speed', pct=40)   # 자유공간 운반 — 극저속 떨림 방지
+    pd.post('speed', pct=80)   # 자유공간 운반 (2배 상향)
     print('① 운반 — 통 위로')
     pd.move_and_wait(*BOX_XY, TRANSIT_Z, timeout=40.0)
-    pd.post('speed', pct=25)   # 통 안 여유 ±5cm — 정밀 불필요
+    pd.post('speed', pct=50)   # 테두리 위 방출 — 정밀 불필요
     print('② 하강')
     pd.move_and_wait(*BOX_XY, RELEASE_Z, timeout=35.0)
     print('③ 방출 (보호해제 선행)')
@@ -81,7 +81,7 @@ def main():
                  f'수동 확인 필요')
     print(f'   개방 확인 (그리퍼 {g2:.1f})')
     print('④ 복귀 상승')
-    pd.post('speed', pct=40)
+    pd.post('speed', pct=80)
     pd.move_and_wait(*BOX_XY, TRANSIT_Z, timeout=30.0)
     pd.post('stop')
     print('투하 완료 — 통 위 대기 (토크 유지)')
