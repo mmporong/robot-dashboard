@@ -50,26 +50,25 @@ OUT = HERE / 'handeye.json'
 # 범위는 실제 IK 도달성을 계산해 정했다(2026-08-19): z=+0.04 이상은 리치 밖이고,
 # z=+0.02 는 x≤0.22 에서만 풀린다.
 #
-# ✎ 아래층은 -0.03 — 책상면 실측 -0.078 (2026-08-19 저녁 확정) 기준 여유 48mm 로,
-# 죠에 물린 물체가 ~20mm 아래로 튀어나와도 28mm 가 남는다. 종전 -0.05 는 구
-# floor(-0.1037) 기준 설계라 새 floor 에서는 실여유가 8mm 로 접촉 사거리였다
-# (리뷰 M6-2). z 층 분산이 5cm 로 줄어드는 대신, 퇴화는 실행 시 최소 특이값
-# 출력으로 확인한다. preflight 가 바닥 여유(MIN_CLEAR)를 정적으로 검사한다.
+# ✎ 2026-08-20 재설계 — 표적은 고무 체스말(전체 7cm, **죠 아래 돌출 4cm** 실측).
+# 아래층 하한 = floor(-0.078) + 돌출(0.040) + 여유(0.025) = -0.013 → 아래층 -0.01.
+# 1차 순회의 -0.03 은 이 물체 기준 여유 8mm 라 끌림 위험이었다. z 폭이 3~4cm 로
+# 줄어드는 대신 x 를 0.15~0.26 으로 넓혀 조건수를 확보 — 13점 특이값
+# [0.163, 0.145, 0.048] (기준 0.02 의 2.4배, 오프라인 검증). 순서는 인접 관절
+# 변화 최소화(최근접 재배열, 최대 43.5° — 캐치업 대기가 흡수).
 POSES = [
-    (0.18, -0.06, -0.03), (0.18, 0.00, -0.03), (0.18, 0.06, -0.03),
-    (0.23, -0.06, -0.03), (0.23, 0.00, -0.03), (0.23, 0.06, -0.03),
-    (0.18, -0.05, -0.01), (0.18, 0.05, -0.01),
-    (0.23, -0.05, -0.01), (0.23, 0.05, -0.01),
-    (0.19, -0.03,  0.02), (0.19, 0.03,  0.02),
-    (0.21, 0.00,  0.02),
+    (0.18, -0.03,  0.02), (0.20, 0.00, -0.01), (0.18, 0.03,  0.02),
+    (0.16, 0.05, 0.005), (0.15, 0.07, -0.01),
+    (0.16, -0.05, 0.005), (0.15, -0.07, -0.01),
+    (0.21, 0.00,  0.03),
+    (0.24, -0.05, 0.005), (0.25, -0.05, -0.01),
+    (0.26, 0.00, -0.01), (0.25, 0.05, -0.01), (0.24, 0.05, 0.005),
 ]
 
-# 아래층과 책상면 사이에 요구하는 최소 여유 [m] — 물체 돌출(~0.02) + 바닥 불확실
-# (±0.002) + 자세 오차 여유. preflight 가 floor_z_m 실측값과 대조한다.
-# ✎ 현 구성(-0.03, floor -0.078)의 실여유는 48mm 로 **헤드룸이 3mm 뿐**이다 —
-# 바닥 재측정값이 -0.075 위로 나오면 여기서 막힌다. 그건 오류가 아니라 설계
-# 재검토 신호다(아래층을 -0.025 로 올리는 식으로). 리뷰 m32.
-MIN_CLEAR_M = 0.045
+# 아래층과 책상면 사이에 요구하는 최소 여유 [m] — **물체 돌출(0.040 실측)** +
+# 바닥 불확실(±0.002) + 자세 오차 여유. preflight 가 floor_z_m 실측값과 대조한다.
+# 다른 물체를 물리면 돌출량부터 자로 재서 이 값을 갱신할 것.
+MIN_CLEAR_M = 0.065
 
 
 def post(op, **kw):
@@ -141,31 +140,149 @@ def read_blob(tries=12, need=5):
     깊이 화소가 없으면 데몬이 창을 r=14~20 까지 넓혀 **주변(책상) 화소의
     중앙값**을 쓴다 — 그 값은 물체가 아니라 배경 깊이라, RMS 33mm 의 계통
     오차가 그대로 들어왔다. 창이 작고(r≤9) 물체 화소가 충분한(≥8) 프레임만
-    채택한다. 대부분 탈락하면 물체가 깊이 센서에 너무 작은 것 — 더 큰 물체로.
+    cam_xyz 로 채택한다.
+
+    ★ 방위각은 깊이와 무관하게 항상 모은다 — 고무 체스말처럼 구조광에 안
+    잡히는 물체도 픽셀 (u,v) 는 유효하다. 방위각 = ((u-cx)/fx, (v-cy)/fy).
+    깊이가 전멸해도 방위각+책상평면으로 정합을 풀 수 있다(solve_bearings_plane).
+
+    반환: (cam_xyz 중앙값|None, cam 프레임 수, 방위각 중앙값|None, 방위 프레임 수)
     """
-    pts = []
+    cams, brgs = [], []
     rejected = 0
     for _ in range(tries):
         r = get('/blob')
         b = r.get('blob')
+        if b and b.get('u') is not None and b.get('fx'):
+            brgs.append([(b['u'] - b['w'] / 2) / b['fx'],
+                         (b['v'] - b['h'] / 2) / b['fy']])
         if b and b.get('cam_xyz'):
             if b.get('win_r', 99) <= 9 and b.get('valid_px', 0) >= 8:
-                pts.append(b['cam_xyz'])
+                cams.append(b['cam_xyz'])
             else:
                 rejected += 1
         time.sleep(0.15)
-    if rejected and len(pts) < need:
-        print(f'    (깊이 품질 미달 {rejected}프레임 탈락 — 물체가 깊이 센서에 '
-              f'너무 작습니다. win_r≤9·valid_px≥8 요구)')
-    if len(pts) < need:
-        return None, len(pts)
-    a = np.array(pts)
-    med = np.median(a, axis=0)
-    # 중앙값에서 2cm 넘게 떨어진 관측은 버리고 다시 평균 낸다
-    keep = a[np.linalg.norm(a - med, axis=1) < 0.02]
-    if len(keep) < need:
-        return None, len(keep)
-    return keep.mean(axis=0), len(keep)
+    cam, n_cam = None, 0
+    if len(cams) >= need:
+        a = np.array(cams)
+        med = np.median(a, axis=0)
+        keep = a[np.linalg.norm(a - med, axis=1) < 0.02]   # 2cm 밖 관측 제거
+        if len(keep) >= need:
+            cam, n_cam = keep.mean(axis=0), len(keep)
+    elif rejected:
+        print(f'    (깊이 품질 미달 {rejected}프레임 — 방위각만 사용)')
+    brg, n_brg = None, 0
+    if len(brgs) >= need:
+        a = np.array(brgs)
+        med = np.median(a, axis=0)
+        keep = a[np.linalg.norm(a - med, axis=1) < 0.008]  # 8mrad 밖 관측 제거
+        if len(keep) >= need:
+            brg, n_brg = keep.mean(axis=0), len(keep)
+    return cam, n_cam, brg, n_brg
+
+
+def solve_bearings_plane(brg, rob):
+    """픽셀 방위각 + 뎁스 책상평면 결합 정합 — 물체 깊이를 쓰지 않는다.
+
+    왜 필요한가(2026-08-20): 고무 체스말은 구조광에 안 잡혀 cam_xyz 가 전멸하지만
+    픽셀 방위각은 2~3px 정확도로 멀쩡했다. 방위각만으로는 좁은 원뿔 PnP 모호성이
+    남으므로(카메라가 "지하"로 가는 해), 뎁스가 조밀하게 잡히는 **책상 평면**을
+    구속(법선=로봇 수직, 높이=floor_z_m)으로 넣어 모호한 축을 고정한다.
+
+    반환 (R, t, diag) — p_rob = R·p_cam + t. 실패 시 (None, None, 사유).
+    """
+    import cv2
+    import floor_from_depth as ffd
+    try:
+        floor = arm_lib.load_gain('floor_z_m')['floor_z_m']
+    except (SystemExit, Exception) as e:      # Ctrl-C 는 삼키지 않는다
+        return None, None, f'floor_z_m 불가({e})'
+    try:
+        Pd = ffd.fetch_points()
+        n_cam, d_cam, m_pl = ffd.ransac_plane(Pd)
+    except (SystemExit, Exception) as e:
+        return None, None, f'책상 평면 실패({e})'
+    # ★ 이 평면이 책상이라는 근거를 요구한다(리뷰 M9-1). tilt·plane_z 게이트는
+    # 최적화가 0 으로 미는 양이라 자기참조다 — 책이 쌓인 면·벽이 지배 평면이면
+    # 해 전체가 그 오프셋만큼 틀린 채 게이트를 통과한다.
+    frac = float(m_pl.mean())
+    if frac < ffd.MIN_INLIER_FRAC:
+        return None, None, (f'책상 평면 인라이어 {100*frac:.0f}% < '
+                            f'{100*ffd.MIN_INLIER_FRAC:.0f}% — 시야를 확인하세요')
+    if not (0.30 <= abs(d_cam) <= 1.20):
+        return None, None, (f'평면 수직거리 {abs(d_cam):.2f}m 가 비현실적 — '
+                            f'책상이 아닐 수 있습니다')
+    p0_cam = -d_cam * n_cam
+    B, O = np.asarray(brg, float), np.asarray(rob, float)
+    zguess = 0.65                              # 잔차 스케일용 명목 거리
+
+    def unpack(x):
+        Rc, _ = cv2.Rodrigues(np.ascontiguousarray(x[:3]))
+        return Rc, x[3:6]
+
+    def residuals(x):
+        Rc, tc = unpack(x)
+        pc = O @ Rc.T + tc
+        if (pc[:, 2] <= 0.05).any():           # 카메라 뒤로 가는 해 배제
+            return np.full(2 * len(O) + 4, 1e3)
+        r_b = ((pc[:, :2] / pc[:, 2:3]) - B).ravel() / 0.005
+        R = Rc.T
+        n_rob = R @ n_cam
+        s = 1.0 if n_rob[2] >= 0 else -1.0
+        r_n = (s * n_rob - np.array([0, 0, 1]))[:2] / 0.02
+        p0_rob = R @ (p0_cam - tc)
+        r_h = np.array([(p0_rob[2] - floor) / 0.005])
+        r_d = np.array([(pc[:, 2].mean() - zguess) / 0.30])   # 약한 거리 정칙화
+        return np.concatenate([r_b, r_n, r_h, r_d])
+
+    def lm(x0, iters=500):
+        x = x0.copy(); lam = 1e-3
+        r = residuals(x); cost = float(r @ r)
+        for _ in range(iters):
+            J = np.empty((len(r), len(x)))
+            for j in range(len(x)):
+                dx = np.zeros(len(x)); dx[j] = 1e-6
+                J[:, j] = (residuals(x + dx) - r) / 1e-6
+            step = np.linalg.solve(J.T @ J + lam * np.eye(len(x)), -J.T @ r)
+            r2 = residuals(x + step); c2 = float(r2 @ r2)
+            if c2 < cost:
+                x, r, cost = x + step, r2, c2
+                lam = max(lam * 0.5, 1e-9)
+                if np.linalg.norm(step) < 1e-11:
+                    break
+            else:
+                lam *= 4
+                if lam > 1e9:
+                    break
+        return x, cost
+
+    ok, rvec, tvec = cv2.solvePnP(O, B.reshape(-1, 1, 2), np.eye(3), None,
+                                  flags=cv2.SOLVEPNP_SQPNP)
+    if not ok:
+        return None, None, 'PnP 초기해 실패'
+    x, _cost = lm(np.concatenate([rvec.ravel(), tvec.ravel()]))
+    Rc, tc = unpack(x)
+    R = Rc.T
+    t = -Rc.T @ tc
+    pc = O @ Rc.T + tc
+    res_b = np.linalg.norm((pc[:, :2] / pc[:, 2:3]) - B, axis=1)
+    n_rob = R @ n_cam
+    n_rob = n_rob * (1 if n_rob[2] >= 0 else -1)
+    tilt = float(np.degrees(np.arccos(min(1.0, n_rob[2]))))
+    plane_z = float((R @ (p0_cam - tc))[2])
+    # 자기참조가 아닌 독립 검증(리뷰 M9-1): 평면 인라이어를 이 해로 로봇 좌표에
+    # 옮겼을 때 물리적으로 타당한 작업면 범위에 있어야 한다. 벽·엉뚱한 면이면
+    # x·y 가 흩어진다. (깊이 없는 물체에서는 교차 대조가 없어 이것이 유일한
+    # 독립 근거다.)
+    rob_pl = Pd[m_pl] @ R.T + t
+    in_work = float(((rob_pl[:, 0] > -0.05) & (rob_pl[:, 0] < 0.80)
+                     & (np.abs(rob_pl[:, 1]) < 0.60)).mean())
+    diag = {'bearing_med_mrad': float(np.median(res_b) * 1000),
+            'bearing_max_mrad': float(res_b.max() * 1000),
+            'desk_tilt_deg': tilt, 'plane_z_m': plane_z, 'floor_m': floor,
+            'plane_inlier_frac': frac, 'plane_dist_m': float(abs(d_cam)),
+            'plane_in_work_frac': in_work}
+    return R, t, diag
 
 
 def kabsch(P, Q):
@@ -250,8 +367,11 @@ def main():
         sys.exit('연결·캘리브레이션이 먼저 필요합니다')
 
     if a.dry:
-        p, n = read_blob()
-        print(f'관측 {n} 프레임 · 카메라 좌표 {None if p is None else np.round(p, 4)}')
+        cam_p, n_cam, brg, n_brg = read_blob()
+        print(f'관측 — 방위 {n_brg}프레임 '
+              f'{None if brg is None else np.round(brg, 4)} · '
+              f'깊이 {n_cam}프레임 '
+              f'{None if cam_p is None else np.round(cam_p, 4)}')
         return
 
     if not st['torque']:
@@ -273,9 +393,11 @@ def main():
     kin = arm_lib.load_kinematics()
     mapping = arm_lib.load_mapping()
     preflight(kin, mapping)             # 실물을 움직이기 전에 전 지점 정적 검증
-    cam_pts, rob_pts, log = [], [], []
+    cam_pts, rob_cam = [], []     # 깊이 품질 통과 관측 (Kabsch 용)
+    brg_pts, rob_brg = [], []     # 픽셀 방위각 (방위각+평면 솔버 용 — 항상 수집)
+    log = []
     stalls = 0                    # 연속 도달 실패 횟수 — 쌓이면 중단한다
-    prev_pair = None              # 파지 이탈 검출용 (직전 로봇·카메라 좌표)
+    prev_pair = None              # 파지 이탈 검출용 (직전 로봇·방위각)
     loose = 0
     for i, (x, y, z) in enumerate(POSES, 1):
         r = post('ik', x=x, y=y, z=z, pitch=-90)
@@ -310,61 +432,127 @@ def main():
         stalls = 0
         time.sleep(a.settle)                # 진동 가라앉힘
         rob = fk_of(pos, kin, mapping)      # **실제** 도달 위치
-        p, n = read_blob()
+        cam_p, n_cam, brg, n_brg = read_blob()
         err = max(abs(c - t) for c, t in zip(rob, (x, y, z)))
-        if p is None:
+        if brg is None:
             # ★ 관측 실패는 이동 실패가 아니다 — stop 을 보내지 않는다(감사 M1).
-            # stop 은 ①위치 재전송으로 펌웨어 보호 플래그를 풀고 ②(수정 전에는)
-            # 그리퍼 예압을 지웠으며 ③속도를 8 로 내려 다음 이동을 오탐 킬로
-            # 몰았다(C1). 팔은 도달 자세를 목표=도달점으로 유지 중이라 안전하다.
-            print(f'[{i:2d}/{len(POSES)}] ({x:+.3f},{y:+.3f},{z:+.3f}) 관측 실패 (유효 {n})')
+            # 팔은 도달 자세를 목표=도달점으로 유지 중이라 안전하다.
+            print(f'[{i:2d}/{len(POSES)}] ({x:+.3f},{y:+.3f},{z:+.3f}) 관측 실패 '
+                  f'(방위 {n_brg}·깊이 {n_cam}프레임)')
             continue
         if err > 0.02:
             print(f'[{i:2d}/{len(POSES)}] 목표와 {1000*err:.0f}mm 어긋나 건너뜀 '
                   f'(도달 {rob})')
             continue
         # ★ 파지 이탈 검출 — 물체가 죠에서 빠지면 책상 위 빨간 블롭은 계속
-        # 보이므로 read_blob 은 성공한다. 그러면 13점이 조용히 오염된다(감사 M8).
-        # 로봇이 수 cm 움직였는데 카메라 좌표가 안 따라오면 물체가 팔에 없는 것.
+        # 보이므로 관측은 성공한다. 그러면 13점이 조용히 오염된다(감사 M8).
+        # 방위각으로 판정한다(깊이 무관): 카메라 이동 근사 = |Δ방위| × 0.65m.
         if prev_pair is not None:
             drob = float(np.linalg.norm(np.array(rob) - np.array(prev_pair[0])))
-            dcam = float(np.linalg.norm(np.array(p) - np.array(prev_pair[1])))
+            dcam = float(np.linalg.norm(np.array(brg) - np.array(prev_pair[1]))) * 0.65
             if drob > 0.02 and dcam < 0.3 * drob:
                 loose += 1
                 if loose >= 2:
                     sys.exit(f'[{i:2d}/{len(POSES)}] 물체 이탈 의심 — 로봇 이동 '
-                             f'{1000*drob:.0f}mm 에 카메라 이동 {1000*dcam:.0f}mm '
-                             f'(2회 연속). 물체를 다시 물리고 재시작하세요.')
+                             f'{1000*drob:.0f}mm 에 카메라 시선 이동 {1000*dcam:.0f}mm '
+                             f'상당 (2회 연속). 물체를 다시 물리고 재시작하세요.')
             else:
                 loose = 0
-        prev_pair = (rob, list(p))
-        cam_pts.append(p)
-        rob_pts.append(rob)
+        prev_pair = (rob, list(brg))
+        brg_pts.append(list(brg))
+        rob_brg.append(rob)
+        if cam_p is not None:
+            cam_pts.append(cam_p)
+            rob_cam.append(rob)
         log.append({'target': [x, y, z], 'reached': rob,
-                    'cam': [round(v, 4) for v in p], 'frames': n})
+                    'cam': [round(v, 4) for v in cam_p] if cam_p is not None else None,
+                    'brg': [round(v, 5) for v in brg],
+                    'frames': n_cam, 'brg_frames': n_brg})
+        camtxt = (f'카메라 ({cam_p[0]:+.3f},{cam_p[1]:+.3f},{cam_p[2]:+.3f})'
+                  if cam_p is not None else '깊이 없음(방위만)')
         print(f'[{i:2d}/{len(POSES)}] 로봇 ({rob[0]:+.3f},{rob[1]:+.3f},{rob[2]:+.3f}) '
-              f'↔ 카메라 ({p[0]:+.3f},{p[1]:+.3f},{p[2]:+.3f})  [{n}프레임, 오차 {1000*err:.0f}mm]')
+              f'↔ {camtxt}  [방위 {n_brg}f, 오차 {1000*err:.0f}mm]')
 
-    if len(cam_pts) < 6:
-        sys.exit(f'대응쌍이 {len(cam_pts)}개뿐입니다 — 최소 6개가 필요합니다')
+    if len(brg_pts) < 6:
+        sys.exit(f'대응쌍(방위)이 {len(brg_pts)}개뿐입니다 — 최소 6개가 필요합니다')
 
-    P, Q = np.array(cam_pts), np.array(rob_pts)
-    R, t, rms = kabsch(P, Q)
-    # 점들이 한 평면에 몰렸는지 — 가장 작은 특이값이 회전을 정하는 힘이다
-    sv = np.linalg.svd(P - P.mean(0), compute_uv=False)
-    print(f'\n대응쌍 {len(P)}개 · RMS 잔차 {1000*rms:.1f} mm')
-    print(f'점 분포 특이값 {np.round(sv, 4)}  (막내가 0.02 미만이면 평면 퇴화 위험)')
+    # ── 솔버 1: Kabsch (깊이 품질을 통과한 관측이 충분할 때) ────────────────
+    kab = None
+    if len(cam_pts) >= 6:
+        P, Q = np.array(cam_pts), np.array(rob_cam)
+        Rk, tk, rms = kabsch(P, Q)
+        sv = np.linalg.svd(P - P.mean(0), compute_uv=False)
+        print(f'\n[Kabsch] 대응쌍 {len(P)} · RMS {1000*rms:.1f}mm · '
+              f'최소 특이값 {sv[-1]:.4f}')
+        # 게이트(감사 m30): 퇴화·고잔차 결과는 채택하지 않는다
+        if sv[-1] >= 0.02 and rms < 0.008:
+            kab = (Rk, tk, rms, sv)
+        else:
+            print('  → 게이트 미달 (특이값<0.02 또는 RMS≥8mm) — 채택 안 함')
+    else:
+        print(f'\n[Kabsch] 깊이 품질 통과 관측 {len(cam_pts)}개 — 생략 '
+              f'(고무 등 구조광에 안 잡히는 물체면 정상)')
+
+    # ── 솔버 2: 방위각 + 책상평면 (항상) ────────────────────────────────────
+    Rb, tb, diag = solve_bearings_plane(brg_pts, rob_brg)
+    bp = None
+    if Rb is None:
+        print(f'[방위+평면] 실패: {diag}')
+    else:
+        print(f'[방위+평면] 방위 잔차 중앙값 {diag["bearing_med_mrad"]:.2f}'
+              f'(최대 {diag["bearing_max_mrad"]:.1f})mrad · '
+              f'책상 기울기 {diag["desk_tilt_deg"]:.2f}° · '
+              f'평면 z {diag["plane_z_m"]:+.4f} (floor {diag["floor_m"]}) · '
+              f'인라이어 {100*diag["plane_inlier_frac"]:.0f}% · '
+              f'작업면 안 {100*diag["plane_in_work_frac"]:.0f}%')
+        if (diag['bearing_med_mrad'] < 8 and diag['bearing_max_mrad'] < 20
+                and diag['desk_tilt_deg'] < 5
+                and abs(diag['plane_z_m'] - diag['floor_m']) < 0.012
+                and diag['plane_in_work_frac'] >= 0.6):
+            bp = (Rb, tb, diag)
+        else:
+            print('  → 게이트 미달 — 채택 안 함')
+
+    # ── 상호 대조 및 채택 ───────────────────────────────────────────────────
+    if kab and bp:
+        dR = kab[0] @ bp[0].T
+        ang = math.degrees(math.acos(max(-1, min(1, (np.trace(dR) - 1) / 2))))
+        dt = float(np.linalg.norm(kab[1] - bp[1])) * 1000
+        print(f'[교차] 두 솔버 회전 차 {ang:.2f}° · 이동 차 {dt:.1f}mm '
+              + ('→ 일치 (강한 근거)' if ang < 3 and dt < 15 else '→ ⚠ 불일치'))
+        if ang >= 3 or dt >= 15:
+            sys.exit('두 솔버가 불일치합니다 — 결과를 저장하지 않습니다. '
+                     '표적·시야(다른 빨간 물체)·미러 설정을 확인하세요.')
+    chosen = kab or bp
+    if chosen is None:
+        sys.exit('어느 솔버도 게이트를 통과하지 못했습니다 — 저장하지 않습니다.')
+    if kab:
+        R, t, rms = kab[0], kab[1], kab[2]
+        method = 'kabsch' + ('+bearings_plane_crosscheck' if bp else '')
+    else:
+        R, t, rms = bp[0], bp[1], None
+        method = 'bearings+desk_plane'
+    print(f'\n채택: {method}')
+    print(f'카메라 위치(로봇 좌표) = ({t[0]:+.3f}, {t[1]:+.3f}, {t[2]:+.3f}) m '
+          f'— 실물 배치와 대조할 것')
     print('R =\n', np.round(R, 4))
     print('t =', np.round(t, 4))
 
+    svd_all = np.linalg.svd(np.array(rob_brg) - np.array(rob_brg).mean(0),
+                            compute_uv=False)
     OUT.write_text(json.dumps({
-        'R': R.tolist(), 't': t.tolist(), 'rms_m': rms, 'n': len(P),
-        'singular_values': sv.tolist(), 'samples': log,
-        'note': ('2026-08-18 뎁스캠↔로봇 정합. 죠에 빨간 물체를 물린 채 여러 지점으로 '
-                 '이동하며 (IK 목표, 카메라 관측) 쌍을 모아 Kabsch 로 풀었다. '
-                 'p_rob = R·p_cam + t. 물체가 죠에서 차지하는 상대 위치는 상수라 t 에 '
-                 '흡수돼 있어, 이 변환은 곧 "카메라가 본 물체 → 그것을 물 TCP 목표"다. '
-                 '카메라나 베이스를 움직이면 다시 잴 것.'),
+        'R': R.tolist(), 't': t.tolist(),
+        'rms_m': rms, 'n': len(brg_pts), 'n_depth': len(cam_pts),
+        'method': method,
+        'bearings_plane_diag': bp[2] if bp else None,
+        'camera_pos_robot': t.tolist(),
+        'singular_values': svd_all.tolist(), 'samples': log,
+        'note': ('뎁스캠↔로봇 정합. 죠에 빨간 물체를 물린 채 여러 지점으로 이동하며 '
+                 '(픽셀 방위각, 필요 시 깊이) 을 모아 풀었다. p_rob = R·p_cam + t. '
+                 '물체의 죠 내 상대 위치는 t 에 흡수된다(죠 방향이 일정할 때). '
+                 'Kabsch 는 깊이 품질 통과 관측이 6개 이상일 때, 방위각+책상평면은 '
+                 '항상 계산해 상호 대조한다. 카메라·베이스·책상을 움직이거나 '
+                 '재캘리브레이션하면 다시 잴 것. 미러 해제(2026-08-20) 이후 규약.'),
     }, ensure_ascii=False, indent=2))
     print(f'\n저장: {OUT}')
     post('stop')                  # 끝났으면 남은 목표를 지운다

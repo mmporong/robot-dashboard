@@ -56,5 +56,9 @@
   "stale_after_recalib": {
     "cam_up_roll_deg": "2026-08-19 재캘리브레이션으로 wrist_roll 중립이 바뀌어 -180 무효 — 지금은 캠-위가 roll 0 근처다. 재측정 필요",
     "note": "2026-08-19 wrist_roll(ID 5)·gripper(ID 6) 교체 후 전 관절 재캘리브레이션. 소비자 스크립트는 arm_lib.load_gain(필수키) 로 로드해 stale 키면 스스로 멈춘다."
+  },
+  "stale_after_unmirror": {
+    "x_to_px": "2026-08-20 Astra 좌우 미러 해제(astra.py)로 픽셀 유래 상수 무효(부호 반전) — 재측정 필요. 현재 읽는 소비자 없음",
+    "note": "미러 해제 이전에 잰 픽셀 상수는 좌우가 뒤집혀 있다. y_to_px·baseline_px_306 은 stale_after_cam_move 로 이미 차단돼 있으나 미러도 추가 사유다."
   }
 }

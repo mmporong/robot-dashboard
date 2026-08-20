@@ -287,18 +287,21 @@ class Capture:
                 nz, used_r = cand, r
         if z_mm == 0 and nz.size:
             z_mm = int(np.median(nz))
+        fx = (w / 2) / math.tan(cam.hfov / 2)
+        fy = (h / 2) / math.tan(cam.vfov / 2)
         if z_mm:
             z = z_mm / 1000.0
-            fx = (w / 2) / math.tan(cam.hfov / 2)
-            fy = (h / 2) / math.tan(cam.vfov / 2)
             pt = ((u - w / 2) * z / fx, (v - h / 2) * z / fy, z)
         else:
             pt = None
         if pt is not None and not (self.Z_RANGE[0] <= pt[2] <= self.Z_RANGE[1]):
             pt = None                       # 작업 영역 밖 — 좌표는 버리고 화소만 남긴다
         with self.lock:
+            # fx·fy·w·h 도 싣는다 — 깊이가 안 잡히는 물체(고무 등)라도 픽셀
+            # 방위각((u-cx)/fx)은 유효해서, handeye 가 방위각+책상평면으로 푼다.
             self.blob = {'u': round(u, 1), 'v': round(v, 1), 'area': area,
                          'z_mm': z_mm, 'valid_px': int(nz.size), 'win_r': used_r,
+                         'fx': round(fx, 2), 'fy': round(fy, 2), 'w': w, 'h': h,
                          'cam_xyz': [round(c, 4) for c in pt] if pt else None,
                          'registered': bool(getattr(cam, 'registered', False)),
                          'swap_rb': bool(self.swap_rb),
