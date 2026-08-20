@@ -23,6 +23,28 @@ cd ~/so101_tools/sim
 ... sim_view.py --deg "..." --piece-at "0.19,0.02" --snapshot out.png
 ```
 
+## 표시 규약 (2026-08-20 확정)
+- **wrist_roll 표시 오프셋 180°**: 실물 그리퍼는 URDF 대비 롤이 180° 돌아
+  조립돼 있다(움직이는 턱이 실물은 아래). 캘리브 오프셋이 이를 흡수해 TCP
+  위치 적합에는 안 드러난다 — `ROLL_OFFSET_RAD`로 보정.
+- **파지 동기화**: 그리퍼 < 25(GRIP_HOLD_DEG)면 물체를 문 것으로 보고
+  체스말을 `graspframe`에 부착(팬 축 기준 방사 방향). 방출 순간에는 그 자리
+  수직 아래(바닥 높이)로 떨어뜨린다.
+- **투하 박스**: 실물 ~13cm 정육면체, 방출 지점 패널 (0.042, −0.142).
+  `dropbox` mocap 몸체 — 위치가 바뀌면 XML 기본값을 갱신할 것.
+
+## 녹화
+```bash
+# 시뮬 무화면 녹화 (10fps PNG 프레임 → ffmpeg 인코딩)
+~/miniforge3/envs/rlwalk/bin/python ~/so101_tools/sim/sim_view.py --record <디렉터리> --seconds 80
+ffmpeg -framerate 10 -i <디렉터리>/f%05d.png -c:v libx264 -pix_fmt yuv420p out.mp4
+# 실물 캠 녹화 (패널 서버 MJPEG)
+ffmpeg -f mpjpeg -i http://127.0.0.1:8765/cam -t 80 -c:v libx264 -pix_fmt yuv420p wrist.mp4   # 손목캠
+ffmpeg -f mpjpeg -i http://127.0.0.1:8765/rgb -t 80 -c:v libx264 -pix_fmt yuv420p rgb.mp4     # 뎁스캠 컬러
+```
+※ `-t`는 미디어 시간 기준이라 벽시계보다 오래 돌 수 있다 — 넉넉히 걸고
+SIGINT 로 마감해도 된다. 산출물은 `~/so101_tools/media/<날짜>/`.
+
 ## 새 기기 세팅
 메시는 강의 자료를 심링크로 쓴다 (리포에는 미포함):
 ```bash
