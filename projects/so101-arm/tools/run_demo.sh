@@ -61,11 +61,11 @@ echo "연결·물체 검출 OK"
 
 say "녹화 시작 — 손목캠·정면RGB·뎁스·화면(웹패널+뮤조코)·시뮬렌더·관절각CSV"
 FR="-movflags +frag_keyframe+empty_moov"      # 중단돼도 mp4 유효
-ffmpeg -y -loglevel error -f mpjpeg -i "$API/cam" -t 900 \
+ffmpeg -y -loglevel error -f mpjpeg -use_wallclock_as_timestamps 1 -i "$API/cam" -t 900 \
        -c:v libx264 -pix_fmt yuv420p $FR "$OUT/demo_${TS}_wrist.mp4" & PIDS+=($!)
-ffmpeg -y -loglevel error -f mpjpeg -i "$API/rgb" -t 900 \
+ffmpeg -y -loglevel error -f mpjpeg -use_wallclock_as_timestamps 1 -i "$API/rgb" -t 900 \
        -c:v libx264 -pix_fmt yuv420p $FR "$OUT/demo_${TS}_rgb.mp4" & PIDS+=($!)
-ffmpeg -y -loglevel error -f mpjpeg -i "$API/depth" -t 900 \
+ffmpeg -y -loglevel error -f mpjpeg -use_wallclock_as_timestamps 1 -i "$API/depth" -t 900 \
        -c:v libx264 -pix_fmt yuv420p $FR "$OUT/demo_${TS}_depth.mp4" & PIDS+=($!)
 DISP="${DISPLAY:-:1}"
 SIZE=$(xdpyinfo -display "$DISP" 2>/dev/null | awk '/dimensions/{print $2}')
