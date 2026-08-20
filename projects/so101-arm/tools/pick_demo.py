@@ -208,8 +208,11 @@ def main():
 
     # 방향 파지 (2026-08-20): 물체 장축 yaw 를 구해 죠 닫힘축이 직교하도록
     # 손목 롤을 푼다. 축이 안 잡히면(원형 블롭·표본 불일치) 종전대로 롤 없음.
+    # ★ lying(누운 체스말)에만 적용 — 큐브는 원근(윗면+옆면 합성)이 가짜
+    #   장축을 만들고(실측 elong 1.5·축 -67°), 대각 파지(5.7cm)는 위험하다.
+    #   큐브는 면이 팔 쪽을 대강 향하게 놓으면 기본 롤 면 파지로 충분.
     yaw = (piece_yaw(brg, axis_img, fxy, R, t, floor, h_center)
-           if axis_img is not None else None)
+           if axis_img is not None and a.pose == 'lying' else None)
 
     def roll_for(yaw_deg, tx, ty):
         v = yaw_deg + 90.0 - math.degrees(math.atan2(ty, tx)) - CLOSE_AXIS
