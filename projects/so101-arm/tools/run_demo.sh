@@ -9,6 +9,7 @@
 # 사용: bash ~/so101_tools/run_demo.sh
 # 중단: Ctrl-C → 팔 정지(토크 유지) 후 녹화 마감까지 하고 종료
 set -u
+POSE="${1:-cube}"            # cube(기본, 4×4cm 빨간 큐브) | lying | standing (체스말)
 TOOLS="$HOME/so101_tools"
 OUT="$TOOLS/media/$(date +%Y-%m-%d)"
 TS="$(date +%H%M%S)"
@@ -76,7 +77,7 @@ if [ -n "$SIZE" ]; then
 else
     echo "⚠ 화면 캡처 생략 — DISPLAY($DISP) 조회 실패"
 fi
-( cd "$TOOLS/sim" && exec "$SIMPY" -u sim_view.py \
+( cd "$TOOLS/sim" && exec "$SIMPY" -u sim_view.py --piece "$POSE" \
       --record "$OUT/demo_${TS}_simframes" --seconds 900 ) \
       > "$OUT/demo_${TS}_simrec.log" 2>&1 & PIDS+=($!)
 python3 "$TOOLS/log_state.py" "$OUT/demo_${TS}_state.csv" 900 & PIDS+=($!)
@@ -93,7 +94,7 @@ run_stage "토크 ON" curl -sf -m 15 -X POST "$API/cmd" \
     -H 'Content-Type: application/json' -d '{"op":"torque","on":true}' -o /dev/null \
 && sleep 2 \
 && run_stage "펴기 (unfold_safe)" timeout 420 python3 "$TOOLS/unfold_safe.py" \
-&& run_stage "파지 (pick_demo lying)" timeout 420 python3 "$TOOLS/pick_demo.py" lying \
+&& run_stage "파지 (pick_demo $POSE)" timeout 420 python3 "$TOOLS/pick_demo.py" "$POSE" \
 && run_stage "운반·투하 (drop_to_box)" timeout 240 python3 "$TOOLS/drop_to_box.py" \
 && run_stage "파킹 (park)" timeout 420 python3 "$TOOLS/park.py"
 

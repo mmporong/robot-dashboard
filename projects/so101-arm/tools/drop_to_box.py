@@ -23,8 +23,11 @@ import arm_lib
 import pick_demo as pd
 
 BOX_XY = (0.042, -0.142)     # 통 중심(패널) — 통을 옮기면 여기와 sim XML 갱신
-TRANSIT_Z = 0.030            # 운반·복귀 고도 (테두리 +약 28mm)
-RELEASE_Z = -0.024           # 방출 고도 (통 바닥 +약 54mm)
+# 통 교체 (2026-08-20 저녁): 검은 개방형 상자 8×8cm × 높이 6.5cm.
+# 입구 8cm 는 죠(파지폭+손가락 ≈6cm)가 못 들어간다 — **테두리 위에서 방출**.
+# 테두리 = floor + 0.065 = 패널 z -0.013.
+TRANSIT_Z = 0.030            # 운반·복귀 고도 (테두리 +43mm)
+RELEASE_Z = -0.005           # 방출 고도 — 테두리 +8mm (물체 낙하 ~5cm)
 
 K = arm_lib.load_kinematics()
 MP = arm_lib.load_mapping()

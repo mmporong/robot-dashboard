@@ -76,7 +76,8 @@ def main():
     ap.add_argument('--fps', type=float, default=10.0, help='--record 프레임률')
     ap.add_argument('--seconds', type=float, default=90.0, help='--record 길이')
     ap.add_argument('--cam', default='', help='스냅샷/녹화 카메라명 (기본 자유 시점)')
-    ap.add_argument('--piece', choices=['lying', 'standing'], default='lying')
+    ap.add_argument('--piece', choices=['cube', 'lying', 'standing'],
+                    default='cube')
     ap.add_argument('--piece-at', help='물체 패널 좌표 "x,y" 수동 지정')
     ap.add_argument('--hz', type=float, default=10.0)
     a = ap.parse_args()
@@ -91,7 +92,11 @@ def main():
     jadr = {j: model.jnt_qposadr[mujoco.mj_name2id(
         model, mujoco.mjtObj.mjOBJ_JOINT, j)] for j in JN + ['gripper']}
     mocap_id = {n: model.body(n).mocapid[0]
-                for n in ('desk', 'piece', 'dropbox')}
+                for n in ('desk', 'piece', 'piece_cyl', 'dropbox')}
+    # 활성 프록시: cube → 'piece'(큐브), lying/standing → 'piece_cyl'(체스말).
+    # 비활성 쪽은 XML 기본 위치(지면 아래)에 그대로 둔다.
+    PIECE = 'piece' if a.piece == 'cube' else 'piece_cyl'
+    PIECE_H = {'cube': 0.02, 'lying': 0.011, 'standing': 0.035}[a.piece]
     holding = {'v': False}          # 물기 상태 추적 — 방출 시 낙하 표현용
 
     # 책상: 상면을 실측 floor 높이에 (박스 반높이 0.03 만큼 내려 배치)
@@ -99,10 +104,9 @@ def main():
     data.mocap_pos[mocap_id['desk']] = desk_c - np.array([0, 0, 0.03])
 
     def set_piece(xy):
-        h = 0.011 if a.piece == 'lying' else 0.035
-        data.mocap_pos[mocap_id['piece']] = panel_to_sim(
-            (xy[0], xy[1], floor + h), R, t)
-        data.mocap_quat[mocap_id['piece']] = (
+        data.mocap_pos[mocap_id[PIECE]] = panel_to_sim(
+            (xy[0], xy[1], floor + PIECE_H), R, t)
+        data.mocap_quat[mocap_id[PIECE]] = (
             LYING_QUAT if a.piece == 'lying' else (1, 0, 0, 0))
 
     def set_pose_deg(deg):
@@ -128,15 +132,15 @@ def main():
         if holding['v'] and not now_closed and not a.piece_at:
             # 방출 순간 — 물체를 그 자리 수직 아래(바닥/박스 바닥)로 떨어뜨린다.
             # 뎁스캠이 박스 안을 못 보므로 blob 갱신은 기대할 수 없다.
-            p = data.mocap_pos[mocap_id['piece']].copy()
-            drop_z = panel_to_sim((0.0, 0.0, floor + 0.011), R, t)[2]
-            data.mocap_pos[mocap_id['piece']] = (p[0], p[1], drop_z)
+            p = data.mocap_pos[mocap_id[PIECE]].copy()
+            drop_z = panel_to_sim((0.0, 0.0, floor + PIECE_H), R, t)[2]
+            data.mocap_pos[mocap_id[PIECE]] = (p[0], p[1], drop_z)
             holding['v'] = False
         elif (not holding['v'] and now_closed and prev_g is not None
               and prev_g >= GRIP_HOLD_DEG and not a.piece_at):
             gsite = data.site('graspframe').xpos
             d = float(np.linalg.norm(
-                np.array(data.mocap_pos[mocap_id['piece']]) - gsite))
+                np.array(data.mocap_pos[mocap_id[PIECE]]) - gsite))
             holding['v'] = d < 0.07
         if holding['v'] and not a.piece_at:
             g = data.site('graspframe').xpos
@@ -148,10 +152,12 @@ def main():
             ux, uy = dx / n, dy / n
             half = math.sqrt(0.5)
             # 원기둥 z축을 수평 (ux,uy,0) 으로 돌리는 quat: z→dir 회전축 = z×dir
-            data.mocap_pos[mocap_id['piece']] = (
-                g[0] + ux * 0.02, g[1] + uy * 0.02, g[2])
-            data.mocap_quat[mocap_id['piece']] = (
-                half, -uy * half, ux * half, 0.0)
+            off = 0.02 if a.piece != 'cube' else 0.0   # 큐브는 죠 중심에
+            data.mocap_pos[mocap_id[PIECE]] = (
+                g[0] + ux * off, g[1] + uy * off, g[2])
+            data.mocap_quat[mocap_id[PIECE]] = (
+                (half, -uy * half, ux * half, 0.0) if a.piece != 'cube'
+                else (1.0, 0.0, 0.0, 0.0))
             mujoco.mj_forward(model, data)
 
     he_R = he_t = None
@@ -213,8 +219,7 @@ def main():
                 if (he_R is not None and not a.piece_at
                         and st['pos'].get('gripper', 0) >= 25
                         and n % int(a.fps) == 0):   # 열림 상태면 물체는 뎁스캠 위치
-                    xy = read_blob_xy(he_R, he_t, floor,
-                                      0.011 if a.piece == 'lying' else 0.035)
+                    xy = read_blob_xy(he_R, he_t, floor, PIECE_H)
                     if xy:
                         set_piece(xy)
             except Exception:
@@ -245,8 +250,7 @@ def main():
                 if (he_R is not None and not a.piece_at
                         and n % int(a.hz) == 0):  # 물체는 1Hz 갱신
                     try:
-                        xy = read_blob_xy(he_R, he_t, floor,
-                                          0.011 if a.piece == 'lying' else 0.035)
+                        xy = read_blob_xy(he_R, he_t, floor, PIECE_H)
                         if xy:
                             set_piece(xy)
                     except Exception:

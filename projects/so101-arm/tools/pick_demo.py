@@ -33,7 +33,12 @@ POSE = {                    # (블롭 중심 높이, 파지 TCP 높이) — floo
     'lying':    (0.011, 0.008),   # 죠 끝이 몸통 중심선(11mm) **아래**로 내려가야
                                   # 물체가 입 안에 들어온다 — 16mm 는 바깥턱에
                                   # 닿았다(실물 1차 실패). 최종 하강은 15% 저속
+    'cube':     (0.020, 0.010),   # 4×4cm 큐브(2026-08-20 전환): 중심 2cm,
+                                  # 죠 끝 floor+10mm — 패드가 몸통 중하부를 문다
 }
+GRIP_OPEN = {'standing': 55, 'lying': 55,
+             'cube': 80}     # 4cm 폭은 55 개방이 부족 — 80 으로 벌린다
+                             # (99 는 아랫턱 180° 젖힘 실측 — 그 아래로 유지)
 APPROACH_CAND = (0.02, 0.005, -0.01)   # 접근 고도 후보 — 원거리 x 는 높은 z 가
 LIFT_CAND = (0.03, 0.015, 0.0)         # 안 풀린다(리치). IK 되는 첫 값을 쓴다
 GRIP_OPEN_ABS = 55          # 절대 개방각 — delta 방식은 이미 열린 상태에서 이중
@@ -269,7 +274,7 @@ def main():
     g_now = get('/state')['pos'].get('gripper', 50)
     post('goto', joint='gripper', value=round(g_now, 1))  # 위치 재전송 = 과부하 보호 해제
     time.sleep(1.0)
-    post('goto', joint='gripper', value=GRIP_OPEN_ABS)
+    post('goto', joint='gripper', value=GRIP_OPEN.get(a.pose, GRIP_OPEN_ABS))
     wait_gripper_settle()
     # 재관측(re-look) — 접근 자세에서 팔이 시야를 바꿨을 수 있어 한 번 갱신
     loc2 = locate(R, t, floor, h_center)
