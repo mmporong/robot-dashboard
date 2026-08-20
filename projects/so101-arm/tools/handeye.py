@@ -564,6 +564,26 @@ def main():
                  '재캘리브레이션하면 다시 잴 것. 미러 해제(2026-08-20) 이후 규약.'),
     }, ensure_ascii=False, indent=2))
     print(f'\n저장: {OUT}')
+    # 재정합은 교시 상수(파지 오프셋·손목캠 목표 픽셀)의 기준을 갈아치운다 —
+    # 재교시 전에는 못 쓰게 stale 마킹 (14차 리뷰 M3). 소비자(pick_demo 등)는
+    # arm_lib.load_gain(필수키) 로 로드하므로 여기서 스스로 멈춘다.
+    gain_p = HERE / 'servo_gain.json'
+    try:
+        gain = json.loads(gain_p.read_text())
+        grp = gain.setdefault('stale_after_rereg', {})
+        why = f'재정합({time.strftime("%Y-%m-%d %H:%M")})으로 기준 상실 — 재교시 필요'
+        marked = [k for k in ('grasp_xy_offset_m', 'wrist_grasp_target_px')
+                  if k in gain]
+        for k in marked:
+            grp[k] = why
+        grp['note'] = ('handeye.py 가 정합 저장 시 자동 기록. '
+                       '재교시 후 이 그룹에서 해당 키를 지울 것.')
+        gain_p.write_text(json.dumps(gain, ensure_ascii=False, indent=2))
+        if marked:
+            print(f'교시 상수 stale 마킹: {" · ".join(marked)}')
+    except Exception as e:
+        print(f'⚠ servo_gain stale 마킹 실패: {e} — 교시 상수를 수동으로 무효 '
+              f'표시할 것 (재교시 전 pick_demo 사용 금지)')
     post('stop')                  # 끝났으면 남은 목표를 지운다
 
 
