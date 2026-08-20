@@ -22,7 +22,7 @@ def main():
     with out.open('w', newline='') as f:
         w = csv.writer(f)
         w.writerow(['t_s', 'torque'] + [f'{j}_deg' for j in JOINTS]
-                   + [f'{j}_temp' for j in JOINTS])
+                   + [f'{j}_temp' for j in JOINTS] + ['volt_pan', 'volt_grip'])
         n = 0
         while time.monotonic() < t_end:
             tick = time.monotonic()
@@ -30,9 +30,11 @@ def main():
                 d = json.loads(urllib.request.urlopen(
                     'http://127.0.0.1:8765/state', timeout=1.5).read())
                 pos, temp = d.get('pos', {}), d.get('temp') or {}
+                volt = d.get('volt') or {}
                 w.writerow([round(time.time() - t0, 2), int(bool(d.get('torque')))]
                            + [round(pos.get(j, float('nan')), 2) for j in JOINTS]
-                           + [temp.get(j, '') for j in JOINTS])
+                           + [temp.get(j, '') for j in JOINTS]
+                           + [volt.get('shoulder_pan', ''), volt.get('gripper', '')])
                 n += 1
                 if n % 100 == 0:
                     f.flush()

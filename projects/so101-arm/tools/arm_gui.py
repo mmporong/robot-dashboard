@@ -983,12 +983,24 @@ class Worker(threading.Thread):
                 curs[m] = abs(self.bus.read('Present_Current', m, normalize=False))
             except Exception:
                 pass
+        # 입력 전압(0.1V 단위) — 급사 원인 계측 (2026-08-20 밤): 체인 접촉
+        # 불량 가설의 직접 증거는 침묵 직전의 전압 처짐이다. 체인 양끝(첫
+        # 서보·그리퍼)만 읽어 비용을 줄인다.
+        volts = {}
+        for m in ('shoulder_pan', 'gripper'):
+            try:
+                volts[m] = self.bus.read('Present_Voltage', m,
+                                         normalize=False) / 10.0
+            except Exception:
+                pass
         if not temps:
             return
         with self.lock:
             self.state['temp'] = temps
             if curs:
                 self.state['current'] = curs
+            if volts:
+                self.state['volt'] = volts
         hot_i = {m: c for m, c in curs.items() if c >= CURRENT_STOP}
         if hot_i:
             try:
