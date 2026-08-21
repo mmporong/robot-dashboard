@@ -25,3 +25,7 @@ projects/*/mcap/
 
 # so101-arm 런타임 로그
 projects/so101-arm/*.log
+
+# 옆 파일로 뺀 영상. `dash.py <프로젝트> read` 가 다시 만든다 — 44MB짜리를 이력에 넣지 않는다.
+projects/*/media/
+projects/*/datasets.json

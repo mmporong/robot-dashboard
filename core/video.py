@@ -24,6 +24,8 @@
 """
 import base64
 import io
+import pathlib
+import shutil
 
 from PIL import Image
 
@@ -87,13 +89,27 @@ def resample(frames, fps, span):
     return out
 
 
-def build(by_run, fps, budget_mb, size=None, crf=26):
+def build(by_run, fps, budget_mb, size=None, crf=26, crf_by_cam=None,
+          out_dir=None, url_base='media'):
     """시행별·카메라별 프레임 → 비디오. 예산을 넘으면 **화질부터** 낮춘다.
 
     프레임을 솎으면 재생이 끊기고, 해상도를 낮추면 화질이 통째로 내려간다. 그런데
     H.264의 `crf`는 **그 사이**를 준다 — 같은 해상도·같은 프레임 수로 용량만 줄인다.
     그래서 예산 초과 시 `crf`를 먼저 올리고, 그래도 안 되면 그때 해상도를 내린다.
+
+    `crf_by_cam`으로 **채널마다 화질을 다르게** 준다. 예산은 하나인데 채널이 여럿이면
+    똑같이 깎을 이유가 없다 — 확대해서 들여다볼 채널(손목캠·정면)과 배경으로만 두는
+    채널(화면 녹화·시뮬 미러)은 필요한 화질이 다르다. 값은 기준 crf에 **더하는 차**다
+    (실측 2026-08-21: 같은 원본이 crf 28에 5.9MB, crf 40에 2.1MB — 3배 차이).
+
+    `out_dir`를 주면 data URI 대신 **옆 파일로 뺀다.** 그러면 세 가지가 한꺼번에 풀린다 —
+    base64가 33% 부풀리던 것이 없어지고, 한 장에 다 넣어야 하는 예산 제약이 사라지며,
+    브라우저가 보는 채널만 받아 온다(첫 화면이 빨라진다). 대신 단일 파일이 아니게 되므로
+    아티팩트로 발행할 화면은 `out_dir` 없이 그대로 묻어 넣는다.
     """
+    bump = crf_by_cam or {}
+    if out_dir is not None:
+        return _build_files(by_run, fps, size, crf, bump, pathlib.Path(out_dir), url_base)
     budget = budget_mb * 1024 * 1024
     for attempt, (c, sc) in enumerate([(crf, 1.0), (crf + 6, 1.0), (crf + 6, 0.75),
                                        (crf + 10, 0.75), (crf + 10, 0.5)]):
@@ -107,7 +123,7 @@ def build(by_run, fps, budget_mb, size=None, crf=26):
                 if sc != 1.0:
                     w, h = Image.open(io.BytesIO(base64.b64decode(frames[0]['b']))).size
                     sz = (int(w * sc), int(h * sc))
-                uri, nbytes, dim = encode(frames, fps, sz, crf=c)
+                uri, nbytes, dim = encode(frames, fps, sz, crf=c + bump.get(cam, 0))
                 if uri:
                     out[rid][cam] = {'src': uri, 'fps': fps, 'w': dim[0], 'h': dim[1],
                                      't0': frames[0]['t'], 'n': len(frames)}
@@ -118,4 +134,31 @@ def build(by_run, fps, budget_mb, size=None, crf=26):
             return out, total
         print(f'  {total/1e6:.1f}MB > {budget_mb}MB — crf {c} · 해상도 {sc:.0%}로 다시')
     print('  ! 예산을 못 맞췄다 — 가장 낮은 설정으로 내보낸다')
+    return out, total
+
+
+def _build_files(by_run, fps, size, crf, bump, out_dir, url_base):
+    """영상을 옆 파일로 뺀다. 예산 조이기가 없으므로 **화질을 낮출 이유도 없다.**
+
+    디렉터리는 매번 비우고 다시 쓴다 — 시행이 빠졌는데 파일만 남으면 어느 것이 지금
+    화면의 것인지 알 수 없게 된다.
+    """
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True)
+    out, total = {}, 0
+    for rid, cams in by_run.items():
+        out[rid] = {}
+        for cam, frames in cams.items():
+            if not frames:
+                continue
+            uri, nbytes, dim = encode(frames, fps, size, crf=crf + bump.get(cam, 0))
+            if not uri:
+                continue
+            name = f'{rid.replace("/", "_")}_{cam}.mp4'
+            (out_dir / name).write_bytes(base64.b64decode(uri.split(',', 1)[1]))
+            out[rid][cam] = {'src': f'{url_base}/{name}', 'fps': fps,
+                             'w': dim[0], 'h': dim[1], 't0': frames[0]['t'],
+                             'n': len(frames), 'bytes': nbytes}
+            total += nbytes
     return out, total

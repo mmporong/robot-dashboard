@@ -1,0 +1,568 @@
+<meta charset="utf-8">
+<title>SO-101 Bench Telemetry</title>
+<style>
+  :root{
+    --ground:#EEF1F4; --panel:#FFFFFF; --ink:#12171C; --muted:#5B6670;
+    --rule:#DCE1E6; --rule-soft:#EBEEF1; --accent:#0E7490; --accent-soft:#E0F2F6;
+    --ok:#15803D; --ok-soft:#E7F5EC; --warn:#B45309; --warn-soft:#FDF3E7;
+    --crit:#B91C1C; --crit-soft:#FDECEC;
+    --mono:ui-monospace,"SF Mono","Cascadia Code",Menlo,Consolas,monospace;
+    --sans:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans KR",sans-serif;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%}
+  body{margin:0;background:var(--ground);color:var(--ink);font-family:var(--sans);
+       font-size:14px;line-height:1.45;-webkit-font-smoothing:antialiased}
+  .num{font-family:var(--mono);font-variant-numeric:tabular-nums}
+  .eyebrow{font-size:10px;font-weight:700;letter-spacing:.10em;text-transform:uppercase;
+           color:var(--muted);margin:0 0 7px}
+  .app{min-height:100dvh;display:flex;flex-direction:column}
+
+  /* 상단바 */
+  .topbar{display:flex;align-items:center;gap:14px;padding:8px 14px;background:var(--panel);
+          border-bottom:1px solid var(--rule);flex-wrap:wrap;position:sticky;top:0;z-index:5}
+  .brand{font-size:14px;font-weight:700;letter-spacing:-.01em;white-space:nowrap}
+  .brand span{font-weight:400;color:var(--muted);font-size:12px;margin-left:7px}
+  .runsel{display:flex;gap:5px;flex-wrap:wrap;margin-left:auto;align-items:center}
+  .chip{border:1px solid var(--rule);background:var(--panel);border-radius:7px;padding:3px 9px;
+        cursor:pointer;font-family:inherit;font-size:11.5px;display:flex;align-items:center;
+        gap:6px;white-space:nowrap;color:var(--ink)}
+  .chip:hover{border-color:var(--accent)}
+  .chip[aria-pressed="true"]{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent);
+        background:var(--accent-soft)}
+  .chip .id{font-family:var(--mono);color:var(--muted)}
+  .led{width:7px;height:7px;border-radius:50%;flex:0 0 auto;background:#B4BEC6}
+  .led.ok{background:var(--ok)} .led.warn{background:var(--warn)} .led.crit{background:var(--crit)}
+
+  .wrap{padding:10px 12px;display:flex;flex-direction:column;gap:9px}
+  .pane{background:var(--panel);border:1px solid var(--rule);border-radius:10px;padding:10px 12px}
+
+  /* 계측 줄 */
+  .facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(132px,1fr));gap:9px}
+  .fact{border:1px solid var(--rule);border-radius:9px;padding:8px 10px;background:var(--panel)}
+  .fact .k{font-size:10.5px;color:var(--muted);letter-spacing:.04em}
+  .fact .v{font-family:var(--mono);font-size:19px;font-variant-numeric:tabular-nums;
+           margin-top:2px;letter-spacing:-.02em}
+  .fact .s{font-size:11px;color:var(--muted)}
+  .fact.warn{border-color:var(--warn);background:var(--warn-soft)}
+  .fact.crit{border-color:var(--crit);background:var(--crit-soft)}
+
+  /* 영상 */
+  /* 채널 격자. 열 수를 사용자가 정한다 — 다섯을 나란히 보고 싶을 때와 둘만 크게
+     보고 싶을 때가 다르다. `auto` 는 폭에 맞춰 접힌다(반응형 기본값). */
+  .vids{display:grid;gap:8px;grid-template-columns:repeat(auto-fit,minmax(var(--vmin,230px),1fr))}
+  .vids[data-cols="1"]{grid-template-columns:1fr}
+  .vids[data-cols="2"]{grid-template-columns:repeat(2,1fr)}
+  .vids[data-cols="3"]{grid-template-columns:repeat(3,1fr)}
+  .vids[data-cols="5"]{grid-template-columns:repeat(5,1fr)}
+  /* 패널 도구줄 — 열 수·크기 조절. Foxglove 도 패널마다 확대/축소를 둔다. */
+  .vtools{display:flex;gap:6px;align-items:center;margin-left:auto;font-size:11px}
+  .vtools button{border:1px solid var(--rule);background:var(--panel);border-radius:6px;
+                 padding:2px 8px;cursor:pointer;font:inherit;font-size:11px;color:var(--muted)}
+  .vtools button:hover{border-color:var(--accent);color:var(--accent)}
+  .vtools button[aria-pressed="true"]{border-color:var(--accent);background:#E0F2F6;color:var(--accent)}
+  .phead{display:flex;align-items:center;gap:8px}
+  /* 칸 하나를 키우는 버튼. 제목 더블클릭으로도 된다(Foxglove 관례). */
+  .vexp{position:absolute;right:5px;top:5px;z-index:3;border:0;border-radius:5px;
+        background:rgba(18,23,28,.66);color:#fff;font-size:12px;line-height:1;
+        padding:3px 6px;cursor:pointer;opacity:0;transition:opacity .12s}
+  .vcell:hover .vexp,.vcell:focus-within .vexp{opacity:1}
+  /* 확대 — 화면을 덮는다. 되감기는 뒤에서 계속 돌고 있으므로 같은 video 를 옮겨 붙인다. */
+  .zoom{position:fixed;inset:0;z-index:50;background:rgba(12,16,20,.92);display:none;
+        flex-direction:column;padding:14px}
+  .zoom.on{display:flex}
+  .zoom .zhead{display:flex;align-items:center;gap:10px;color:#fff;font-size:13px;
+               margin-bottom:10px;flex:0 0 auto}
+  .zoom .zhead button{margin-left:auto;border:1px solid #4A555E;background:#1B2228;color:#fff;
+                      border-radius:6px;padding:4px 12px;cursor:pointer;font:inherit;font-size:12px}
+  .zoom .zbody{flex:1;min-height:0;display:flex;align-items:center;justify-content:center}
+  /* 확대는 **화면을 채운다.** max-* 만 주면 원본 크기에서 멈춰(360×270) 확대가 안 된다. */
+  .zoom .zbody video{width:100%;height:100%;object-fit:contain;background:#000}
+  .vcell{position:relative;background:#0D1216;border-radius:9px;overflow:hidden;
+         aspect-ratio:4/3;display:flex;align-items:center;justify-content:center}
+  .vcell video{width:100%;height:100%;object-fit:contain;display:block}
+  .vtag{position:absolute;left:7px;bottom:7px;background:rgba(10,14,18,.76);color:#E9EEF3;
+        font-size:10.5px;padding:2px 7px;border-radius:5px;letter-spacing:.02em}
+  .vtag i{font-style:normal;color:#9FB0BD;margin-left:5px}
+  .transport{display:flex;align-items:center;gap:10px;margin-top:9px}
+  .transport button{border:1px solid var(--rule);background:var(--panel);border-radius:7px;
+        padding:5px 13px;cursor:pointer;font-family:inherit;font-size:12.5px;font-weight:600;
+        color:var(--ink)}
+  .transport button:hover{border-color:var(--accent);color:var(--accent)}
+  .transport input[type=range]{flex:1;accent-color:var(--accent)}
+  .tnow{font-family:var(--mono);font-size:12.5px;color:var(--muted);min-width:104px;
+        text-align:right;font-variant-numeric:tabular-nums}
+
+  /* 차트 */
+  .charts{display:grid;grid-template-columns:1fr 1fr;gap:9px}
+  @media (max-width:900px){.charts{grid-template-columns:1fr}}
+  .chart{position:relative}
+  .chart canvas{width:100%;height:var(--charth,186px);display:block}
+  /* 서보별 값 — Foxglove 의 Table/Diagnostics 패널 자리. 재생 위치의 값을 그대로 읽는다. */
+  .servos{width:100%;border-collapse:collapse;font-size:12px}
+  .servos th{text-align:left;font-size:10px;letter-spacing:.06em;text-transform:uppercase;
+             color:var(--muted);font-weight:700;padding:5px 7px;border-bottom:1px solid var(--rule)}
+  .servos td{padding:5px 7px;border-bottom:1px solid var(--rule-soft);
+             font-family:var(--mono);font-variant-numeric:tabular-nums}
+  .servos td:first-child{font-family:inherit}
+  .servos .sw{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:6px;
+              vertical-align:-1px}
+  .servos .hot{color:var(--crit);font-weight:700}
+  .servos .warm{color:var(--warn)}
+  /* 로그 — 재생 시점까지 일어난 일. Foxglove 의 Log 패널 자리. */
+  .logwrap{max-height:190px;overflow-y:auto;border:1px solid var(--rule-soft);border-radius:7px}
+  .logrow{display:grid;grid-template-columns:56px 1fr;gap:8px;padding:3px 8px;font-size:11.5px;
+          border-bottom:1px solid var(--rule-soft)}
+  .logrow:last-child{border-bottom:0}
+  .logrow .lt{font-family:var(--mono);color:var(--muted)}
+  .logrow.now{background:#E0F2F6}
+  .logrow .lv{color:var(--muted)}
+  @media (max-width:900px){
+    .charts{grid-template-columns:1fr}
+    .vids{grid-template-columns:1fr !important}
+  }
+  .legend{display:flex;gap:9px;flex-wrap:wrap;font-size:10.5px;color:var(--muted);margin-top:5px}
+  .legend b{font-weight:600;color:var(--ink)}
+  .swatch{display:inline-block;width:9px;height:3px;border-radius:2px;margin-right:4px;
+          vertical-align:middle}
+
+  /* 데이터셋 */
+  .dsrow{display:flex;align-items:center;gap:9px;font-size:12.5px;border-top:1px solid var(--rule-soft);
+         padding:6px 0}
+  .dsrow:first-of-type{border-top:0}
+  .dsrow b{font-weight:600}
+  .dsrow .num{margin-left:auto;color:var(--muted)}
+  .feat{font-family:var(--mono);font-size:10.5px;color:var(--muted)}
+  .empty{color:var(--muted);font-size:12.5px;padding:6px 0}
+  .note{font-size:11.5px;color:var(--muted);margin-top:7px}
+</style>
+
+<div class="app">
+  <div class="topbar">
+    <div class="brand">SO-101 Bench Telemetry<span>실기 기록 — 영상·상태·데이터셋</span></div>
+    <div class="runsel" id="runsel"></div>
+  </div>
+  <div class="wrap">
+    <div class="pane">
+      <p class="eyebrow" id="runhead">시행</p>
+      <div class="facts" id="facts"></div>
+      <p class="note" id="runnote"></p>
+    </div>
+    <div class="pane">
+      <div class="phead">
+        <p class="eyebrow" style="margin:0">채널 — 같은 시간축으로 함께 재생</p>
+        <div class="vtools">
+          <span style="color:var(--muted)">열</span>
+          <button data-cols="auto" aria-pressed="true">자동</button>
+          <button data-cols="1">1</button><button data-cols="2">2</button>
+          <button data-cols="3">3</button><button data-cols="5">5</button>
+          <span style="color:var(--muted);margin-left:6px">크기</span>
+          <button id="vsmall">−</button><button id="vbig">+</button>
+        </div>
+      </div>
+      <div class="vids" id="vids"></div>
+      <div class="transport">
+        <button id="play">▶ 재생</button>
+        <input type="range" id="seek" min="0" max="1000" value="0" step="1">
+        <span class="tnow num" id="tnow">0.0 / 0.0 s</span>
+      </div>
+    </div>
+    <div class="pane">
+      <div class="phead">
+        <p class="eyebrow" style="margin:0">서보 — 재생 위치의 값</p>
+        <div class="vtools"><span style="color:var(--muted)" id="servot">0.0s</span></div>
+      </div>
+      <table class="servos" id="servos"></table>
+    </div>
+    <div class="pane">
+      <p class="eyebrow">일어난 일 — 재생 위치까지</p>
+      <div class="logwrap"><div id="evlog"></div></div>
+    </div>
+    <div class="pane">
+      <div class="phead">
+        <p class="eyebrow" style="margin:0">계측 — 재생 위치가 세로선으로 함께 움직입니다</p>
+        <div class="vtools">
+          <span style="color:var(--muted)">높이</span>
+          <button id="chsmall">−</button><button id="chbig">+</button>
+        </div>
+      </div>
+      <div class="charts">
+        <div class="chart">
+          <canvas id="cJoint"></canvas>
+          <div class="legend" id="lJoint"></div>
+        </div>
+        <div class="chart">
+          <canvas id="cTemp"></canvas>
+          <div class="legend" id="lTemp"></div>
+        </div>
+      </div>
+    </div>
+    <div class="pane">
+      <p class="eyebrow">LeRobot 데이터셋 — 같은 벤치에서 수집한 학습용 기록</p>
+      <div id="dslist"></div>
+    </div>
+  </div>
+</div>
+
+<div class="zoom" id="zoom" role="dialog" aria-modal="true" aria-label="채널 확대">
+  <div class="zhead"><span id="ztitle"></span>
+    <button id="zclose">축소 (Esc)</button></div>
+  <div class="zbody" id="zbody"></div>
+</div>
+
+<script>
+const RUNS = /*__RUNS__*/[];
+const DATASETS = /*__DATASETS__*/[];
+const $ = id => document.getElementById(id);
+
+const JCOL = {shoulder_pan:'#0E7490', shoulder_lift:'#B45309', elbow_flex:'#15803D',
+              wrist_flex:'#7C3AED', wrist_roll:'#0F766E', gripper:'#B91C1C'};
+const TCOL = {...JCOL};
+let cur = null, playing = false, raf = 0;
+
+/* ── 시행 선택 ─────────────────────────────── */
+function runChip(r){
+  const b = document.createElement('button');
+  b.className = 'chip'; b.type = 'button';
+  const s = r.summary || {};
+  const hot = s.temp_max != null && s.temp_max >= 55;
+  const led = r.video && Object.keys(r.video).length ? 'ok' : (hot ? 'warn' : '');
+  b.innerHTML = `<span class="led ${led}"></span><span class="id">${r.date} ${r.time}</span>`
+              + `<b>${(s.seconds||0).toFixed(0)}s</b>`;
+  b.setAttribute('aria-pressed', String(cur && cur.id === r.id));
+  b.onclick = () => select(r.id);
+  return b;
+}
+function drawRunSel(){
+  const el = $('runsel'); el.innerHTML = '';
+  RUNS.slice().reverse().forEach(r => el.appendChild(runChip(r)));
+}
+
+/* ── 계측 카드 ─────────────────────────────── */
+function fact(k, v, s, cls){
+  return `<div class="fact ${cls||''}"><div class="k">${k}</div>`
+       + `<div class="v">${v}</div><div class="s">${s||''}</div></div>`;
+}
+function drawFacts(r){
+  const s = r.summary || {};
+  const hot = s.temp_max != null && s.temp_max >= 55;
+  const cards = [
+    fact('길이', `${(s.seconds||0).toFixed(1)}s`, `${s.samples||0} 표본`),
+    fact('채널', `${(r.channels||[]).length}`, (r.channels||[]).join(' · ') || '없음'),
+    fact('최고 온도', s.temp_max != null ? `${s.temp_max.toFixed(0)}°C` : '—',
+         s.temp_max_at != null ? `${s.temp_max_at.toFixed(0)}s 시점` : '', hot ? 'warn' : ''),
+    fact('파지 시도', `${(s.closes||[]).length}`,
+         (s.closes||[]).length ? `${s.closes.map(t=>t.toFixed(0)).join(', ')}s` : '닫힘 전이 없음'),
+    fact('그리퍼 최소', s.grip_min != null ? `${s.grip_min.toFixed(1)}°` : '—',
+         s.grip_min != null && s.grip_min < 2 ? '0 근처 — 헛집음 의심' : ''),
+  ];
+  if (s.volt_min != null)
+    cards.push(fact('최저 전압', `${s.volt_min.toFixed(1)}V`,
+                    s.volt_min < 11.5 ? '전원 흔들림' : '', s.volt_min < 11.5 ? 'crit' : ''));
+  if (s.torque_off_at != null)
+    cards.push(fact('토크 꺼짐', `${s.torque_off_at.toFixed(0)}s`, '이 시점부터 힘 없음', 'crit'));
+  $('facts').innerHTML = cards.join('');
+  $('runhead').textContent = `시행 ${r.date} ${r.time}`;
+  const noVid = !(r.video && Object.keys(r.video).length);
+  $('runnote').textContent = noVid
+    ? '이 시행은 계측만 실려 있습니다 — 영상은 project.py 의 SHOW 에 넣은 시행에만 담깁니다.'
+    : '판정 라벨은 붙이지 않습니다. 실기에는 실좌표 심판이 없고, 로그의 성공 문구가 실물과 어긋난 전례가 있어 계측된 사실만 싣습니다.';
+}
+
+/* ── 영상 ─────────────────────────────── */
+function drawVideos(r){
+  const el = $('vids'); el.innerHTML = '';
+  const vid = r.video || {};
+  const chans = (r.channels || []).filter(c => vid[c]);
+  if (!chans.length){ el.innerHTML = '<div class="empty">이 시행에는 실린 영상이 없습니다</div>'; return; }
+  for (const c of chans){
+    const v = vid[c];
+    const cell = document.createElement('div'); cell.className = 'vcell';
+    cell.dataset.chan = c;
+    const el2 = document.createElement('video');
+    el2.src = v.src; el2.muted = true; el2.playsInline = true; el2.preload = 'auto';
+    el2.dataset.chan = c;
+    cell.appendChild(el2);
+    const tag = document.createElement('span'); tag.className = 'vtag';
+    tag.innerHTML = `${(r.labels && r.labels[c]) || c}`
+      + `<i>${v.w}×${v.h} · ${v.fps}fps${r.speed_warn && r.speed_warn[c] ? ' · ⚠ 배속 기록' : ''}</i>`;
+    cell.appendChild(tag);
+    // 확대. Foxglove 관례를 따라 **아이콘 클릭과 제목 더블클릭** 둘 다 연다.
+    const exp = document.createElement('button');
+    exp.className = 'vexp'; exp.type = 'button'; exp.textContent = '⤢';
+    exp.title = '확대 (제목 더블클릭도 됩니다)';
+    exp.onclick = e => { e.stopPropagation(); zoomIn(c); };
+    cell.appendChild(exp);
+    tag.ondblclick = () => zoomIn(c);
+    el2.onerror = () => { tag.innerHTML = `${c} <i>재생 불가</i>`; };
+    el.appendChild(cell);
+  }
+}
+function videos(){ return [...document.querySelectorAll('#vids video')]; }
+function duration(){
+  const s = (cur && cur.summary && cur.summary.seconds) || 0;
+  const v = videos().map(x => isFinite(x.duration) ? x.duration : 0);
+  return Math.max(s, ...v, 0.001);
+}
+function seekTo(t){
+  for (const v of videos()) { if (isFinite(v.duration)) v.currentTime = Math.min(t, v.duration - 0.01); }
+  paint(t);
+}
+let lastT = 0;
+function paint(t){
+  lastT = t;
+  const d = duration();
+  $('tnow').textContent = `${t.toFixed(1)} / ${d.toFixed(1)} s`;
+  $('seek').value = Math.round(1000 * t / d);
+  drawCharts(t);
+  drawServos(t);
+  drawLog(t);
+}
+$('seek').oninput = () => seekTo(duration() * $('seek').value / 1000);
+$('play').onclick = () => {
+  playing = !playing;
+  $('play').textContent = playing ? '❚❚ 일시정지' : '▶ 재생';
+  for (const v of videos()) playing ? v.play().catch(()=>{}) : v.pause();
+  if (playing) tickPlay(); else cancelAnimationFrame(raf);
+};
+function tickPlay(){
+  const v = videos().find(x => isFinite(x.duration));
+  if (v){
+    paint(v.currentTime);
+    if (v.currentTime >= v.duration - 0.05){
+      playing = false; $('play').textContent = '▶ 재생';
+      for (const x of videos()) x.pause();
+      return;
+    }
+  }
+  raf = requestAnimationFrame(tickPlay);
+}
+
+/* ── 차트 (라이브러리 없이 캔버스로) ─────────── */
+function series(r, suffix, names){
+  const s = r.series; if (!s) return [];
+  return names.map(n => ({name:n, y:s[n + suffix]})).filter(o => Array.isArray(o.y) && o.y.length);
+}
+function drawChart(canvas, legendEl, r, lines, unit, cursorT){
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  const g = canvas.getContext('2d'); g.setTransform(dpr,0,0,dpr,0,0);
+  g.clearRect(0,0,w,h);
+  const pad = {l:38, r:8, t:8, b:18};
+  const t = (r.series && r.series.t) || [];
+  if (!t.length || !lines.length){
+    g.fillStyle = '#5B6670'; g.font = '12px ' + getComputedStyle(document.body).fontFamily;
+    g.fillText('상태 CSV 가 없습니다', pad.l, h/2); legendEl.innerHTML=''; return;
+  }
+  let lo = Infinity, hi = -Infinity;
+  for (const L of lines) for (const v of L.y) if (v != null){ if (v<lo) lo=v; if (v>hi) hi=v; }
+  if (!isFinite(lo)){ lo = 0; hi = 1; }
+  if (hi - lo < 1e-6){ hi = lo + 1; }
+  const pd = (hi - lo) * 0.08; lo -= pd; hi += pd;
+  const T = t[t.length-1] || 1;
+  const X = v => pad.l + (w - pad.l - pad.r) * (v / T);
+  const Y = v => pad.t + (h - pad.t - pad.b) * (1 - (v - lo) / (hi - lo));
+  // 격자
+  g.strokeStyle = '#EBEEF1'; g.fillStyle = '#5B6670';
+  g.font = '10px ' + getComputedStyle(document.body).fontFamily; g.lineWidth = 1;
+  for (let i = 0; i <= 4; i++){
+    const val = lo + (hi - lo) * i / 4, y = Y(val);
+    g.beginPath(); g.moveTo(pad.l, y); g.lineTo(w - pad.r, y); g.stroke();
+    g.fillText(val.toFixed(0), 4, y + 3);
+  }
+  g.fillText('0s', pad.l, h - 5);
+  g.fillText(T.toFixed(0) + 's', w - pad.r - 22, h - 5);
+  // 파지 시도 표시
+  for (const ct of ((r.summary && r.summary.closes) || [])){
+    g.strokeStyle = '#B91C1C33'; g.beginPath();
+    g.moveTo(X(ct), pad.t); g.lineTo(X(ct), h - pad.b); g.stroke();
+  }
+  // 선
+  g.lineWidth = 1.4;
+  for (const L of lines){
+    g.strokeStyle = L.color; g.beginPath();
+    let started = false;
+    for (let i = 0; i < t.length; i++){
+      const v = L.y[i]; if (v == null) continue;
+      const x = X(t[i]), y = Y(v);
+      started ? g.lineTo(x, y) : (g.moveTo(x, y), started = true);
+    }
+    g.stroke();
+  }
+  // 재생 커서
+  if (cursorT != null && cursorT >= 0){
+    g.strokeStyle = '#12171C'; g.lineWidth = 1;
+    g.beginPath(); g.moveTo(X(Math.min(cursorT, T)), pad.t);
+    g.lineTo(X(Math.min(cursorT, T)), h - pad.b); g.stroke();
+  }
+  legendEl.innerHTML = lines.map(L => {
+    let val = null;
+    if (cursorT != null){
+      let k = 0; while (k + 1 < t.length && t[k+1] <= cursorT) k++;
+      val = L.y[k];
+    }
+    return `<span><span class="swatch" style="background:${L.color}"></span>`
+         + `<b>${L.name.replace(/_/g,' ')}</b>`
+         + (val != null ? ` <span class="num">${val.toFixed(1)}${unit}</span>` : '') + '</span>';
+  }).join('');
+}
+function drawCharts(cursorT){
+  if (!cur) return;
+  const joints = (cur.summary && cur.summary.joints) || Object.keys(JCOL);
+  const jl = series(cur, '_deg', joints).map(o => ({...o, color: JCOL[o.name] || '#5B6670'}));
+  const tl = series(cur, '_temp', joints).map(o => ({...o, color: TCOL[o.name] || '#5B6670'}));
+  drawChart($('cJoint'), $('lJoint'), cur, jl, '°', cursorT);
+  drawChart($('cTemp'), $('lTemp'), cur, tl, '°C', cursorT);
+}
+
+/* ── 데이터셋 ─────────────────────────────── */
+function drawDatasets(){
+  const el = $('dslist');
+  if (!DATASETS.length){
+    el.innerHTML = '<div class="empty">아직 수집된 데이터셋이 없습니다 — 패널의 [기록 시작]으로 만듭니다</div>';
+    return;
+  }
+  el.innerHTML = DATASETS.map(d =>
+    `<div class="dsrow"><b>${d.repo_id}</b>`
+    + `<span class="feat">${(d.features||[]).filter(f=>f.startsWith('observation')||f==='action').join(' · ')}</span>`
+    + `<span class="num">회차 ${d.episodes} · ${d.frames} 프레임 · ${d.fps}fps</span></div>`).join('');
+}
+
+/* ── 선택 ─────────────────────────────── */
+/* ── 확대 ───────────────────────────────────────────────────────────
+   같은 `video` 요소를 **옮겨 붙인다**. 새로 만들면 그 순간 로딩이 다시 시작되고
+   재생 위치도 잃는다 — 여기서는 다섯 채널이 한 시간축을 공유하므로 그러면 안 된다. */
+let zoomChan = null;
+function zoomIn(c){
+  const v = document.querySelector(`#vids video[data-chan="${c}"]`);
+  if (!v) return;
+  zoomChan = c;
+  $('ztitle').textContent = (cur && cur.labels && cur.labels[c]) || c;
+  $('zbody').appendChild(v);
+  $('zoom').classList.add('on');
+}
+function zoomOut(){
+  if (!zoomChan) return;
+  const v = $('zbody').querySelector('video');
+  const cell = document.querySelector(`#vids .vcell[data-chan="${zoomChan}"]`);
+  if (v && cell) cell.insertBefore(v, cell.firstChild);
+  $('zoom').classList.remove('on');
+  zoomChan = null;
+}
+$('zclose').onclick = zoomOut;
+$('zoom').onclick = e => { if (e.target === $('zoom')) zoomOut(); };
+document.addEventListener('keydown', e => { if (e.key === 'Escape') zoomOut(); });
+
+/* ── 격자 열 수 · 칸 크기 ─────────────────────────────────────────── */
+let vmin = 230;
+function setCols(n){
+  const el = $('vids');
+  if (n === 'auto') el.removeAttribute('data-cols'); else el.dataset.cols = n;
+  document.querySelectorAll('.vtools button[data-cols]').forEach(b =>
+    b.setAttribute('aria-pressed', String(b.dataset.cols === n)));
+}
+document.querySelectorAll('.vtools button[data-cols]').forEach(b =>
+  b.onclick = () => setCols(b.dataset.cols));
+const bump = (d) => { vmin = Math.max(140, Math.min(760, vmin + d));
+                      $('vids').style.setProperty('--vmin', vmin + 'px'); };
+$('vbig').onclick = () => bump(70);
+$('vsmall').onclick = () => bump(-70);
+$('chbig') && ($('chbig').onclick = () => bumpCh(60));
+$('chsmall') && ($('chsmall').onclick = () => bumpCh(-60));
+let charth = 186;
+const bumpCh = d => { charth = Math.max(110, Math.min(420, charth + d));
+                      document.querySelector('.charts').style.setProperty('--charth', charth + 'px');
+                      drawCharts(lastT); };
+
+/* ── 서보별 값 ─────────────────────────────────────────────────────
+   재생 위치에서 **표본을 골라** 그대로 싣는다. 보간하지 않는다 — 없는 값을 만들면
+   "그 시점에 그랬다"가 아니라 추정이 된다. */
+function sampleAt(r, t){
+  const ts = (r.series && r.series.t) || [];
+  if (!ts.length) return -1;
+  let lo = 0, hi = ts.length - 1;
+  while (lo < hi){ const m = (lo + hi + 1) >> 1; if (ts[m] <= t) lo = m; else hi = m - 1; }
+  return lo;
+}
+const JKO = {shoulder_pan:'어깨 회전', shoulder_lift:'어깨 상하', elbow_flex:'팔꿈치',
+             wrist_flex:'손목 상하', wrist_roll:'손목 회전', gripper:'그리퍼'};
+function drawServos(t){
+  const r = cur, el = $('servos');
+  if (!r){ el.innerHTML = ''; return; }
+  const i = sampleAt(r, t);
+  const S = r.series || {}, joints = (r.summary && r.summary.joints) || [];
+  $('servot').textContent = `${t.toFixed(1)}s`;
+  let h = '<tr><th>서보</th><th>관절각</th><th>온도</th><th>최고 온도</th><th>가동 범위</th></tr>';
+  for (const j of joints){
+    const deg = S[j + '_deg'], tmp = S[j + '_temp'];
+    const d = (deg && i >= 0) ? deg[i] : null;
+    const c = (tmp && i >= 0) ? tmp[i] : null;
+    const hi = tmp && tmp.length ? Math.max(...tmp.filter(v => v != null)) : null;
+    const lo2 = deg && deg.length ? Math.min(...deg.filter(v => v != null)) : null;
+    const hi2 = deg && deg.length ? Math.max(...deg.filter(v => v != null)) : null;
+    // 온도 임계는 서보 제조사 권장이 아니라 **이 기록에서 관찰된 범위** 기준이다.
+    const cls = c == null ? '' : (c >= 45 ? 'hot' : (c >= 40 ? 'warm' : ''));
+    h += `<tr><td><span class="sw" style="background:${JCOL[j] || '#94A3B8'}"></span>`
+       + `${JKO[j] || j}</td>`
+       + `<td>${d == null ? '—' : d.toFixed(1) + '°'}</td>`
+       + `<td class="${cls}">${c == null ? '—' : c.toFixed(0) + '°C'}</td>`
+       + `<td>${hi == null ? '—' : hi.toFixed(0) + '°C'}</td>`
+       + `<td>${lo2 == null ? '—' : lo2.toFixed(0) + '° ~ ' + hi2.toFixed(0) + '°'}</td></tr>`;
+  }
+  el.innerHTML = h;
+}
+
+/* ── 일어난 일 ─────────────────────────────────────────────────────
+   **계측에서 읽히는 사건만** 싣는다. 성공/실패는 붙이지 않는다 — 실기에는 실좌표
+   심판이 없고, 로그의 성공 문구가 실물과 어긋난 전례가 있다. */
+function events(r){
+  const S = r.series || {}, sm = r.summary || {}, ev = [];
+  const ts = S.t || [];
+  if (ts.length) ev.push({t: 0, k: '기록 시작', v: `${(sm.samples || 0)} 표본 · ${(sm.seconds || 0).toFixed(0)}초`});
+  for (const c of (sm.closes || [])) ev.push({t: c, k: '그리퍼 닫힘', v: '파지 시도'});
+  if (sm.temp_max_at != null) ev.push({t: sm.temp_max_at, k: '최고 온도', v: `${sm.temp_max}°C`});
+  if (sm.torque_off_at != null) ev.push({t: sm.torque_off_at, k: '토크 꺼짐', v: '팔에서 힘이 빠졌다'});
+  // 정지 구간 — 관절이 오래 안 움직이면 그 자체가 볼 거리다(대기인지 멈춘 건지)
+  const j0 = (sm.joints || [])[0];
+  if (j0 && S[j0 + '_deg']){
+    const d = S[j0 + '_deg']; let run = 0, from = 0;
+    for (let i = 1; i < d.length; i++){
+      const still = Math.abs(d[i] - d[i-1]) < 0.15;
+      if (still){ if (!run) from = ts[i-1]; run++; }
+      else { if (run >= 40) ev.push({t: from, k: '정지', v: `${(ts[i-1]-from).toFixed(0)}초간 움직임 없음`}); run = 0; }
+    }
+  }
+  return ev.sort((a,b) => a.t - b.t);
+}
+function drawLog(t){
+  const el = $('evlog');
+  if (!cur){ el.innerHTML = ''; return; }
+  const ev = cur._ev || (cur._ev = events(cur));
+  const past = ev.filter(e => e.t <= t + 1e-6);
+  if (!past.length){ el.innerHTML = '<div class="logrow"><span class="lt">—</span>'
+    + '<span class="lv">아직 기록된 사건이 없습니다</span></div>'; return; }
+  el.innerHTML = past.map((e, i) =>
+    `<div class="logrow${i === past.length-1 ? ' now' : ''}">`
+    + `<span class="lt">${e.t.toFixed(1)}s</span>`
+    + `<span><b>${e.k}</b> <span class="lv">${e.v}</span></span></div>`).join('');
+  el.parentElement.scrollTop = el.scrollHeight;
+}
+
+function select(id){
+  cur = RUNS.find(r => r.id === id) || RUNS[RUNS.length - 1];
+  playing = false; $('play').textContent = '▶ 재생';
+  cancelAnimationFrame(raf);
+  drawRunSel(); drawFacts(cur); drawVideos(cur);
+  requestAnimationFrame(() => paint(0));
+}
+if (RUNS.length){
+  const withVideo = RUNS.filter(r => r.video && Object.keys(r.video).length);
+  select((withVideo[withVideo.length-1] || RUNS[RUNS.length-1]).id);
+}else{
+  $('runhead').textContent = '기록 없음';
+  $('runnote').textContent = 'python3 dash.py so101-arm all 을 돌리면 ~/so101_tools/media 의 기록이 실립니다.';
+}
+drawDatasets();
+window.addEventListener('resize', () => drawCharts(duration() * $('seek').value / 1000));
+</script>
