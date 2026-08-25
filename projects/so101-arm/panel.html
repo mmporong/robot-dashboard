@@ -46,7 +46,12 @@
   .stage{position:relative;background:var(--stage);border-radius:12px;overflow:hidden;
          display:flex;align-items:center;justify-content:center}
   .stage img{width:100%;height:100%;object-fit:contain;display:block}
-  .feeds{position:absolute;inset:0;display:grid;grid-template-columns:1fr 1fr;gap:2px}
+  .feeds{position:absolute;inset:0;display:grid;grid-template-columns:1fr 1fr 1fr;gap:2px}
+  .feeds.nomirror{grid-template-columns:1fr 1fr}
+  .mctl{position:absolute;right:8px;bottom:8px;display:flex;gap:4px}
+  .mctl button{background:rgba(10,14,18,.72);color:#C8D2DC;border:1px solid #2A3441;
+    border-radius:6px;font-size:11px;padding:3px 7px;cursor:pointer;line-height:1.4}
+  .mctl button:hover{border-color:#4A5A6B;color:#EAF0F6}
   .feed{position:relative;min-width:0;overflow:hidden;display:flex;
         align-items:center;justify-content:center}
   .ftag{position:absolute;left:8px;bottom:8px;background:rgba(10,14,18,.72);
@@ -95,6 +100,20 @@
   .ikgrid input{font-family:var(--mono);font-size:13px;padding:5px 8px;width:100%;
                 border:1px solid var(--rule);border-radius:7px;background:var(--panel);color:var(--ink)}
   .ikgrid input:focus{outline:2px solid var(--accent);outline-offset:-1px;border-color:var(--accent)}
+  .dsgrid{display:grid;grid-template-columns:auto 1fr;gap:7px 8px;align-items:center}
+  .dsgrid label{font-size:11.5px;color:var(--muted)}
+  .dsgrid input{font-family:var(--mono);font-size:12.5px;padding:5px 8px;width:100%;
+                border:1px solid var(--rule);border-radius:7px;background:var(--panel);color:var(--ink)}
+  .dsgrid input:focus{outline:2px solid var(--accent);outline-offset:-1px;border-color:var(--accent)}
+  .dslist{margin-top:8px;display:flex;flex-direction:column;gap:5px}
+  .dsrow{display:flex;align-items:center;gap:7px;font-size:11.5px;color:var(--muted);
+         border-top:1px solid var(--rule);padding-top:5px}
+  .dsrow b{color:var(--ink);font-weight:600}
+  .dsrow .num{margin-left:auto;font-family:var(--mono)}
+  .dsrow button{background:none;border:1px solid var(--rule);border-radius:6px;
+                color:var(--muted);font-size:11px;padding:2px 6px;cursor:pointer}
+  .dsrow button:hover{border-color:var(--accent);color:var(--ink)}
+  .recon{color:#D64545;font-weight:700}
   .ikact{display:flex;gap:7px;margin-top:9px}
   .ikact .chip{flex:1;text-align:center;padding:8px 0;font-size:13px}
   .ikact .go{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:700}
@@ -153,7 +172,7 @@
   <div class="main">
     <!-- 카메라 스테이지 -->
     <section class="stage">
-      <div class="feeds">
+      <div class="feeds" id="feeds">
         <div class="feed">
           <img id="cam" src="/cam" alt="손목캠"
                onerror="this.outerHTML='<div class=nocam>손목캠 없음</div>'">
@@ -163,6 +182,19 @@
           <img id="dep" src="/depth" alt="깊이"
                onerror="this.outerHTML='<div class=nocam>깊이 없음 — Astra 연결 확인</div>'">
           <span class="ftag" id="dtag">뎁스캠 · 거리</span>
+        </div>
+        <div class="feed" id="mirfeed">
+          <img id="mir" src="/mirror" alt="미러"
+               onerror="document.getElementById('feeds').classList.add('nomirror');
+                        this.parentElement.remove()">
+          <span class="ftag" id="mtag">MuJoCo 미러 · 디지털 트윈</span>
+          <div class="mctl">
+            <button data-az="-30" title="시점 왼쪽">↺</button>
+            <button data-az="30" title="시점 오른쪽">↻</button>
+            <button data-el="-10" title="위에서">▲</button>
+            <button data-el="10" title="눈높이">▼</button>
+            <button id="bMirLive" title="프리뷰·재생 취소하고 실물 미러로">라이브</button>
+          </div>
         </div>
       </div>
       <div class="hud">
@@ -194,10 +226,25 @@
           <label>pitch°</label><input id="ip" value="-90">
         </div>
         <div class="ikact">
+          <button class="chip" id="bPrev" title="팔은 움직이지 않고 미러에만 그려 봅니다">시뮬 확인</button>
           <button class="chip go" id="bIK">IK 이동</button>
           <button class="chip" id="bHome">홈 자세</button>
         </div>
-        <div class="ikout" id="ikout">목표를 넣고 [IK 이동] — 도달 후 죠 끝을 자로 재서 예측과 비교합니다.</div>
+        <div class="ikout" id="ikout">[시뮬 확인]으로 미러에서 먼저 보고 → [IK 이동]. 도달 후 죠 끝을 자로 재서 예측과 비교합니다.</div>
+      </div>
+      <div class="card">
+        <p class="eyebrow">데이터셋 — LeRobot 표준 포맷으로 기록</p>
+        <div class="dsgrid">
+          <label>이름</label><input id="dsName" value="so101_cube_pick">
+          <label>태스크</label><input id="dsTask" value="pick the red cube and drop it in the box">
+          <label>fps</label><input id="dsFps" value="10">
+        </div>
+        <div class="ikact">
+          <button class="chip go" id="bRec">● 기록 시작</button>
+          <button class="chip" id="bRecCancel" title="저장하지 않고 버립니다">버리기</button>
+        </div>
+        <div class="ikout" id="dsout">연결·캘리브 후 시작합니다. 액션은 패널이 낸 명령 목표로 기록됩니다.</div>
+        <div class="dslist" id="dslist"></div>
       </div>
     </aside>
   </div>
@@ -294,6 +341,82 @@ $('bIK').onclick=async()=>{
     : `${r.msg}`;
 };
 
+/* 시뮬 확인 — 팔은 그대로 두고 미러에만 그린다(plan → validate → execute).
+   캘리브 범위 거부도 여기서 미리 나온다: 팔이 먼저 알게 되는 경로를 없앤다 */
+$('bPrev').onclick=async()=>{
+  const r=await cmd({op:'ik_preview',x:$('ix').value,y:$('iy').value,
+                     z:$('iz').value,pitch:$('ip').value,hold:5});
+  if(!r) return;
+  if(r.ok){
+    $('ikout').innerHTML=`미러에 4초간 표시 — q = <span class="num">[${r.q.join(', ')}]</span><br>`
+      +`예측 TCP <span class="num">(${r.fk_pan.join(', ')})</span>`
+      +(r.mirror?'':' <b>(미러 꺼짐 — 계산만)</b>')+' · 팔은 움직이지 않았습니다';
+  }else{
+    $('ikout').innerHTML=`실행하면 거부됩니다 — ${r.msg||'IK 해 없음'}`;
+  }
+};
+
+/* 데이터셋 — LeRobot 표준 포맷 기록·목록·미러 재생 */
+let recOn=false;
+$('bRec').onclick=async()=>{
+  if(!recOn){
+    const r=await cmd({op:'rec_start',repo_id:$('dsName').value.trim(),
+                       task:$('dsTask').value.trim(),fps:+$('dsFps').value});
+    if(!r) return;
+    $('dsout').innerHTML = r.ok
+      ? `기록 시작 — <b>${r.repo_id}</b> · ${r.fps}fps · 카메라 ${r.cameras.join(', ')}<br>`
+        +`<span class="num">${r.root}</span>`
+      : r.msg;
+  }else{
+    const r=await cmd({op:'rec_stop'});
+    if(!r) return;
+    $('dsout').innerHTML = r.ok
+      ? `저장 완료 — ${r.frames} 프레임 · 회차 ${r.episodes}` : r.msg;
+    loadDatasets();
+  }
+};
+$('bRecCancel').onclick=async()=>{
+  const r=await cmd({op:'rec_cancel'});
+  if(r) $('dsout').textContent = r.ok ? `버렸습니다 (${r.frames} 프레임)` : r.msg;
+};
+async function loadDatasets(){
+  let d; try{ d=await (await fetch('/rec/list')).json(); }catch(e){ return; }
+  const el=$('dslist'); el.innerHTML='';
+  for(const s of (d.datasets||[])){
+    const row=document.createElement('div'); row.className='dsrow';
+    row.innerHTML=`<b>${s.repo_id}</b> 회차 ${s.episodes} · ${s.frames} 프레임`
+                 +`<span class="num">${s.fps}fps</span>`;
+    const b=document.createElement('button'); b.textContent='미러 재생';
+    b.title='기록된 궤적을 시뮬에서 되돌려 봅니다 — 팔은 움직이지 않습니다';
+    b.onclick=async()=>{
+      const r=await cmd({op:'rec_replay',repo_id:s.repo_id,episode:0,fps:s.fps||10});
+      $('dsout').textContent = r&&r.ok ? `미러 재생 — ${r.frames} 프레임 (팔 정지)`
+                                       : (r&&r.msg)||'재생 실패';
+    };
+    row.appendChild(b); el.appendChild(row);
+  }
+  if(!(d.datasets||[]).length) el.innerHTML='<div class="dsrow">아직 수집된 데이터셋이 없습니다</div>';
+}
+loadDatasets();
+setInterval(async()=>{
+  let s; try{ s=await (await fetch('/rec/status')).json(); }catch(e){ return; }
+  recOn=!!s.recording;
+  $('bRec').innerHTML = recOn ? '■ 기록 정지' : '● 기록 시작';
+  if(recOn){
+    $('dsout').innerHTML=`<span class="recon">● 기록 중</span> ${s.repo_id} — `
+      +`${s.frames} 프레임 · ${s.seconds}s · 상태 정지 비율 <b>${s.dup_pct}%</b>`
+      +(s.dup_pct>60?' <b>(움직임이 거의 없습니다)</b>':'');
+  }else if(s.err){ $('dsout').textContent=s.err; }
+},1000);
+
+/* 미러 시점 — 데몬이 카메라 상태를 들고 있어 델타만 보낸다 */
+let mirAz=150, mirEl=-25;
+document.querySelectorAll('.mctl button[data-az]').forEach(b=>b.onclick=()=>{
+  mirAz=(mirAz+ +b.dataset.az+360)%360; cmd({op:'mirror_view',azimuth:mirAz});});
+document.querySelectorAll('.mctl button[data-el]').forEach(b=>b.onclick=()=>{
+  mirEl=Math.max(-85,Math.min(5,mirEl+ +b.dataset.el)); cmd({op:'mirror_view',elevation:mirEl});});
+const bLive=$('bMirLive'); if(bLive) bLive.onclick=()=>cmd({op:'mirror_live'});
+
 /* 상태 폴링 */
 let calibInit=false;
 async function tick(){
@@ -306,13 +429,13 @@ async function tick(){
   $('hK').className='badge'+(st.calibrated?' on':' warn');
   $('hT').className='badge'+(st.torque?' on':'');
   $('hR').hidden=!st.recording;
-  $('hSpd').textContent=(st.speed_pct||15)+'%';
+  $('hSpd').textContent=st.teleop?'무제한(텔레옵)':(st.speed_pct||15)+'%';
   const dt=$('dtag'), dp=st.depth;
   if(dt&&dp) dt.textContent = dp.ok
     ? `뎁스캠 · 중앙 ${dp.center_mm}mm · 최근접 ${dp.min_mm}mm · 유효 ${dp.valid_pct}%`
     : `뎁스캠 · ${dp.msg||'대기'}`;
   if(st.speed_pct&&document.activeElement!==$('speed')){
-    $('speed').value=st.speed_pct; $('speedv').textContent=st.speed_pct+'%';
+    $('speed').value=st.speed_pct; $('speedv').textContent=st.teleop?'무제한(텔레옵)':st.speed_pct+'%';
   }
 
   /* 캘리브 서랍: 첫 응답에서 상태에 맞춰 열고 닫는다 */

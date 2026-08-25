@@ -57,11 +57,19 @@ class Capture:
     # ③ 살색이 빨강 저채도 쪽에 걸려 사람 팔이 물체보다 큰 덩어리로 잡힌다.
     #    S 하한 140 이면 팔은 전부 빠지고 물체만 남는다(실측: S≥140 에서 팔 0px).
     # 카메라·조명이 바뀌면 다시 잴 것.
-    RED = [((0, 140, 55), (10, 255, 255)), ((166, 140, 55), (179, 255, 255))]
+    # 2026-08-21 재측정 (카메라를 뒤로 옮기고 팔을 앞으로 당긴 배치):
+    #   죠에 물린 큐브는 죠 그늘에 들어가 색이 죽는다 — 실측 H 163 · S 109 · V 43.
+    #   종전 임계(H≥166 · S≥140 · V≥55)는 셋 다 아슬하게 빗나가 검출 0 이었다.
+    #   S 를 100 아래로 더 내리면 사람 팔(빨강 저채도)이 큐브보다 큰 덩어리로
+    #   잡힌다(실측: S≥100 에서 팔 1489px vs 큐브 523px) — 120/45 가 경계다.
+    RED = [((0, 120, 45), (12, 255, 255)), ((158, 120, 45), (179, 255, 255))]
     # 뎁스캠에서 큐브는 200px 안팎으로 작게 잡힌다(멀리서 넓게 보므로).
-    MIN_AREA = 80
+    # 그늘에 든 물체는 살아남는 화소가 적다 — 죠에 물린 큐브 실측 64px.
+    MIN_AREA = 50
     # 작업 영역 밖(사람·벽)을 거르는 깊이 창 [m]
-    Z_RANGE = (0.35, 1.20)
+    # 작업 영역은 카메라에서 0.4~0.8m 다. 상한을 1.2m 로 두면 멀리 있는
+    # 빨강까지 '유효'가 되어 후보 필터가 무력해진다 (2026-08-21).
+    Z_RANGE = (0.35, 0.85)
 
     def __init__(self):
         self.lock = threading.Lock()
@@ -208,6 +216,10 @@ class Capture:
                     nz = d[valid]
                     with self.lock:
                         self.jpeg = buf.tobytes()
+                        # 원시 뎁스(mm, uint16)와 FOV — /depth_raw 가 포인트맵용으로
+                        # 쓴다. d 는 매 틱 새 배열이라 참조 보관이 안전하다.
+                        self.depth = d
+                        self.fovs = (cam.hfov, cam.vfov)
                         self.seq += 1
                         self.stats = {'ok': True,
                                       'valid_pct': round(100 * valid.mean(), 1),
@@ -258,7 +270,33 @@ class Capture:
                 m |= cv2.inRange(hsv, np.array(lo), np.array(hi))
             m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
             n, lab, st, ct = cv2.connectedComponentsWithStats(m, 8)
-            k = max(range(1, n), key=lambda i: st[i, cv2.CC_STAT_AREA], default=None)
+            # ★ 면적 최대 하나만 고르면 안 된다 (2026-08-21 정합 실패의 원인):
+            # 임계를 그늘에 맞춰 완화하면 **멀리 있는 빨강**(사람 옷 등)이 걸리고,
+            # 그게 작업 영역의 물체보다 큰 덩어리일 때 조용히 그쪽을 집는다.
+            # 실측: 13지점 순회에서 카메라 거리가 0.53m 와 1.06m 로 뒤섞여
+            # Kabsch RMS 244.8mm — 게이트가 잡아냈지만 원인은 여기였다.
+            # 그래서 면적 상위 후보를 깊이로 걸러 **작업 범위 안**인 첫 덩어리를 쓴다.
+            k = None
+            for i in sorted(range(1, n), key=lambda i: st[i, cv2.CC_STAT_AREA],
+                            reverse=True)[:6]:
+                if int(st[i, cv2.CC_STAT_AREA]) < self.MIN_AREA:
+                    break
+                ys_i, xs_i = np.nonzero(lab == i)
+                dv_i = d[ys_i, xs_i]
+                dv_i = dv_i[dv_i > 0]
+                if dv_i.size < 5:
+                    # 깊이가 없다고 버리면 안 된다 — 구조광 그림자에 물체가
+                    # 통째로 들어가는 일이 있고(2026-08-19 실측: 11x11 창 유효
+                    # 화소 0), 그때도 **픽셀 방위각은 유효**해서 정합·파지가
+                    # 방위각∩평면으로 푼다. 버렸더니 13점 중 7점이 관측 실패로
+                    # 날아갔다(2026-08-21 정합 4차). 차선 후보로만 남긴다.
+                    if k is None:
+                        k = i
+                    continue
+                z_i = float(np.median(dv_i)) / 1000.0
+                if self.Z_RANGE[0] <= z_i <= self.Z_RANGE[1]:
+                    k = i                 # 깊이가 작업 범위 안 — 확정
+                    break
             if k is None:
                 continue
             area = int(st[k, cv2.CC_STAT_AREA])
@@ -384,6 +422,26 @@ def make_handler(cap):
                                         if rgb else None})
             elif self.path == '/health':
                 self._json({'seq': cap.seq, 'beat_age': age})
+            elif self.path == '/depth_raw':
+                # 원시 뎁스 한 프레임 — PNG16(무손실) base64. 포인트맵 변환용.
+                import cv2
+                with cap.lock:
+                    d = getattr(cap, 'depth', None)
+                    fovs = getattr(cap, 'fovs', None)
+                    seq = cap.seq
+                if d is None or fovs is None:
+                    return self._json({'error': 'no depth yet'}, 503)
+                # ★ astra 깊이는 int16 — PNG 는 부호 있는 16비트가 없어
+                # OpenCV 가 8비트로 포화시킨다(255mm 초과 전부 255 실측).
+                import numpy as _np
+                ok, buf = __import__('cv2').imencode(
+                    '.png', _np.ascontiguousarray(d.astype(_np.uint16)))
+                if not ok:
+                    return self._json({'error': 'png encode fail'}, 500)
+                self._json({'seq': seq, 'beat_age': age,
+                            'h': int(d.shape[0]), 'w': int(d.shape[1]),
+                            'hfov': float(fovs[0]), 'vfov': float(fovs[1]),
+                            'png16': base64.b64encode(buf.tobytes()).decode()})
             elif self.path == '/points':
                 with cap.lock:
                     pts, seq = cap.points, cap.seq

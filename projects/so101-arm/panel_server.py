@@ -25,6 +25,7 @@ import json
 import math
 import pathlib
 import subprocess
+import os
 import sys
 import threading
 import time
@@ -35,6 +36,7 @@ TOOLS = pathlib.Path('~/so101_tools').expanduser()
 sys.path.insert(0, str(TOOLS))
 
 import arm_lib                                    # noqa: E402
+import ds_record                                  # noqa: E402  (LeRobot 표준 기록)
 from arm_gui import Worker                        # noqa: E402  (시리얼 워커 재사용)
 
 HOME_Q = [0.0, -0.3, 0.6, 0.5, 0.0]
@@ -326,6 +328,152 @@ class Depth(threading.Thread):
                 time.sleep(1.0)
 
 
+class Mirror(threading.Thread):
+    """MuJoCo 미러 데몬(~/so101_tools/sim/mirror_daemon.py)을 감독·중계한다.
+
+    별도 프로세스인 이유는 깊이 데몬과 다르다 — 장치 교착이 아니라 **환경**이다.
+    mujoco 는 rlwalk 환경에만 설치돼 있고 이 서버는 lerobot 환경에서 돈다.
+    두 환경을 한 프로세스에 합칠 수 없으니 HTTP 로 잇는다.
+
+    미러는 읽기 전용 표시 계층이다 — 데몬은 /state 를 읽어 그릴 뿐 팔에 명령을
+    내리지 않는다. 그래서 데몬이 죽어도 팔은 아무 영향을 받지 않는다.
+    """
+
+    STALE_S = 20.0
+    SIM_DIR = TOOLS / 'sim'
+
+    def __init__(self, port=8768, piece='cube'):
+        super().__init__(daemon=True)
+        self.port = port
+        self.piece = piece
+        self.lock = threading.Lock()
+        self.jpeg = None
+        self.status = {'ok': False, 'msg': '시작 전'}
+        self.started = False
+        self._start_lock = threading.Lock()
+        self._proc_lock = threading.Lock()
+        self._closing = False
+        self._proc = None
+        self._log = None
+        self._restarts = 0
+
+    @staticmethod
+    def python_bin():
+        """mujoco 가 있는 인터프리터 — 없으면 None(미러 비활성)."""
+        p = pathlib.Path.home() / 'miniforge3/envs/rlwalk/bin/python'
+        return str(p) if p.exists() else None
+
+    def snapshot_jpeg(self):
+        with self.lock:
+            return self.jpeg
+
+    def ensure(self):
+        with self._start_lock:
+            if not self.started:
+                self.started = True
+                self.start()
+
+    def shutdown(self, timeout=6.0):
+        self._closing = True
+        if self.is_alive():
+            self.join(2.0)
+        self._stop_proc(grace=timeout)
+
+    def request(self, path, body=None, timeout=4.0):
+        """데몬으로 중계 (POST). 시점 변경·프리뷰·재생에 쓴다."""
+        import urllib.error
+        import urllib.request
+        url = f'http://127.0.0.1:{self.port}{path}'
+        try:
+            if body is None:
+                with urllib.request.urlopen(url, timeout=timeout) as r:
+                    return json.loads(r.read())
+            req = urllib.request.Request(
+                url, method='POST', data=json.dumps(body).encode(),
+                headers={'Content-Type': 'application/json'})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            try:
+                return json.loads(e.read())
+            except Exception:
+                return {'ok': False, 'msg': f'미러 데몬 HTTP {e.code}'}
+        except Exception as e:
+            return {'ok': False, 'msg': f'미러 데몬 통신 실패: {type(e).__name__}'}
+
+    def _spawn(self):
+        with self._proc_lock:
+            if self._closing:
+                return
+            py = self.python_bin()
+            if py is None:
+                with self.lock:
+                    self.status = {'ok': False,
+                                   'msg': 'mujoco 환경(rlwalk) 없음 — 미러 비활성'}
+                return
+            # 포트 선점 확인 — 살아 있는 데몬이 있으면 그걸 쓴다(깊이와 같은 규약)
+            h = self.request('/health', timeout=0.5)
+            if h.get('beat_age') is not None:
+                if h['beat_age'] <= self.STALE_S:
+                    return
+                subprocess.run(['fuser', '-k', '-TERM', f'{self.port}/tcp'],
+                               capture_output=True)
+                time.sleep(1.5)
+            if self._log is None:
+                self._log = open(HERE / 'mirror_daemon.log', 'ab', buffering=0)
+            self._proc = subprocess.Popen(
+                [py, '-u', str(self.SIM_DIR / 'mirror_daemon.py'),
+                 '--http', str(self.port), '--piece', self.piece],
+                cwd=str(self.SIM_DIR), stdout=self._log,
+                stderr=subprocess.STDOUT)
+
+    def _stop_proc(self, grace=6.0):
+        with self._proc_lock:
+            p, self._proc = self._proc, None
+        if p is None or p.poll() is not None:
+            return
+        try:
+            p.terminate()
+            p.wait(grace)
+        except Exception:
+            try:
+                p.kill()
+                p.wait(3.0)
+            except Exception:
+                pass
+
+    def run(self):
+        import urllib.request
+        self._spawn()
+        last_ok = time.monotonic()
+        while not self._closing:
+            time.sleep(0.1)
+            try:
+                url = f'http://127.0.0.1:{self.port}/frame.jpg'
+                with urllib.request.urlopen(url, timeout=3.0) as r:
+                    j = r.read()
+                if j:
+                    with self.lock:
+                        self.jpeg = j
+                        self.status = {'ok': True, 'msg': ''}
+                    last_ok = time.monotonic()
+                    self._restarts = 0
+            except Exception as e:
+                if time.monotonic() - last_ok > 15.0:
+                    with self.lock:
+                        self.status = {'ok': False,
+                                       'msg': f'미러 데몬 무응답 — 재시작 ({type(e).__name__})'}
+                    self._stop_proc()
+                    self._restarts += 1
+                    time.sleep(min(3.0 * (2 ** min(self._restarts - 1, 3)), 30.0))
+                    if self._closing:
+                        break
+                    self._spawn()
+                    last_ok = time.monotonic()
+                else:
+                    time.sleep(0.5)
+
+
 def serve_mjpeg(handler, get_jpeg, fps=10):
     """최신 JPEG 를 multipart 로 흘린다.
 
@@ -351,7 +499,7 @@ def serve_mjpeg(handler, get_jpeg, fps=10):
         pass                              # 탭을 닫으면 여기로 — 정상 종료
 
 
-def make_handler(worker, kin, cam, dep):
+def make_handler(worker, kin, cam, dep, mir=None, rec=None):
     page = (HERE / 'panel.html').read_bytes()
 
     class H(BaseHTTPRequestHandler):
@@ -405,6 +553,25 @@ def make_handler(worker, kin, cam, dep):
                 cam.ensure()
                 # MJPEG 스트림 — 브라우저 <img>가 그대로 재생한다
                 serve_mjpeg(self, cam.snapshot_jpeg)
+            elif self.path == '/mirror':
+                if mir is None:
+                    return self._json({'error': 'mirror off'}, 503)
+                mir.ensure()
+                serve_mjpeg(self, mir.snapshot_jpeg)
+            elif self.path == '/mirror/state':
+                if mir is None:
+                    return self._json({'ok': False, 'msg': 'mirror off'}, 503)
+                mir.ensure()
+                with mir.lock:
+                    st = dict(mir.status)
+                self._json({'proxy': st, 'daemon': mir.request('/state')})
+            elif self.path == '/rec/status':
+                if rec is None:
+                    return self._json({'recording': False, 'msg': '레코더 비활성'})
+                self._json(rec.status())
+            elif self.path == '/rec/list':
+                self._json({'datasets': ds_record.list_datasets(),
+                            'root': str(ds_record.DEFAULT_ROOT)})
             else:
                 self._json({'error': 'not found'}, 404)
 
@@ -440,8 +607,24 @@ def make_handler(worker, kin, cam, dep):
                     worker.cmd.put(('range', bool(req['start'])))
                 elif op == 'jog':
                     worker.cmd.put(('jog', req['joint'], float(req['delta'])))
+                    if rec is not None:      # 액션 = 명령 목표 (데이터셋 기록용)
+                        cur = (worker.snapshot().get('pos') or {}).get(req['joint'])
+                        if cur is not None:
+                            rec.note_action({req['joint']:
+                                             cur + float(req['delta'])})
+                elif op == 'teleop_profile':
+                    worker.cmd.put(('teleop_profile', bool(req.get('on', True))))
+                    return self._json({'ok': True})
+                elif op == 'pose':
+                    joints = dict(req.get('joints') or {})
+                    worker.cmd.put(('pose', joints))
+                    if rec is not None and joints:
+                        rec.note_action({j: float(v) for j, v in joints.items()})
+                    return self._json({'ok': True})
                 elif op == 'goto':
                     worker.cmd.put(('goto', req['joint'], float(req['value'])))
+                    if rec is not None:
+                        rec.note_action({req['joint']: float(req['value'])})
                 elif op == 'stop_test':
                     worker.cmd.put(('stop_test', req['joint'], float(req['target']),
                                     float(req.get('wait', 1.0))))
@@ -453,7 +636,12 @@ def make_handler(worker, kin, cam, dep):
                     # 사용자가 잡아 둔 홈이 mapping.json 에 있으면 그것을 쓴다
                     hq = arm_lib.load_mapping().get('home_q', HOME_Q)
                     worker.cmd.put(('move_q', hq, 2.5))
-                elif op == 'ik':
+                    if rec is not None:
+                        mph = arm_lib.load_mapping()
+                        rec.note_action({j: mph['signs'][j] * math.degrees(hq[i])
+                                         + mph['offsets'][j]
+                                         for i, j in enumerate(arm_lib.JOINTS)})
+                elif op in ('ik', 'ik_preview'):
                     x, y, z = (float(req[k]) for k in 'xyz')
                     pitch = math.radians(float(req.get('pitch', -90)))
                     bf = tuple(p + o for p, o in zip((x, y, z), arm_lib.PAN0))
@@ -472,26 +660,106 @@ def make_handler(worker, kin, cam, dep):
                             / mpj['signs']['wrist_roll'])
                     fk = kin.fk_pos(q)
                     pan = [round(p - o, 4) for p, o in zip(fk, arm_lib.PAN0)]
+                    mpj = arm_lib.load_mapping()
+                    tgt = {j: round(mpj['signs'][j] * math.degrees(q[i])
+                                    + mpj['offsets'][j], 2)
+                           for i, j in enumerate(arm_lib.JOINTS)}
+                    if op == 'ik_preview':
+                        # ★ 실행 전 검증 (plan → validate → execute). 팔에는
+                        # 아무 명령도 내리지 않는다 — 캘리브 범위를 실제 이동과
+                        # 같은 게이트로 미리 보고, 자세를 미러에 띄운다. 거부될
+                        # 자세를 팔이 먼저 알게 되는 경로를 없앤다.
+                        why, _bad = worker._clamp_to_calib(dict(tgt))
+                        cur = worker.snapshot().get('pos') or {}
+                        deg = dict(tgt, gripper=cur.get('gripper', 30))
+                        shown = False
+                        if mir is not None:
+                            mir.ensure()
+                            shown = bool(mir.request(
+                                '/preview',
+                                {'deg': deg,
+                                 'hold': float(req.get('hold', 4.0))}
+                            ).get('ok'))
+                        return self._json({'ok': why is None, 'preview': True,
+                                           'mirror': shown, 'msg': why or '',
+                                           'q': [round(v, 4) for v in q],
+                                           'fk_pan': pan, 'deg': tgt})
                     # 보간 시간을 거리 비례로 (2026-08-20): 고정 3초는 짧은
                     # 구간을 굼뜨게, 긴 구간은 속도상한에 눌려 프로파일이
                     # 어긋났다. 최대 관절 이동량 / (상한 × 0.85) 로 잡는다.
                     secs = 3.0
                     try:
-                        mpj = arm_lib.load_mapping()
-                        tgt = {j: mpj['signs'][j] * math.degrees(q[i])
-                               + mpj['offsets'][j]
-                               for i, j in enumerate(arm_lib.JOINTS)}
                         cur = worker.snapshot().get('pos') or {}
                         md = max(abs((tgt[j] - cur.get(j, tgt[j]) + 180)
                                      % 360 - 180) for j in arm_lib.JOINTS)
                         vel = worker._profile_vel() * 0.087   # [°/s]
-                        secs = min(5.0, max(0.8, md / (vel * 0.85)))
+                        secs = min(3.5, max(0.5, md / (vel * 1.6)))
                     except Exception:
                         pass
                     worker.cmd.put(('move_q', list(q), round(secs, 2)))
+                    if rec is not None:
+                        rec.note_action(tgt)
                     return self._json({'ok': True,
                                        'q': [round(v, 4) for v in q],
                                        'fk_pan': pan})
+                elif op == 'cam_home':
+                    # 뎁스캠을 정합 기준각으로 — 파지 전 필수 단계. 버스 소유자가
+                    # Worker 라 큐로 넘긴다(별도 프로세스가 같은 포트를 열면 경합).
+                    worker.cmd.put(('cam_home',))
+                    return self._json({'ok': True, 'queued': True})
+                elif op == 'cam_move':
+                    worker.cmd.put(('cam_move', req['axis'], float(req['delta'])))
+                    return self._json({'ok': True, 'queued': True})
+                elif op in ('rec_start', 'rec_stop', 'rec_cancel', 'rec_replay'):
+                    if rec is None:
+                        return self._json({'ok': False, 'msg': '레코더 비활성'}, 503)
+                    if op == 'rec_start':
+                        rid = str(req.get('repo_id') or '').strip()
+                        if not rid or '/' in rid or rid.startswith('.'):
+                            return self._json({'ok': False,
+                                               'msg': '데이터셋 이름을 확인하세요 '
+                                                      '(빈 값·/·. 로 시작 불가)'}, 400)
+                        return self._json(rec.start_episode(
+                            rid, req.get('task') or '', int(req.get('fps', 10)),
+                            wrist=bool(req.get('wrist', True)),
+                            depth=bool(req.get('depth', True)),
+                            pointmap=bool(req.get('pointmap', False))))
+                    if op == 'rec_stop':
+                        return self._json(rec.stop_episode(save=True))
+                    if op == 'rec_cancel':
+                        return self._json(rec.stop_episode(save=False))
+                    # rec_replay — 기록된 궤적을 미러에서 되돌려 본다(팔 정지)
+                    if mir is None:
+                        return self._json({'ok': False, 'msg': '미러 비활성'}, 503)
+                    try:
+                        frames = ds_record.episode_frames(
+                            req['repo_id'], int(req.get('episode', 0)),
+                            stride=int(req.get('stride', 1)))
+                    except Exception as e:
+                        return self._json({'ok': False,
+                                           'msg': f'에피소드 읽기 실패: {e}'}, 400)
+                    if not frames:
+                        return self._json({'ok': False, 'msg': '프레임 없음'}, 400)
+                    mir.ensure()
+                    r = mir.request('/replay', {'frames': frames,
+                                                'fps': float(req.get('fps', 10))},
+                                    timeout=20.0)
+                    return self._json(dict(r, frames=len(frames)))
+                elif op in ('mirror_view', 'mirror_live', 'mirror_replay'):
+                    # 미러는 표시 계층이라 팔을 건드리지 않는다 — 데몬으로 중계만
+                    if mir is None:
+                        return self._json({'ok': False, 'msg': '미러 비활성'}, 503)
+                    mir.ensure()
+                    if op == 'mirror_view':
+                        body = {k: req[k] for k in
+                                ('azimuth', 'elevation', 'distance') if k in req}
+                        return self._json(mir.request('/view', body))
+                    if op == 'mirror_live':
+                        return self._json(mir.request('/live', {}))
+                    return self._json(mir.request(
+                        '/replay', {'frames': req.get('frames') or [],
+                                    'fps': float(req.get('fps', 10))},
+                        timeout=10.0))
                 else:
                     return self._json({'error': f'unknown op {op}'}, 400)
                 self._json({'ok': True})
@@ -515,16 +783,33 @@ def main():
                     help='깊이 캡처 데몬(depth_daemon.py)의 HTTP 포트')
     ap.add_argument('--cam', type=int, default=4,
                     help='V4L2 인덱스 (/dev/videoN). -1이면 캠 끔')
+    ap.add_argument('--no-mirror', dest='mirror', action='store_false',
+                    help='MuJoCo 미러(디지털 트윈)를 끈다')
+    ap.add_argument('--mirror-port', type=int, default=8768,
+                    help='미러 렌더 데몬(sim/mirror_daemon.py)의 HTTP 포트')
+    ap.add_argument('--piece', default='cube',
+                    choices=['cube', 'lying', 'standing'],
+                    help='미러에 그릴 물체 프록시')
+    ap.add_argument('--no-record', dest='record', action='store_false',
+                    help='LeRobot 데이터셋 기록 기능을 끈다')
     a = ap.parse_args()
 
     port = a.port_serial
     if port == 'auto':
-        import glob
-        cands = sorted(glob.glob('/dev/ttyACM*')) or sorted(glob.glob('/dev/ttyUSB*'))
+        # 신원 검증을 통과한 포트만 (arm_lib.find_arm_port) — 팔이 꺼져 있을 때
+        # 남의 USB-시리얼 보드를 팔로 집는 사고를 막는다 (2026-08-21 실측)
+        cands = [p for p in [arm_lib.find_arm_port()] if p]
         if not cands:
-            raise SystemExit('시리얼 포트를 못 찾았어요 — USB 케이블과 보드 전원을 확인하세요')
-        port = cands[0]
-        print(f'포트 자동 선택: {port}')
+            # 포트가 없어도 서버는 띄운다 (2026-08-21). 여기서 죽으면 팔 전원이
+            # 꺼져 있다는 이유로 미러·깊이캠·패널까지 통째로 못 뜬다 — 데이터셋
+            # 검수나 시뮬 작업은 팔 없이도 하는 일이다. Worker._do_connect 가
+            # 연결 시점에 포트를 재탐색하므로, 나중에 꽂아도 그대로 붙는다.
+            port = '/dev/ttyACM0'
+            print('팔로 확인된 시리얼 포트 없음 — 팔 없이 기동합니다 '
+                  '(전원·USB 를 연결하고 [연결]을 누르면 포트를 다시 찾습니다)')
+        else:
+            port = cands[0]
+            print(f'포트 자동 선택: {port}')
 
     worker = Worker(port, a.id)
     worker.start()
@@ -541,9 +826,29 @@ def main():
         cam = None
 
     dep = Depth(a.depth_port) if a.depth else None
+    mir = None
+    if a.mirror:
+        if Mirror.python_bin() is None:
+            print('mujoco 환경(rlwalk) 없음 — 미러 비활성 (/mirror 503)')
+        else:
+            mir = Mirror(a.mirror_port, a.piece)   # 첫 요청에 기동(ensure)
+    rec = ds_record.Recorder(worker, cam, dep) if a.record else None
     ThreadingHTTPServer.daemon_threads = True   # 남은 스트림 스레드가 종료를 막지 않게
+    # ★ 단일 인스턴스 잠금 (2026-08-24) — 패널이 둘 뜨면 같은 시리얼 포트를
+    # 두 프로세스가 물고 명령 유실·패킷 실패·유령 무응답이 생긴다(하루 종일
+    # 실측). flock 이라 프로세스가 어떻게 죽든 잠금은 자동 해제된다.
+    import fcntl
+    global _panel_lock
+    _panel_lock = open('/tmp/so101_panel.lock', 'w')
+    try:
+        fcntl.flock(_panel_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print('다른 패널 인스턴스가 이미 실행 중입니다 — 종료 (중복 기동 금지)')
+        sys.exit(1)
+    _panel_lock.write(str(os.getpid())); _panel_lock.flush()
+
     srv = ThreadingHTTPServer(('127.0.0.1', a.http),
-                              make_handler(worker, kin, cam, dep))
+                              make_handler(worker, kin, cam, dep, mir, rec))
     print(f'SO-101 패널 → http://127.0.0.1:{a.http}  (시리얼 {port})')
 
     # SIGTERM(systemctl stop · kill)에도 정리 경로를 타게 한다. 기본 동작은 즉시
@@ -562,9 +867,16 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        if rec is not None:
+            rec.shutdown()          # 기록 중이면 저장하고 끝낸다 — 버리지 않는다
+        if mir is not None:
+            mir.shutdown()          # 렌더 데몬을 남기면 GPU 를 문 고아가 된다
         if dep is not None:
             dep.shutdown()
-        worker.cmd.put(('disconnect',))
+        # ★ 토크 유지 종료 (2026-08-24) — 팔 자세와 무관하게 토크를 끊던 옛
+        # 경로는 펴진 팔을 책상에 떨어뜨렸다. 토크 해제는 사용자의 명시적
+        # '해제'(disconnect op)에서만.
+        worker.cmd.put(('disconnect_hold',))
         worker.stop()
 
 
