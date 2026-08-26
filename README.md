@@ -71,4 +71,5 @@ ros2 bag record ─────────┘                        └─tren
 
 - `docs/HANDOFF.md` — 지금 상태, 검증한 숫자, 이미 당한 함정, 남은 일
 - `docs/RESEARCH_CLAIMS.md` — 시장·기술 조사 원자료 (출처 23건 · 주장 115개)
+- `docs/PHYSICAL_AI_PORTFOLIO_20260826.md` — sim-to-real 기록 계약과 관련 논문별 적용 추천
 - `projects/slam/README.md` — 새 프로젝트를 태우는 순서
