@@ -27,6 +27,20 @@ HE = json.loads((pathlib.Path(__file__).parent / 'handeye.json').read_text())
 R, T = np.array(HE['R']), np.array(HE['t'])
 FLOOR = arm_lib.load_gain('floor_z_m')['floor_z_m']
 OFF = arm_lib.load_gain('grasp_xy_offset_m')['grasp_xy_offset_m']
+
+# 큐브 교시 오프셋은 실물 교시로만 생기는 값이라, 리허설은 주입해서 돈다 —
+# 교시 여부에 회귀 검증이 묶이면 "교시 전에는 테스트가 없는" 구간이 생긴다.
+# 체스말과 같은 값을 넣어 롤 기대식(pan = atan2(ty,tx))을 그대로 쓴다.
+_REAL_LOAD_GAIN = arm_lib.load_gain
+
+
+def _load_gain(key):
+    if key == 'cube_xy_offset_m':
+        return {'cube_xy_offset_m': OFF}
+    return _REAL_LOAD_GAIN(key)
+
+
+arm_lib.load_gain = _load_gain
 FX = FY = 577.31
 W, H = 640, 480
 

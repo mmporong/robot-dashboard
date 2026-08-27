@@ -60,7 +60,7 @@
         border-radius:6px;backdrop-filter:blur(2px)}
   @media (max-width:980px){ .feeds{grid-template-columns:1fr;grid-template-rows:1fr 1fr} }
   .stage .nocam{color:#6B7683;font-size:13px}
-  .hud{position:absolute;top:10px;left:12px;right:12px;display:flex;gap:6px;
+  .hud{position:absolute;top:10px;left:12px;right:12px;display:flex;gap:6px;flex-wrap:wrap;
        pointer-events:none}
   .badge{display:inline-flex;align-items:center;gap:6px;background:rgba(10,14,18,.72);
          color:var(--stage-ink);border-radius:7px;padding:4px 10px;font-size:11px;
@@ -69,6 +69,8 @@
   .badge .led{width:7px;height:7px;border-radius:50%;background:#5B6670}
   .badge.on .led{background:#34D399}
   .badge.warn .led{background:#FBBF24}
+  .badge.critical{font-size:12.5px}
+  .ftag.warn{color:#FDE68A;border:1px solid rgba(251,191,36,.65)}
   .badge:last-child{margin-left:auto}
 
   .ops{display:flex;flex-direction:column;gap:9px;min-height:0;overflow:auto}
@@ -172,6 +174,7 @@
     <button class="chip" id="bTon" disabled>토크 ON</button>
     <button class="chip hot" id="bToff">토크 OFF</button>
     <button class="stop-big" id="bStop">⏹ 정지<small>SPACE</small></button>
+    <button class="chip" id="bRearm" disabled>▶ 정지 해제</button>
   </div>
 
   <div class="main">
@@ -198,7 +201,10 @@
         <span class="badge" id="hC"><span class="led"></span>연결</span>
         <span class="badge" id="hK"><span class="led"></span>캘리브</span>
         <span class="badge" id="hT"><span class="led"></span>토크</span>
+        <span class="badge critical warn" id="hSafe"><span class="led"></span>안전 검증 전</span>
+        <span class="badge critical warn" id="hBase"><span class="led"></span>베이스 증거 없음</span>
         <span class="badge warn" id="hPan"><span class="led"></span>팬 잠금 없음</span>
+        <span class="badge" id="hCmd"><span class="led"></span>명령 대기</span>
         <span class="badge num" id="hTemp">—°C</span>
         <span class="badge num" id="hVolt">—V</span>
         <span class="badge" id="hR" hidden><span class="led"></span>범위 기록 중</span>
@@ -280,7 +286,7 @@
 const ARM=['shoulder_pan','shoulder_lift','elbow_flex','wrist_flex','wrist_roll'];
 const ALL=[...ARM,'gripper'];
 const $=id=>document.getElementById(id);
-const esc=s=>String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const CSRF_TOKEN="__SO101_CSRF__";
 
 /* MJPEG가 잠깐 늦게 뜨더라도 요소를 지우지 않고 재연결한다. */
 function retryFeed(id,path,label){
@@ -315,7 +321,8 @@ document.querySelectorAll('.jbtn').forEach(b=>b.disabled=true);
 
 async function cmd(body){
   try{
-    const r=await fetch('/cmd',{method:'POST',headers:{'Content-Type':'application/json'},
+    const r=await fetch('/cmd',{method:'POST',headers:{'Content-Type':'application/json',
+                                'X-SO101-CSRF':CSRF_TOKEN},
                                 body:JSON.stringify(body)});
     const out=await r.json();
     if(!r.ok||out.ok===false) $('log').textContent=out.msg||out.error||`명령 실패 (${r.status})`;
@@ -327,6 +334,7 @@ $('bDisc').onclick=()=>cmd({op:'disconnect'});
 $('bTon').onclick =()=>cmd({op:'torque',on:true});
 $('bToff').onclick=()=>cmd({op:'torque',on:false});
 $('bStop').onclick=()=>cmd({op:'stop'});
+$('bRearm').onclick=()=>cmd({op:'rearm'});
 $('bCopy').onclick=async()=>{
   const txt=window.__logRaw||$('log').innerText;
   try{ await navigator.clipboard.writeText(txt); }
@@ -358,10 +366,9 @@ $('speed').addEventListener('change',()=>cmd({op:'speed',pct:+$('speed').value})
 $('bIK').onclick=async()=>{
   const r=await cmd({op:'ik',x:$('ix').value,y:$('iy').value,z:$('iz').value,pitch:$('ip').value});
   if(!r) return;
-  $('ikout').innerHTML = r.ok
-    ? `q = <span class="num">[${r.q.join(', ')}]</span><br>`
-      +`예측 TCP <span class="num">(${r.fk_pan.join(', ')})</span> — 3초 보간 이동 중`
-    : `${r.msg}`;
+  $('ikout').textContent = r.ok
+    ? `q = [${r.q.join(', ')}] · 예측 TCP (${r.fk_pan.join(', ')}) — 보간 이동 중`
+    : String(r.msg||'이동 실패');
 };
 
 /* 시뮬 확인 — 팔은 그대로 두고 미러에만 그린다(plan → validate → execute).
@@ -371,33 +378,44 @@ $('bPrev').onclick=async()=>{
                      z:$('iz').value,pitch:$('ip').value,hold:5});
   if(!r) return;
   if(r.ok){
-    $('ikout').innerHTML=`미러에 4초간 표시 — q = <span class="num">[${r.q.join(', ')}]</span><br>`
-      +`예측 TCP <span class="num">(${r.fk_pan.join(', ')})</span>`
-      +(r.mirror?'':' <b>(미러 꺼짐 — 계산만)</b>')+' · 팔은 움직이지 않았습니다';
+    $('ikout').textContent=`미러에 4초간 표시 — q = [${r.q.join(', ')}] · `
+      +`예측 TCP (${r.fk_pan.join(', ')})`
+      +(r.mirror?'':' (미러 꺼짐 — 계산만)')+' · 팔은 움직이지 않았습니다';
   }else{
-    $('ikout').innerHTML=`실행하면 거부됩니다 — ${r.msg||'IK 해 없음'}`;
+    $('ikout').textContent=`실행하면 거부됩니다 — ${r.msg||'IK 해 없음'}`;
   }
 };
 $('bPiece').onclick=async()=>{
   const r=await cmd({op:'mirror_piece',x:$('ix').value,y:$('iy').value});
-  if(r&&r.ok) $('ikout').innerHTML=`시뮬 큐브를 <span class="num">(${$('ix').value}, ${$('iy').value})</span>에 배치했습니다 · 팔은 움직이지 않았습니다`;
+  if(r&&r.ok) $('ikout').textContent=`시뮬 큐브를 (${$('ix').value}, ${$('iy').value})에 배치했습니다 · 팔은 움직이지 않았습니다`;
 };
 
 /* 데이터셋 — LeRobot 표준 포맷 기록·목록·미러 재생 */
 let recOn=false;
+let recStatusKnown=false;
+let recordStartReady=false;
+function setRecorderUnavailable(message){
+  recStatusKnown=false;
+  recOn=false;
+  $('bRec').disabled=true;
+  $('dsout').textContent=message;
+}
 $('bRec').onclick=async()=>{
   if(!recOn){
+    if(!recordStartReady){
+      $('dsout').textContent='기록 차단 — 손목캠 새 프레임과 안전 상태를 확인하세요';
+      return;
+    }
     const r=await cmd({op:'rec_start',repo_id:$('dsName').value.trim(),
                        task:$('dsTask').value.trim(),fps:+$('dsFps').value});
     if(!r) return;
-    $('dsout').innerHTML = r.ok
-      ? `기록 시작 — <b>${r.repo_id}</b> · ${r.fps}fps · 카메라 ${r.cameras.join(', ')}<br>`
-        +`<span class="num">${r.root}</span>`
-      : r.msg;
+    $('dsout').textContent = r.ok
+      ? `기록 시작 — ${r.repo_id} · ${r.fps}fps · 카메라 ${r.cameras.join(', ')} · ${r.root}`
+      : String(r.msg||'기록 시작 실패');
   }else{
     const r=await cmd({op:'rec_stop'});
     if(!r) return;
-    $('dsout').innerHTML = r.ok
+    $('dsout').textContent = r.ok
       ? `저장 완료 — ${r.frames} 프레임 · 회차 ${r.episodes}` : r.msg;
     loadDatasets();
   }
@@ -407,12 +425,23 @@ $('bRecCancel').onclick=async()=>{
   if(r) $('dsout').textContent = r.ok ? `버렸습니다 (${r.frames} 프레임)` : r.msg;
 };
 async function loadDatasets(){
-  let d; try{ d=await (await fetch('/rec/list')).json(); }catch(e){ return; }
-  const el=$('dslist'); el.innerHTML='';
+  let d;
+  try{
+    const response=await fetch('/rec/list');
+    if(!response.ok) throw new Error(`dataset list ${response.status}`);
+    d=await response.json();
+  }catch(e){
+    setRecorderUnavailable('기록 상태 확인 실패 — 서버 연결을 확인하세요');
+    return;
+  }
+  const el=$('dslist'); el.replaceChildren();
   for(const s of (d.datasets||[])){
     const row=document.createElement('div'); row.className='dsrow';
-    row.innerHTML=`<b>${s.repo_id}</b> 회차 ${s.episodes} · ${s.frames} 프레임`
-                 +`<span class="num">${s.fps}fps</span>`;
+    const name=document.createElement('b'); name.textContent=String(s.repo_id||'');
+    const info=document.createTextNode(` 회차 ${s.episodes} · ${s.frames} 프레임 `);
+    const fps=document.createElement('span'); fps.className='num';
+    fps.textContent=`${s.fps}fps`;
+    row.append(name,info,fps);
     const b=document.createElement('button'); b.textContent='미러 재생';
     b.title='기록된 궤적을 시뮬에서 되돌려 봅니다 — 팔은 움직이지 않습니다';
     b.onclick=async()=>{
@@ -422,18 +451,32 @@ async function loadDatasets(){
     };
     row.appendChild(b); el.appendChild(row);
   }
-  if(!(d.datasets||[]).length) el.innerHTML='<div class="dsrow">아직 수집된 데이터셋이 없습니다</div>';
+  if(!(d.datasets||[]).length){
+    const empty=document.createElement('div'); empty.className='dsrow';
+    empty.textContent='아직 수집된 데이터셋이 없습니다'; el.appendChild(empty);
+  }
 }
 loadDatasets();
 setInterval(async()=>{
-  let s; try{ s=await (await fetch('/rec/status')).json(); }catch(e){ return; }
+  let s;
+  try{
+    const response=await fetch('/rec/status');
+    if(!response.ok) throw new Error(`record status ${response.status}`);
+    s=await response.json();
+  }catch(e){
+    setRecorderUnavailable('기록 상태 알 수 없음 — 기록 조작을 차단했습니다');
+    return;
+  }
+  const recovered=!recStatusKnown;
+  recStatusKnown=true;
   recOn=!!s.recording;
-  $('bRec').innerHTML = recOn ? '■ 기록 정지' : '● 기록 시작';
+  $('bRec').textContent = recOn ? '■ 기록 정지' : '● 기록 시작';
   if(recOn){
-    $('dsout').innerHTML=`<span class="recon">● 기록 중</span> ${s.repo_id} — `
-      +`${s.frames} 프레임 · ${s.seconds}s · 상태 정지 비율 <b>${s.dup_pct}%</b>`
-      +(s.dup_pct>60?' <b>(움직임이 거의 없습니다)</b>':'');
+    $('dsout').textContent=`● 기록 중 ${s.repo_id} — ${s.frames} 프레임 · `
+      +`${s.seconds}s · 상태 정지 비율 ${s.dup_pct}%`
+      +(s.dup_pct>60?' (움직임이 거의 없습니다)':'');
   }else if(s.err){ $('dsout').textContent=s.err; }
+  else if(recovered){ $('dsout').textContent='기록 상태 복구 — 새 에피소드 시작 가능'; }
 },1000);
 
 /* 미러 시점 — 데몬이 카메라 상태를 들고 있어 델타만 보낸다 */
@@ -449,7 +492,7 @@ let calibInit=false, tickBusy=false, lastStateAt=0;
 function markStateStale(){
   $('port').textContent='○ 상태 끊김';
   $('hC').className='badge warn';
-  for(const b of document.querySelectorAll('.jbtn,#bIK,#bHome,#bTon,#bRec,#joints input[type=range]'))
+  for(const b of document.querySelectorAll('.jbtn,#bIK,#bHome,#bTon,#bRec,#bRearm,#joints input[type=range]'))
     b.disabled=true;
 }
 async function tick(){
@@ -473,11 +516,41 @@ async function tick(){
   $('hC').className='badge'+(st.connected?' on':'');
   $('hK').className='badge'+(st.calibrated?' on':' warn');
   $('hT').className='badge'+(st.torque?' on':'');
+  $('hSafe').className='badge critical'+(st.safety_ready?' on':' warn');
+  $('hSafe').textContent=st.safety_ready?'● 안전 레지스터 확인':'● 안전 검증 전';
+  $('hBase').className='badge critical'+(st.base_interlock_active?' on':' warn');
+  const baseReason=st.base_interlock_reason||'정지 증거 없음';
+  $('hBase').textContent=st.base_interlock_active
+    ? '● 베이스 정지 확인'
+    : `● 베이스 인터록 차단 · ${baseReason}`;
+  $('hBase').title=baseReason;
   $('hR').hidden=!st.recording;
   $('hSpd').textContent=st.teleop?'무제한(텔레옵)':(st.speed_pct||15)+'%';
   const pan=st.pan_lock, tol=+(st.pan_tol||0);
   $('hPan').className='badge'+(pan==null?' warn':' on');
-  $('hPan').innerHTML='<span class="led"></span>'+(pan==null?'팬 잠금 없음':`팬 ${(+pan).toFixed(1)}° ±${tol.toFixed(1)}°`);
+  const panLed=document.createElement('span'); panLed.className='led';
+  $('hPan').replaceChildren(panLed,document.createTextNode(
+    pan==null?'팬 잠금 없음':`팬 ${(+pan).toFixed(1)}° ±${tol.toFixed(1)}°`));
+  const camera=st.vision&&st.vision.camera;
+  const cameraFresh=!!(camera&&camera.available&&!camera.stale);
+  if(camera){
+    $('ctag').className='ftag'+(camera.stale||!camera.available?' warn':'');
+    let cameraLabel;
+    if(!camera.available) cameraLabel='손목캠 · 미검출';
+    else if(camera.stale) cameraLabel='손목캠 · 프레임 만료';
+    else cameraLabel=`손목캠 · #${camera.sequence} · ${(camera.age||0).toFixed(2)}초`;
+    $('ctag').textContent=cameraLabel;
+  }
+  const command=st.last_command;
+  if(command){
+    const label={accepted:'접수',executing:'실행 중',completed:'완료',rejected:'거부'};
+    let commandClass='badge';
+    if(command.status==='rejected') commandClass+=' warn';
+    else if(command.status==='completed') commandClass+=' on';
+    $('hCmd').className=commandClass;
+    $('hCmd').textContent=`● ${command.op} · ${label[command.status]||command.status}`;
+    $('hCmd').title=command.reason||command.id||'';
+  }
   const temps=Object.values(st.temp||{}).map(Number).filter(Number.isFinite);
   const volts=Object.values(st.volt||{}).map(Number).filter(Number.isFinite);
   const tmax=temps.length?Math.max(...temps):null, vmin=volts.length?Math.min(...volts):null;
@@ -491,19 +564,24 @@ async function tick(){
 
   /* 캘리브 서랍: 첫 응답에서 상태에 맞춰 열고 닫는다 */
   if(!calibInit){ $('calibBox').open=!st.calibrated; calibInit=true; }
-  $('calSum').innerHTML='캘리브레이션 — '+(st.calibrated
-    ?'<b>완료</b> · 다시 하려면 펼치기'
-    :'<span class="todo">필요 — 펼쳐서 1→2→3 순서로</span>');
+  $('calSum').textContent='캘리브레이션 — '+(st.calibrated
+    ?'완료 · 다시 하려면 펼치기'
+    :'필요 — 펼쳐서 1→2→3 순서로');
 
   const calibView=st.calibrated&&!st.recording;
-  const motionReady=st.connected&&st.calibrated&&st.torque&&!st.recording;
+  const motionReady=st.connected&&st.calibrated&&st.torque&&st.safety_ready
+    &&st.base_interlock_active&&!st.stop_latched&&!st.recording;
   for(const b of document.querySelectorAll('.jbtn,#bIK,#bHome')) b.disabled=!motionReady;
-  $('bTon').disabled=!(st.connected&&st.calibrated);
-  $('bRec').disabled=!(st.connected&&st.calibrated);
+  $('bTon').disabled=!(st.connected&&st.calibrated&&st.safety_ready
+    &&st.base_interlock_active&&!st.stop_latched);
+  $('bRearm').disabled=!st.stop_latched;
+  recordStartReady=!!(st.connected&&st.calibrated&&st.safety_ready
+    &&st.base_interlock_active&&!st.stop_latched&&cameraFresh&&recStatusKnown);
+  $('bRec').disabled=recOn ? !recStatusKnown : !recordStartReady;
   for(const m of ALL){
     const v=st.pos[m];
     const s=$('s_'+m);
-    s.disabled=!calibView||!st.torque;
+    s.disabled=!motionReady;
     if(v===undefined){ $('v_'+m).textContent='—'; continue; }
     $('v_'+m).textContent=calibView?v.toFixed(1)+(m==='gripper'?'':'°'):v.toFixed(0)+'t';
     if(calibView&&!dragging[m]) s.value=v;
@@ -512,7 +590,15 @@ async function tick(){
   }
   const lines=(st.log||[]);
   window.__logRaw=lines.join('\n');
-  $('log').innerHTML=lines.map((l,i,a)=>i===a.length-1?`<b>${esc(l)}</b>`:esc(l)).join('\n');
+  const logNodes=[];
+  lines.forEach((line,index)=>{
+    if(index) logNodes.push(document.createTextNode('\n'));
+    if(index===lines.length-1){
+      const strong=document.createElement('b'); strong.textContent=String(line);
+      logNodes.push(strong);
+    }else logNodes.push(document.createTextNode(String(line)));
+  });
+  $('log').replaceChildren(...logNodes);
   $('log').scrollTop=$('log').scrollHeight;
 }
 setInterval(()=>{

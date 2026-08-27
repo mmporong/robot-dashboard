@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from _canonical_redirect import redirect_if_main as _redirect
+_redirect(__name__, 'scan_motors.py')
 """버스에 붙은 피텍 서보를 찾는다 — 읽기만 하고 아무것도 안 바꾼다.
 
 ID 부여(`lerobot-setup-motors`) 전후로 "지금 뭐가 몇 번으로 붙어 있나"를 보는 용도예요.
@@ -6,8 +8,8 @@ ID 부여(`lerobot-setup-motors`) 전후로 "지금 뭐가 몇 번으로 붙어 
 
 사용:
     conda activate lerobot
-    python3 ~/so101_tools/scan_motors.py                 # 기본 /dev/ttyACM0
-    python3 ~/so101_tools/scan_motors.py /dev/ttyACM1
+    python3 ~/so101-mobile-manipulation/scan_motors.py   # 기본 /dev/ttyACM0
+    python3 ~/so101-mobile-manipulation/scan_motors.py /dev/ttyACM1
 
 ## 응답이 0개일 때 보는 순서 (2026-08-14 실측)
 

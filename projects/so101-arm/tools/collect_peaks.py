@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from _canonical_redirect import redirect_if_main as _redirect
+_redirect(__name__, 'collect_peaks.py')
 """정상 이동의 전류 피크 수집 — CURRENT_STOP(현재 250, 데이터시트 추정) 보정용.
 
 검증된 POSES 상층 지점만 오간다(z ≥ -0.01 · floor_z 무효 상태에서 안전).

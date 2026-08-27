@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from _canonical_redirect import redirect_if_main as _redirect
+_redirect(__name__, 'pick_demo.py')
 """파지 데모 — 뎁스캠이 본 빨간 물체를 광선∩책상평면으로 위치 추정해 잡는다.
 
 pick_red.py(손목캠 폐루프)와 달리 **hand-eye 정합**을 쓰는 첫 소비자다:
@@ -36,9 +38,10 @@ POSE = {                    # (블롭 중심 높이, 파지 TCP 높이) — floo
     'cube':     (0.020, 0.010),   # 4×4cm 큐브(2026-08-20 전환): 중심 2cm,
                                   # 죠 끝 floor+10mm — 패드가 몸통 중하부를 문다
 }
-GRIP_OPEN = {'standing': 55, 'lying': 55,
-             'cube': 80}     # 4cm 폭은 55 개방이 부족 — 80 으로 벌린다
-                             # (99 는 아랫턱 180° 젖힘 실측 — 그 아래로 유지)
+GRIP_OPEN = {'standing': 45, 'lying': 45,
+             'cube': 45}     # 실측(2026-08-21): 4cm 큐브는 19.6 에서 물린다.
+                             # 80 은 죠가 90° 를 넘게 젖혀져 물체를 밀어내고,
+                             # 여는 데만 20초가 걸린다 — 물체 폭 + 여유면 충분
 APPROACH_CAND = (0.02, 0.005, -0.01)   # 접근 고도 후보 — 원거리 x 는 높은 z 가
 LIFT_CAND = (0.03, 0.015, 0.0)         # 안 풀린다(리치). IK 되는 첫 값을 쓴다
 GRIP_OPEN_ABS = 55          # 절대 개방각 — delta 방식은 이미 열린 상태에서 이중
@@ -65,6 +68,35 @@ def bail(msg):
     post('stop')            # ARM 목표만 현재로 — 그리퍼 예압 유지
     print(f'중단: {msg} — 정지(토크 유지)')
     sys.exit(1)
+
+
+def ensure_cam_home(timeout=90.0):
+    """뎁스캠이 정합 기준각에 있는지 보고, 아니면 **서버가 되돌린다**.
+
+    정합(handeye.json)은 카메라가 그 각도에 있을 때만 성립한다. 사람이 손으로
+    돌려 놓거나 다른 데를 보고 온 뒤에 그냥 진행하면, 좌표를 믿을 수 없는 채로
+    팔이 움직인다. 그렇다고 매번 사람이 맞추게 하는 것도 설계 실패다
+    (2026-08-21 사용자 지시) — 시작할 때 알아서 맞춘다.
+
+    카메라 서보가 없는 구성이면 조용히 넘어간다(종전 동작).
+    """
+    cam = get('/state').get('cam')
+    if not cam or cam.get('at_home') is None:
+        return
+    if cam.get('at_home'):
+        return
+    off = {k: v.get('off_deg') for k, v in (cam.get('axes') or {}).items()}
+    print(f'뎁스캠이 기준각에서 벗어나 있습니다 {off} — 되돌립니다')
+    post('cam_home')
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        time.sleep(1.0)
+        cam = get('/state').get('cam') or {}
+        if cam.get('at_home'):
+            print('   기준각 복귀 완료 — 정합 유효')
+            return
+    sys.exit('뎁스캠을 기준각으로 되돌리지 못했습니다 (이동 안 함) — 정합을 '
+             '믿을 수 없어 중단합니다. cam_calib.py --show 로 상태를 확인하세요')
 
 
 def read_bearing(tries=10, need=5, with_axis=False):
@@ -154,7 +186,7 @@ def read_pix(tries=6, need=3):
     return out if len(out) >= need else None
 
 
-def cube_face_yaw(R, t, floor, pix_frames, band=(0.028, 0.055)):
+def cube_face_yaw(R, t, floor, pix_frames, band=None):
     """깊이 화소를 3D→로봇좌표로 올려 **책상 위 높이**로 윗면만 고르고,
     그 xy 에 회전사각형을 적합해 면 방향 yaw [°, mod 90) 를 얻는다.
 
@@ -168,17 +200,25 @@ def cube_face_yaw(R, t, floor, pix_frames, band=(0.028, 0.055)):
     (고무 등)는 None — 방향 미제공이 오방향보다 낫다(fail-safe)."""
     yaws, centers = [], []
     for pix, fx, fy, w, h in pix_frames:
-        P = []
+        pts, hgts = [], []
         for u, v, z_mm in pix:
             z = z_mm / 1000.0
             p_cam = np.array([(u - w / 2) * z / fx, (v - h / 2) * z / fy, z])
             p_rob = R @ p_cam + t
-            hgt = p_rob[2] - floor
-            if band[0] <= hgt <= band[1]:
-                P.append(p_rob[:2])
-        if len(P) < 20:
+            pts.append(p_rob[:2])
+            hgts.append(p_rob[2] - floor)
+        if len(pts) < 20:
             continue
-        P = np.array(P)
+        # ★ 상단 군집을 **상대적으로** 고른다 (2026-08-20 밤 실측: 시야각에
+        # 따라 구조광 거리에 수 cm 계통 편향 — 절대 높이 밴드(2.8~5.5cm)는
+        # 편향 지점에서 전 표본을 버렸다). 편향은 균일 평행이동이라 각도는
+        # 보존된다 — 이 함수는 **각도 전용**이고 중심은 쓰지 않는다.
+        hgts = np.array(hgts)
+        top = np.percentile(hgts, 90)
+        sel = hgts >= top - 0.018
+        if sel.sum() < 20:
+            continue
+        P = np.array(pts)[sel]
         best = None
         for adeg in range(90):
             c, s = math.cos(math.radians(adeg)), math.sin(math.radians(adeg))
@@ -260,6 +300,7 @@ def main():
     # 죠가 물체를 살짝 스쳤다 — "아랫턱이 물체보다 조금 더 왼쪽에 온 상태로
     # 파지돼도 된다". 다음 실물 세션에서 손목캠으로 방향 확인 후 수 mm 보정.
 
+    ensure_cam_home()          # 관측 전에 정합이 유효한 자세인지 보장한다
     brg, axis_img, fxy = read_bearing(with_axis=True)
     loc = ray_plane(brg, R, t, floor, h_center) if brg is not None else None
     if loc is None:
@@ -273,21 +314,29 @@ def main():
            if axis_img is not None and a.pose == 'lying' else None)
     yaw_face = None
     if a.pose == 'cube':
+        # ★ 위치 = 방위각∩평면 + **큐브 전용 교시 오프셋** (2026-08-20 밤 확정).
+        # 깊이 3D 중심은 시야각에 따른 구조광 거리 편향(실측 -39mm 높이 오판
+        # = 수 cm xy 오차)으로 폐기 — 방위각은 깊이를 안 써 면역이고, 형상별
+        # 중심 편향은 교시가 흡수한다(체스말과 같은 구성). 교시 전에는 멈춘다.
+        try:
+            C_OFF = arm_lib.load_gain('cube_xy_offset_m')['cube_xy_offset_m']
+        except SystemExit:
+            sys.exit('큐브 교시 오프셋이 없습니다 (이동 안 함) — 교시: 팔을 파지 '
+                     '높이에 두고 큐브를 죠 바로 아래 중앙에 놓은 뒤 '
+                     'python3 ~/so101-mobile-manipulation/teach_cube_offset.py 실행')
+        x, y = loc[0] - C_OFF[0], loc[1] - C_OFF[1]
+        # 방향은 깊이 점의 상대 상단 군집으로 (편향은 평행이동이라 각도 보존)
+        # ★ 판정 실패 = 중단 (fail-closed). 4cm 큐브는 대각(45°)이면 대각선이
+        # 5.7cm 라 개방 80(≈5.2cm)을 넘는다 — 방향을 모른 채 내려가면 모서리를
+        # 밀어내거나 헛집는다(2026-08-20 실물 오파지). 방향 미제공보다 중단이 낫다.
         pixf = read_pix()
         face = cube_face_yaw(R, t, floor, pixf) if pixf else None
         if face is None:
-            # ★ 강등 금지 (2026-08-20 밤 실측): 원거리(25cm+)에서 깊이가 희소해
-            # 윗면 실측이 무효가 되자 무게중심+체스 교시 오프셋으로 조용히
-            # 진행해 엉뚱한 지점을 집었다. 부정확한 추정으로는 움직이지 않는다.
-            sys.exit('큐브 깊이 표본 부족 — 윗면 실측 중심을 못 구했습니다 '
-                     '(이동 안 함). → 물체를 카메라가 잘 보는 정면 15~22cm '
-                     '지점으로 옮기고 다시 실행하세요')
-        # ★ 큐브 목표 = 윗면 실측 중심. 교시 오프셋(체스말 기하 전용)과
-        # 블롭 중심 편향을 둘 다 우회한다 (2026-08-20 실측: 기존 목표가
-        # 중심보다 y +24mm — 왼쪽 오파지 사고).
-        yaw_face, cx, cy = face
-        print(f'   윗면 중심 보정: ({x:+.3f},{y:+.3f}) → ({cx:+.3f},{cy:+.3f})')
-        x, y = cx, cy
+            sys.exit('큐브 면 방향 판정 실패 — 깊이 표본 부족/일관성 미달 '
+                     '(이동 안 함). 대각으로 놓이면 개방폭을 넘어 방향 없이는 '
+                     '잡을 수 없습니다 — 조명·시야·거리(50~90cm) 확인 후 재시도')
+        yaw_face = face[0]
+    OFF_EFF = C_OFF if a.pose == 'cube' else OFF
 
     def roll_for(yaw_deg, tx, ty):
         v = yaw_deg + 90.0 - math.degrees(math.atan2(ty, tx)) - CLOSE_AXIS
@@ -320,26 +369,62 @@ def main():
             if K.ik_best(*bf, pitch=math.radians(-90)) is not None:
                 return z
         return None
-    APPROACH_Z = feasible_z(APPROACH_CAND)
-    LIFT_Z = feasible_z(LIFT_CAND)
-    if APPROACH_Z is None or LIFT_Z is None:
-        hint = (f'팔 쪽으로 약 {100*(x-0.24):.0f}cm 당겨' if x > 0.24 else
-                f'팔에서 약 {100*(0.14-x):.0f}cm 멀리')
-        sys.exit(f'접근/상승 고도 후보가 전부 IK 불가 ({x:+.3f},{y:+.3f}) — 물체가 '
-                 f'리치 경계 밖입니다 (이동 안 함). → 물체를 {hint} 놓으세요 '
-                 f'(이상적 지점: 베이스 정면 15~22cm)')
-    print(f'   접근 z {APPROACH_Z:+.3f} · 상승 z {LIFT_Z:+.3f} (적응 선택)')
-    if not (0.10 <= x <= 0.28 and abs(y) <= 0.12):     # 가장 싼 검사 먼저
-        hx = ('팔 쪽으로' if x > 0.28 else '팔에서 멀리') if not (0.10 <= x <= 0.28) else ''
-        hy = ('중앙선 쪽으로' if abs(y) > 0.12 else '')
-        sys.exit(f'추정 위치가 작업 영역 밖 ({x:+.3f},{y:+.3f}) — 이동 안 함. '
-                 f'→ 물체를 {hx} {hy} 옮기세요 (정면 10~28cm·좌우 ±12cm, 이상적 15~22cm)')
     # 캘리브 범위 검사 — 이동 후 타임아웃이 아니라 이동 전에 잡는다 (m48)
     mp = arm_lib.load_mapping()
     import json as _json
     cal = _json.loads((pathlib.Path.home() / '.cache/huggingface/lerobot/'
                        'calibration/robots/so_follower/follower.json').read_text())
     bounds = arm_lib.calib_bounds(cal)
+
+    def in_bounds(q):
+        for i, jn in enumerate(J):
+            v = mp['signs'][jn] * math.degrees(q[i]) + mp['offsets'][jn]
+            if not (bounds[jn][0] + 2 <= v <= bounds[jn][1] - 2):
+                return False
+        return True
+
+    def reachable(px, py):
+        """세 고도(접근·파지·상승) 전부 IK + 캘리브 범위를 통과하는가."""
+        def fz(cands):
+            for z in cands:
+                bf = tuple(p + o for p, o in zip((px, py, z), arm_lib.PAN0))
+                q = K.ik_best(*bf, pitch=math.radians(-90))
+                if q is not None and in_bounds(q):
+                    return z
+            return None
+        return fz(APPROACH_CAND), fz([z_grip]), fz(LIFT_CAND)
+
+    APPROACH_Z, GRIP_OK, LIFT_Z = reachable(x, y)
+    if APPROACH_Z is None or LIFT_Z is None or GRIP_OK is None:
+        # ★ 고정 직사각형(옛 0.10~0.28 · ±0.12)으로 자르지 않는다 — 실측하면 팔은
+        # x 6~25cm 를 닿고 y 여유는 x 에 따라 ±20cm 까지 넓다(2026-08-21 IK 격자).
+        # 상수 상자는 **잡을 수 있는 자리를 미리 거부**했다. 판정은 IK 가 한다.
+        # 안내도 방향 어림이 아니라 **가장 가까운 실제 가능 지점**으로 준다.
+        best = None
+        for r_cm in range(1, 21):
+            r = r_cm / 100.0
+            for a_deg in range(0, 360, 10):
+                a = math.radians(a_deg)
+                nx, ny = x + r * math.cos(a), y + r * math.sin(a)
+                if all(v is not None for v in reachable(nx, ny)):
+                    best = (nx, ny, r)
+                    break
+            if best:
+                break
+        if best:
+            nx, ny, r = best
+            dx, dy = 100 * (nx - x), 100 * (ny - y)
+            way = (f'{"앞으" if dx > 0 else "뒤"}로 {abs(dx):.0f}cm' if abs(dx) >= 0.5 else '')
+            side = (f'{"왼" if dy > 0 else "오른"}쪽으로 {abs(dy):.0f}cm'
+                    if abs(dy) >= 0.5 else '')
+            move = ' · '.join(s for s in (way, side) if s)
+            sys.exit(f'추정 위치 ({x:+.3f},{y:+.3f}) 는 팔이 못 닿습니다 (이동 안 함). '
+                     f'→ 큐브를 {move} 옮기면 닿습니다 '
+                     f'(가장 가까운 가능 지점 {nx:+.3f},{ny:+.3f})')
+        sys.exit(f'추정 위치 ({x:+.3f},{y:+.3f}) 는 팔이 못 닿고, 20cm 안에 닿는 '
+                 f'지점도 없습니다 (이동 안 함) — 검출이 잘못됐을 수 있습니다. '
+                 f'뎁스캠이 작업대를 보고 있는지 확인하세요')
+    print(f'   접근 z {APPROACH_Z:+.3f} · 상승 z {LIFT_Z:+.3f} (적응 선택)')
     if roll is not None and not (bounds['wrist_roll'][0] + 2 <= roll
                                  <= bounds['wrist_roll'][1] - 2):
         sys.exit(f'목표 롤 {roll:+.1f}° 가 캘리브 범위 밖 (이동 안 함)')
@@ -372,23 +457,18 @@ def main():
     time.sleep(1.0)
     post('goto', joint='gripper', value=GRIP_OPEN.get(a.pose, GRIP_OPEN_ABS))
     wait_gripper_settle()
-    # 재관측(re-look) — 접근 자세에서 팔이 시야를 바꿨을 수 있어 한 번 갱신
-    if a.pose == 'cube':
-        pixf2 = read_pix(tries=4, need=2)
-        face2 = cube_face_yaw(R, t, floor, pixf2) if pixf2 else None
-        loc2 = (face2[1] + OFF[0], face2[2] + OFF[1]) if face2 else None
-        # ↑ 아래 공통 코드가 OFF 를 빼므로 미리 더해 상쇄한다 (큐브는 무오프셋)
-    else:
-        loc2 = locate(R, t, floor, h_center)
-    d2 = (math.hypot(loc2[0] - (x + OFF[0]), loc2[1] - (y + OFF[1]))
+    # 재관측(re-look) — 접근 자세에서 팔이 시야를 바꿨을 수 있어 한 번 갱신.
+    # 전 포즈 공통으로 방위각∩평면 사용 (깊이 편향 면역).
+    loc2 = locate(R, t, floor, h_center)
+    d2 = (math.hypot(loc2[0] - (x + OFF_EFF[0]), loc2[1] - (y + OFF_EFF[1]))
           if loc2 else None)
     if d2 is None:
         print('   재관측 실패 — 최초 추정 유지')
     elif d2 < 0.015:
-        x, y = loc2[0] - OFF[0], loc2[1] - OFF[1]
+        x, y = loc2[0] - OFF_EFF[0], loc2[1] - OFF_EFF[1]
         print(f'   재관측 보정 → ({x:+.3f}, {y:+.3f})')
     elif d2 < 0.03:
-        x, y = loc2[0] - OFF[0], loc2[1] - OFF[1]
+        x, y = loc2[0] - OFF_EFF[0], loc2[1] - OFF_EFF[1]
         print(f'   ⚠ 재관측 보정 {1000*d2:.0f}mm — 큽니다. 하강을 지켜보세요')
     else:
         bail(f'재관측이 {1000*d2:.0f}mm 어긋남 — 물체가 움직였거나 오검출 (m49)')

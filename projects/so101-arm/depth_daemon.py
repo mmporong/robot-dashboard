@@ -32,7 +32,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-TOOLS = pathlib.Path('~/so101_tools').expanduser()
+TOOLS = pathlib.Path('~/so101-mobile-manipulation').expanduser()
 sys.path.insert(0, str(TOOLS))
 
 # 캡처 루프가 이 시간 넘게 한 바퀴도 못 돌면 SDK 교착으로 보고 프로세스를 끝낸다.

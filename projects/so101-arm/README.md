@@ -4,6 +4,11 @@
 제어·캘리브레이션·MuJoCo·LeRobot 코드는 `~/so101-mobile-manipulation`이 정본이며,
 이 디렉터리는 브라우저 UI와 기록 대시보드만 소유한다.
 
+`projects/so101-arm/tools/`는 과거 대시보드 복제본이며 실행 정본이 아니다. 이 폴더의
+스크립트를 직접 실행하지 않는다. 팔·카메라·시뮬 명령은 반드시
+`~/so101-mobile-manipulation/`의 같은 이름 파일을 사용한다. tracked 실물 제어
+진입점은 직접 실행해도 정본의 같은 파일로 넘기며, 정본이 없으면 실행을 차단한다.
+
 ## 현재 구성
 
 ```text
@@ -28,6 +33,9 @@ conda activate lerobot
 python3 ./panel_server.py
 ```
 
+정본을 다른 위치에 checkout한 CI·개발 환경에서는
+`SO101_CANONICAL_DIR=/path/to/so101-mobile-manipulation`을 지정한다.
+
 브라우저 주소는 `http://127.0.0.1:8765`다. 서버는 외장 UVC 손목캠과 검증된
 SO-101 시리얼 어댑터를 자동 탐색한다. 팔이 꺼져 있어도 기록·MuJoCo 검수용으로
 패널 자체는 기동한다.
@@ -42,16 +50,29 @@ cd "$HOME/robot-dashboard"
 
 `check`는 설정뿐 아니라 `dashboard.html`이 템플릿과 JSON 입력보다 최신인지도 확인한다.
 
+## 오프라인 CI 범위
+
+secret이 없는 `dashboard-unit`은 실제 `panel_server.py`로 HTTP Origin·CSRF·JSON,
+명령 lifecycle, 카메라 freshness, UI·종료, legacy redirect 계약을 항상 검사한다.
+이 모드의 canonical fixture는 import 경계만 제공하며 예상 밖 호출은 즉시 실패한다.
+
+`canonical-integration`은 `SO101_CANONICAL_TOKEN`이 있을 때만 private 정본을 checkout해
+Worker·BaseMonitor 공개 API까지 다시 검사한다. secret이 없으면 로그에 integration
+skip을 명시한다. unit 통과는 canonical 안전 구현이나 실물 HIL 통과를 뜻하지 않는다.
+
 ## 화면에서 확인할 안전 상태
 
 - 연결·캘리브레이션·토크
 - 팬 잠금 중심과 허용폭: 현재 기준 `−15.6° ±7.0°`
+- 안전 레지스터와 베이스 정지 인터록 사유
+- 손목캠 캡처 sequence·age와 stale 상태
 - 최고 서보 온도와 최저 전압
 - 상태 수신 실패 시 이동 버튼 자동 비활성화
 - YOLO 케이블 가림 재검증 게이트
 
-`정지`와 `토크 OFF`는 상태가 끊겨도 계속 누를 수 있다. 조그·IK·홈 이동은 연결,
-캘리브레이션, 토크가 모두 확인된 때만 활성화된다.
+`정지`와 `토크 OFF`는 상태가 끊겨도 계속 누를 수 있다. 조그·슬라이더·IK·홈 이동은
+연결, 캘리브레이션, 토크, 안전 레지스터, 베이스 정지 인터록이 모두 확인된 때만
+활성화된다.
 
 ## 파일 역할
 

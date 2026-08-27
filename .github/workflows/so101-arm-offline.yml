@@ -1,0 +1,67 @@
+name: SO-101 dashboard offline
+
+on:
+  pull_request:
+    paths:
+      - 'projects/so101-arm/**'
+      - '.github/workflows/so101-arm-offline.yml'
+  push:
+    paths:
+      - 'projects/so101-arm/**'
+      - '.github/workflows/so101-arm-offline.yml'
+
+jobs:
+  dashboard-unit:
+    name: Dashboard-owned unit (no secrets)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Dashboard HTTP, UI, lifecycle, camera and legacy guards
+        env:
+          SO101_DASHBOARD_TEST_MODE: unit
+        run: python3 projects/so101-arm/test_vehicle_dashboard.py
+      - name: Legacy canonical authority guards
+        run: python3 projects/so101-arm/test_legacy_authority.py
+      - name: JavaScript syntax
+        run: sed -n '/<script>/,/<\/script>/p' projects/so101-arm/panel.html | sed '1d;$d' | node --check -
+      - name: Dashboard build check
+        run: python3 dash.py so101-arm check
+      - name: Legacy shell syntax
+        run: |
+          bash -n projects/so101-arm/tools/run_demo.sh
+          bash -n projects/so101-arm/tools/sim/restart_viewer.sh
+          sh -n projects/so101-arm/tools/usb_port_cycle.sh
+
+  canonical-integration:
+    name: Canonical integration (token-gated)
+    runs-on: ubuntu-latest
+    env:
+      SO101_CANONICAL_TOKEN: ${{ secrets.SO101_CANONICAL_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Integration skip notice
+        if: ${{ env.SO101_CANONICAL_TOKEN == '' }}
+        run: echo 'INTEGRATION — SKIP (SO101_CANONICAL_TOKEN secret 없음)'
+      - name: Checkout private canonical repository
+        if: ${{ env.SO101_CANONICAL_TOKEN != '' }}
+        uses: actions/checkout@v4
+        with:
+          repository: mmporong/so101-mobile-manipulation
+          path: so101-mobile-manipulation
+          token: ${{ secrets.SO101_CANONICAL_TOKEN }}
+      - uses: actions/setup-python@v5
+        if: ${{ env.SO101_CANONICAL_TOKEN != '' }}
+        with:
+          python-version: '3.11'
+      - name: Install integration dependencies
+        if: ${{ env.SO101_CANONICAL_TOKEN != '' }}
+        run: pip install numpy opencv-python-headless
+      - name: Run against actual canonical code
+        if: ${{ env.SO101_CANONICAL_TOKEN != '' }}
+        env:
+          SO101_DASHBOARD_TEST_MODE: integration
+          SO101_CANONICAL_DIR: ${{ github.workspace }}/so101-mobile-manipulation
+        run: python3 projects/so101-arm/test_vehicle_dashboard.py

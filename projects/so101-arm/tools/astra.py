@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from _canonical_redirect import redirect_if_main as _redirect
+_redirect(__name__, 'astra.py')
 """Orbbec Astra S 깊이 스트림 파이썬 바인딩 — ctypes 로 C API 를 직접 부른다.
 
 ## 왜 ctypes 인가

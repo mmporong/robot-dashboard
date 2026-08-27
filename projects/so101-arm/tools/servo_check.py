@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
+from _canonical_redirect import redirect_if_main as _redirect
+_redirect(__name__, 'servo_check.py')
 """버스에 물린 서보 하나를 진단한다 — 읽기만 하고 아무것도 바꾸지 않는다.
 
 교체·단락 진단용. 서보를 하나씩 물려 가며 돌리면 어느 것이 죽었는지 가려진다.
 
 ## 쓰는 법
 
-    python3 ~/so101_tools/servo_check.py
+    python3 ~/so101-mobile-manipulation/servo_check.py
 
 서보를 바꿔 물릴 때는 **반드시 전원을 끄고** 한다.
 

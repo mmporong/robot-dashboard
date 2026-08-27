@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from _canonical_redirect import redirect_if_main as _redirect
+_redirect(__name__, 'servo_calib.py')
 """손목캠 픽셀 ↔ 팔 이동량 대응(px/m) 실측 — 비주얼 서보잉의 유일한 미지수.
 
 캡스톤 시뮬 값(FWD 3091 · LAT -2554 px/m)은 87° D405 기준이라 이 웹캠에는 못 쓴다.

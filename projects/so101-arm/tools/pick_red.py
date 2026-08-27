@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from _canonical_redirect import redirect_if_main as _redirect
+_redirect(__name__, 'pick_red.py')
 """빨간 물체 파지 — 검출 → 좌우 정렬 → 전후 결정 → 하강 → 파지 → 들기.
 
 오늘(2026-08-18) 실측한 상수 넷으로 구성한다. 그 전에는 매 단계 눈으로 확인해야 했다.

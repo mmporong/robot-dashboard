@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from _canonical_redirect import redirect_if_main as _redirect
+_redirect(__name__, 'sweep_x.py')
 """전후(x)를 훑으며 물체까지의 거리를 추정한다 — 손목캠 단안이라 폐루프가 안 되는 축.
 
 x 이동은 손목 자세를 거의 안 바꿔 블롭 **위치**가 반응하지 않는다(실측 +8 px/m).

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from _canonical_redirect import redirect_if_main as _redirect
+_redirect(__name__, 'handeye.py')
 """뎁스캠 ↔ 로봇 좌표 정합 — 죠에 물린 빨간 물체로 대응쌍을 모아 강체 변환을 푼다.
 
 ## 무엇을 구하나
@@ -572,7 +574,8 @@ def main():
         gain = json.loads(gain_p.read_text())
         grp = gain.setdefault('stale_after_rereg', {})
         why = f'재정합({time.strftime("%Y-%m-%d %H:%M")})으로 기준 상실 — 재교시 필요'
-        marked = [k for k in ('grasp_xy_offset_m', 'wrist_grasp_target_px')
+        marked = [k for k in ('grasp_xy_offset_m', 'wrist_grasp_target_px',
+                               'cube_xy_offset_m')
                   if k in gain]
         for k in marked:
             grp[k] = why

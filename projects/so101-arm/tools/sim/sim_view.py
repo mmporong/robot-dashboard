@@ -10,7 +10,7 @@ p_sim = R @ p_K + t · qpos = URDF q 직결).
   뷰어(실시간 미러):  ~/miniforge3/envs/rlwalk/bin/python sim_view.py
   정지 자세 뷰어:     ... sim_view.py --deg "shoulder_pan=-6.3,shoulder_lift=-2.2,elbow_flex=0.9,wrist_flex=88.1,wrist_roll=0,gripper=2.6"
   스냅샷(무화면):     ... sim_view.py --deg "..." --snapshot out.png [--cam wrist_cam]
-  물체 수동 배치:     --piece-at "0.19,0.02" --piece lying|standing
+  물체 수동 배치:     --piece-at "0.19,0.02" [--piece-yaw 30] --piece cube|lying|standing
 """
 import argparse
 import json
@@ -23,28 +23,23 @@ import urllib.request
 import numpy as np
 
 D = pathlib.Path(__file__).parent
+sys.path.insert(0, str(D))
 sys.path.insert(0, str(D.parent))
 import arm_lib
+import sim_core                            # 씬 규약(롤 오프셋·파지 판정·좌표)의 단일 출처
 
 BASE = 'http://127.0.0.1:8765'
-JN = arm_lib.JOINTS                       # 5관절 (gripper 별도)
-LYING_QUAT = (0.7071068, 0.0, 0.7071068, 0.0)   # 원기둥 z축 → x축 (누움)
-# 실물 그리퍼는 URDF 대비 롤이 -90° 돌아 조립돼 있다 — roll=0 에서 움직이는
-# 턱이 실물은 오른쪽·모델은 위 (2026-08-20 사용자 실물 대조 2회로 확정:
-# 180°는 아래를 향해 오답). 캘리브 오프셋이 이를 흡수해 TCP 위치 적합(롤 축
-# 위의 점)에는 안 드러난다 — 표시용 오프셋으로 보정.
-ROLL_OFFSET_RAD = math.radians(-90)
-GRIP_HOLD_DEG = 25                        # 이보다 닫혀 있으면 물체를 문 것으로 표시
+JN = sim_core.JN                           # 5관절 (gripper 별도)
+LYING_QUAT = sim_core.LYING_QUAT
+ROLL_OFFSET_RAD = sim_core.ROLL_OFFSET_RAD
+GRIP_HOLD_DEG = sim_core.GRIP_HOLD_DEG
 
 
 def get(path, timeout=2.0):
     return json.loads(urllib.request.urlopen(f'{BASE}{path}', timeout=timeout).read())
 
 
-def load_frame():
-    f = json.loads((D / 'sim_frame.json').read_text())
-    assert f['qpos_mode'] == 'urdf_q', f'미검증 qpos 모드: {f["qpos_mode"]}'
-    return np.array(f['R']), np.array(f['t'])
+load_frame = sim_core.load_frame
 
 
 def panel_to_sim(p, R, t):
@@ -52,20 +47,10 @@ def panel_to_sim(p, R, t):
     return R @ (np.array(p, float) + np.array(arm_lib.PAN0)) + t
 
 
-def read_blob_xy(R_he, t_he, floor, h_center):
-    """뎁스캠 방위각 광선 ∩ 평면 — pick_demo.locate 와 같은 식 (1샷)."""
+def read_blob_pose(R_he, t_he, floor, h_center, piece):
+    """뎁스캠이 본 물체의 (x, y) 와 방향 — 계산은 sim_core 가 한 곳에서 한다."""
     b = get('/blob').get('blob') or {}
-    if b.get('u') is None or not b.get('fx'):
-        return None
-    d = R_he @ np.array([(b['u'] - b['w'] / 2) / b['fx'],
-                         (b['v'] - b['h'] / 2) / b['fy'], 1.0])
-    if abs(d[2]) < 1e-6:
-        return None
-    s = (floor + h_center - t_he[2]) / d[2]
-    if not (0.2 < s < 1.5):
-        return None
-    p = t_he + s * d
-    return float(p[0]), float(p[1])
+    return sim_core.blob_pose(b, R_he, t_he, floor, h_center, piece)
 
 
 def main():
@@ -79,86 +64,28 @@ def main():
     ap.add_argument('--piece', choices=['cube', 'lying', 'standing'],
                     default='cube')
     ap.add_argument('--piece-at', help='물체 패널 좌표 "x,y" 수동 지정')
+    ap.add_argument('--piece-yaw', type=float, default=None,
+                    help='물체 방향 [°] 수동 지정 (큐브는 90° 대칭)')
     ap.add_argument('--hz', type=float, default=10.0)
     a = ap.parse_args()
 
     import mujoco
-    model = mujoco.MjModel.from_xml_path(str(D / 'scene_mirror.xml'))
-    data = mujoco.MjData(model)
-    R, t = load_frame()
-    MP = arm_lib.load_mapping()
-    floor = arm_lib.load_gain('floor_z_m')['floor_z_m']
+    # 씬·운동학·파지 판정은 sim_core 가 단일 출처다 — 미러 데몬과 규약이
+    # 갈라지면 화면 둘이 서로 다른 로봇을 그리게 된다 (2026-08-21 분리).
+    sim = sim_core.SimMirror(piece=a.piece)
+    model, data = sim.model, sim.data
+    R, t = sim.R, sim.t
+    floor = sim.floor
+    PIECE_H = sim.piece_h
 
-    jadr = {j: model.jnt_qposadr[mujoco.mj_name2id(
-        model, mujoco.mjtObj.mjOBJ_JOINT, j)] for j in JN + ['gripper']}
-    mocap_id = {n: model.body(n).mocapid[0]
-                for n in ('desk', 'piece', 'piece_cyl', 'dropbox')}
-    # 활성 프록시: cube → 'piece'(큐브), lying/standing → 'piece_cyl'(체스말).
-    # 비활성 쪽은 XML 기본 위치(지면 아래)에 그대로 둔다.
-    PIECE = 'piece' if a.piece == 'cube' else 'piece_cyl'
-    PIECE_H = {'cube': 0.02, 'lying': 0.011, 'standing': 0.035}[a.piece]
-    holding = {'v': False}          # 물기 상태 추적 — 방출 시 낙하 표현용
-
-    # 책상: 상면을 실측 floor 높이에 (박스 반높이 0.03 만큼 내려 배치)
-    desk_c = panel_to_sim((0.15, 0.0, floor), R, t)
-    data.mocap_pos[mocap_id['desk']] = desk_c - np.array([0, 0, 0.03])
-
-    def set_piece(xy):
-        data.mocap_pos[mocap_id[PIECE]] = panel_to_sim(
-            (xy[0], xy[1], floor + PIECE_H), R, t)
-        data.mocap_quat[mocap_id[PIECE]] = (
-            LYING_QUAT if a.piece == 'lying' else (1, 0, 0, 0))
+    def set_piece(xy, yaw=None):
+        # 방향을 안 그리면 미러가 거짓말을 한다 — 대각 큐브를 축 정렬로 그리면
+        # 화면만 보고는 팔이 왜 손목을 트는지 알 수 없다 (2026-08-21)
+        sim.set_piece(xy, a.piece_yaw if a.piece_yaw is not None else yaw)
 
     def set_pose_deg(deg):
-        q = arm_lib.servo_to_rad({f'{j}.pos': deg[j] for j in JN}, MP)
-        for j, v in zip(JN, q):
-            if j == 'wrist_roll':
-                v = (v + ROLL_OFFSET_RAD + math.pi) % (2 * math.pi) - math.pi
-            data.qpos[jadr[j]] = v
-        if 'gripper' in deg:
-            data.qpos[jadr['gripper']] = math.radians(
-                max(-10.0, min(100.0, deg['gripper'])))
-        mujoco.mj_forward(model, data)
-        # 물체를 문 상태면 체스말을 그리퍼 끝에 붙여 같이 움직인다 — 실팔이
-        # 집으면 시뮬도 같이 집는다 (2026-08-20 사용자 지시).
-        # ★ '물었다' 판정은 각도만으로 못 한다 — 휴지 자세의 빈 죠 다묾(5°)도
-        #   <25° 라 체스말이 죠에 끼워 보였다(실측 오인). **열림→닫힘 전이
-        #   순간에 물체가 죠 7cm 이내**에 있었을 때만 파지로 본다. 시작부터
-        #   닫혀 있으면(전이 없음) 붙이지 않는다.
-        prev_g = holding.get('g')
-        now_g = deg.get('gripper', 100)
-        holding['g'] = now_g
-        now_closed = now_g < GRIP_HOLD_DEG
-        if holding['v'] and not now_closed and not a.piece_at:
-            # 방출 순간 — 물체를 그 자리 수직 아래(바닥/박스 바닥)로 떨어뜨린다.
-            # 뎁스캠이 박스 안을 못 보므로 blob 갱신은 기대할 수 없다.
-            p = data.mocap_pos[mocap_id[PIECE]].copy()
-            drop_z = panel_to_sim((0.0, 0.0, floor + PIECE_H), R, t)[2]
-            data.mocap_pos[mocap_id[PIECE]] = (p[0], p[1], drop_z)
-            holding['v'] = False
-        elif (not holding['v'] and now_closed and prev_g is not None
-              and prev_g >= GRIP_HOLD_DEG and not a.piece_at):
-            gsite = data.site('graspframe').xpos
-            d = float(np.linalg.norm(
-                np.array(data.mocap_pos[mocap_id[PIECE]]) - gsite))
-            holding['v'] = d < 0.07
-        if holding['v'] and not a.piece_at:
-            g = data.site('graspframe').xpos
-            pan_w = R @ np.array(arm_lib.PAN0) + t     # 팬 축의 월드 좌표
-            dx, dy = g[0] - pan_w[0], g[1] - pan_w[1]
-            # 물체는 팬 축 기준 방사 방향으로 물려 바깥을 향한다(손목캠 실측).
-            # 조립 각도는 근사 표시용.
-            n = math.hypot(dx, dy) or 1.0
-            ux, uy = dx / n, dy / n
-            half = math.sqrt(0.5)
-            # 원기둥 z축을 수평 (ux,uy,0) 으로 돌리는 quat: z→dir 회전축 = z×dir
-            off = 0.02 if a.piece != 'cube' else 0.0   # 큐브는 죠 중심에
-            data.mocap_pos[mocap_id[PIECE]] = (
-                g[0] + ux * off, g[1] + uy * off, g[2])
-            data.mocap_quat[mocap_id[PIECE]] = (
-                (half, -uy * half, ux * half, 0.0) if a.piece != 'cube'
-                else (1.0, 0.0, 0.0, 0.0))
-            mujoco.mj_forward(model, data)
+        # --piece-at 로 물체를 고정 배치했으면 죠 부착을 끈다(수동 배치 우선)
+        sim.set_pose_deg(deg, attach=not a.piece_at)
 
     he_R = he_t = None
     hep = D.parent / 'handeye.json'
@@ -217,11 +144,12 @@ def main():
                 st = get('/state', timeout=1.0)
                 set_pose_deg(st['pos'])
                 if (he_R is not None and not a.piece_at
-                        and st['pos'].get('gripper', 0) >= 25
-                        and n % int(a.fps) == 0):   # 열림 상태면 물체는 뎁스캠 위치
-                    xy = read_blob_xy(he_R, he_t, floor, PIECE_H)
+                        and not sim.holding
+                        and n % int(a.fps) == 0):   # 안 물고 있을 때만 갱신
+                    xy, yaw = read_blob_pose(he_R, he_t, floor, PIECE_H,
+                                             a.piece)
                     if xy:
-                        set_piece(xy)
+                        set_piece(xy, yaw)
             except Exception:
                 pass
             if a.cam:
@@ -250,9 +178,10 @@ def main():
                 if (he_R is not None and not a.piece_at
                         and n % int(a.hz) == 0):  # 물체는 1Hz 갱신
                     try:
-                        xy = read_blob_xy(he_R, he_t, floor, PIECE_H)
+                        xy, yaw = read_blob_pose(he_R, he_t, floor, PIECE_H,
+                                                 a.piece)
                         if xy:
-                            set_piece(xy)
+                            set_piece(xy, yaw)
                     except Exception:
                         pass
             v.sync()

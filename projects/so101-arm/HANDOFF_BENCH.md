@@ -8,7 +8,7 @@
 | 파일 | 무엇 | 데이터 |
 | --- | --- | --- |
 | `panel.html` + `panel_server.py` | **라이브** — 지금 팔을 움직인다 | 서보에서 직접 (HTTP 8765) |
-| `dashboard.tpl.html` + `read_runs.py` | **기록** — 끝난 시행을 되돌려 본다 | `~/so101_tools/media/` · `~/so101_datasets/` |
+| `dashboard.tpl.html` + `read_runs.py` | **기록** — 끝난 시행을 되돌려 본다 | `~/so101-mobile-manipulation/media/` · `~/so101_datasets/` |
 
 이 인계는 **기록 쪽만**이다. 라이브 패널은 실물 팔을 움직이는 코드라 이 작업 범위 밖이다.
 
@@ -55,7 +55,7 @@ cd ~/robot-dashboard/projects/so101-arm && python3 -m http.server 8790 --bind 12
 `run_demo.sh` 한 번 = 시행 하나 = **파일 묶음**이다. MCAP 한 덩어리가 아니다.
 
 ```
-~/so101_tools/media/<날짜>/demo_<시각>_rgb.mp4       정면 (뎁스캠 컬러)
+~/so101-mobile-manipulation/media/<날짜>/demo_<시각>_rgb.mp4       정면 (뎁스캠 컬러)
                             _wrist.mp4     손목캠
                             _depth.mp4     깊이
                             _sim.mp4       MuJoCo 미러

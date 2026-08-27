@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from _canonical_redirect import redirect_if_main as _redirect
+_redirect(__name__, 'place_down.py')
 """물체 내려놓기 + 저고도 휴지 — 전원 차단 대비 (2026-08-20, 14차 리뷰 반영).
 
 park.py 대신 쓰는 경우: 사용자가 곧 전원을 뽑을 때. 접힘 파킹은 이동량이

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from _canonical_redirect import redirect_if_main as _redirect
+_redirect(__name__, 'park.py')
 """팔 파킹 — mapping.json 의 park_deg(사용자가 손으로 잡은 접힘 자세)로 접고 토크 OFF.
 
 ## 순서가 전부다 (2026-08-20 리뷰 C11-1)

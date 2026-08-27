@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from _canonical_redirect import redirect_if_main as _redirect
+_redirect(__name__, 'servo_id.py')
 """서보 한 개의 ID를 바꾸고 보호 파라미터를 넣는다 — 교체 서보 셋업용.
 
 ## 반드시 단독으로 연결할 것
@@ -17,9 +19,9 @@ STS3215는 Protection_Current=0(과전류 보호 꺼짐), Unloading_Condition=0(
 2026-08-19 wrist_flex 발연이 그 상태에서 났다. ID를 바꾸는 김에 같이 켠다.
 
 사용:
-    python3 ~/so101_tools/servo_id.py --to 4              # 찾은 서보를 ID 4 로
-    python3 ~/so101_tools/servo_id.py --to 4 --port /dev/ttyACM0
-    python3 ~/so101_tools/servo_id.py --check             # 바꾸지 않고 보기만
+    python3 ~/so101-mobile-manipulation/servo_id.py --to 4  # 찾은 서보를 ID 4 로
+    python3 ~/so101-mobile-manipulation/servo_id.py --to 4 --port /dev/ttyACM0
+    python3 ~/so101-mobile-manipulation/servo_id.py --check # 바꾸지 않고 보기만
 """
 import argparse
 import sys
@@ -108,7 +110,11 @@ def protect_only(port, sid):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--port', default='/dev/ttyACM0')
-    ap.add_argument('--to', type=int, help='새 ID (1~6)')
+    ap.add_argument('--to', type=int, help='새 ID (1~30)')
+    ap.add_argument('--from', dest='src', type=int, metavar='ID',
+                    help='이 ID 하나만 바꾼다. 서보가 여럿 물려 있어도 되지만, '
+                         '그 ID 가 버스에서 유일할 때만 안전하다 — 같은 번호가 '
+                         '둘이면 패킷이 깨져 어느 쪽이 바뀌는지 알 수 없다')
     ap.add_argument('--check', action='store_true', help='바꾸지 않고 확인만')
     ap.add_argument('--protect-only', type=int, metavar='ID',
                     help='ID 변경 없이 보호 파라미터만 적용한다. 여러 서보가 물려 '
@@ -125,19 +131,34 @@ def main():
                  '  1. 서보 전원 어댑터(12V)가 꽂혔는지 — USB 는 보드 로직만 켭니다\n'
                  '  2. 3핀 케이블이 보드↔서보에 제대로 물렸는지\n'
                  '  3. 케이블이 충전 전용이면 /dev/ttyACM* 자체가 안 생깁니다')
-    if len(found) > 1:
-        print('찾은 서보:', found)
-        sys.exit('★ 서보가 둘 이상입니다. ID 를 바꾸려면 **한 개만** 물려 주세요 —\n'
-                 '  어느 것을 바꿀지 알 수 없고, 같은 ID 가 겹치면 통신이 깨집니다.')
-
-    baud, cur_id = found[0]
-    print(f'서보 1개 발견 — ID {cur_id} · {baud} bps')
+    if a.src is not None:
+        # 지정 모드 — 카메라 팬/틸트처럼 팔이 아닌 서보를 재번호할 때 쓴다.
+        # 대상 ID 가 버스에서 유일해야 한다(중복이면 어느 쪽이 바뀔지 모른다).
+        hits = [(b, i) for b, i in found if i == a.src]
+        if not hits:
+            sys.exit(f'ID {a.src} 가 버스에 없습니다. 찾은 것: {found}')
+        if len(hits) > 1:
+            sys.exit(f'ID {a.src} 가 여럿으로 보입니다({hits}) — 중복 상태에서는 '
+                     f'바꾸지 않습니다. 한 개만 물려 주세요.')
+        baud, cur_id = hits[0]
+        others = [i for _, i in found if i != a.src]
+        print(f'대상 ID {cur_id} · {baud} bps (같은 버스의 다른 서보: {others or "없음"})')
+    else:
+        if len(found) > 1:
+            print('찾은 서보:', found)
+            sys.exit('★ 서보가 둘 이상입니다. ID 를 바꾸려면 **한 개만** 물리거나,\n'
+                     '  --from <현재ID> 로 바꿀 서보를 지정하세요 (그 ID 가 유일할 때만).')
+        baud, cur_id = found[0]
+        print(f'서보 1개 발견 — ID {cur_id} · {baud} bps')
 
     if a.check or a.to is None:
         print('(--check 모드이거나 --to 가 없어 변경하지 않았습니다)')
         return
-    if not 1 <= a.to <= 6:
-        sys.exit('새 ID 는 1~6 이어야 합니다')
+    # 1~6 은 SO-101 팔이 쓴다. 카메라 팬/틸트 같은 주변 서보는 7 이상으로 둔다 —
+    # 같은 버스에 겹치면 팔 명령이 그 서보를 같이 돌린다(2026-08-21 실측: 뎁스캠
+    # 팬/틸트가 공장값 1·3 이라 shoulder_pan·elbow_flex 와 충돌해 둘 다 침묵했다).
+    if not 1 <= a.to <= 30:
+        sys.exit('새 ID 는 1~30 이어야 합니다')
 
     from lerobot.motors.feetech.feetech import FeetechMotorsBus
     from lerobot.motors import Motor, MotorNormMode

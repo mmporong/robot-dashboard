@@ -8,7 +8,7 @@ import pathlib
 import sys
 import time
 
-sys.path.insert(0, str(pathlib.Path('~/so101_tools').expanduser()))
+sys.path.insert(0, str(pathlib.Path('~/so101-mobile-manipulation').expanduser()))
 import arm_lib
 import arm_gui
 from arm_gui import Worker, ARM, ALL

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from _canonical_redirect import redirect_if_main as _redirect
+_redirect(__name__, 'drop_to_box.py')
 """문 물체를 투하 통에 넣기 — 운반→하강→방출→복귀 (2026-08-20).
 
 통 제원·위치는 사용자 실측: ~13cm 정사각 바닥 × 높이 ~8cm(테두리 ≈ 책상면),

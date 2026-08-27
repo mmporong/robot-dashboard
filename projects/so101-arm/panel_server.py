@@ -8,6 +8,7 @@
 
     GET  /        → panel.html
     GET  /state   → Worker 상태 JSON (연결·캘리브·토크·관절각·범위·로그)
+    GET  /command?id=... → 특정 Worker 명령 상태·applied_action 원증거
     GET  /cam     → 손목캠 MJPEG
     GET  /mirror  → MuJoCo 미러 MJPEG
     POST /cmd     → {"op": "connect" | "disconnect" | "torque" | "neutral"
@@ -23,25 +24,270 @@ IK 는 서버에서 푼다 — 캡스톤 `kinematics.ik_best` 로 관절각을 �
     python3 panel_server.py --port-serial /dev/ttyACM1 --http 8766
 """
 import argparse
+from collections import OrderedDict
+import ipaddress
 import json
 import math
 import pathlib
+import secrets
 import subprocess
 import os
 import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
 
 HERE = pathlib.Path(__file__).parent
-TOOLS = pathlib.Path('~/so101-mobile-manipulation').expanduser()
+TOOLS = pathlib.Path(os.environ.get(
+    'SO101_CANONICAL_DIR', '~/so101-mobile-manipulation')).expanduser().resolve()
 sys.path.insert(0, str(TOOLS))
 
 import arm_lib                                    # noqa: E402
 import ds_record                                  # noqa: E402  (LeRobot 표준 기록)
 from arm_gui import Worker                        # noqa: E402  (시리얼 워커 재사용)
+from ros_base_monitor import BaseMonitor          # noqa: E402  (읽기 전용 ROS 감시)
 
-HOME_Q = [0.0, -0.3, 0.6, 0.5, 0.0]
+MAX_COMMAND_BYTES = 64 * 1024
+MAX_JSON_DEPTH = 64
+REPO_ID_CHARS = frozenset(
+    'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-')
+BOOL_FIELDS = frozenset(('on', 'start', 'wrist'))
+
+
+def valid_repo_id(value):
+    """로컬 디렉터리 한 칸으로만 쓸 수 있는 데이터셋 ID인지 검사한다."""
+    return (isinstance(value, str) and 1 <= len(value) <= 64
+            and not value.startswith(('.', '-'))
+            and all(ch in REPO_ID_CHARS for ch in value))
+
+
+def validate_json_values(value, key=None):
+    """명령 payload를 반복 순회해 깊이·비유한 수·bool 혼동을 거부한다."""
+    pending = [(value, key, 0)]
+    while pending:
+        current, current_key, depth = pending.pop()
+        if depth > MAX_JSON_DEPTH:
+            raise ValueError(f'JSON 중첩은 {MAX_JSON_DEPTH}단계 이하여야 합니다')
+        if current_key in BOOL_FIELDS and type(current) is not bool:
+            raise ValueError(f'{current_key}는 JSON boolean이어야 합니다')
+        if type(current) is bool:
+            if current_key not in BOOL_FIELDS:
+                raise ValueError(
+                    f'{current_key or "값"}에는 boolean을 사용할 수 없습니다')
+            continue
+        if isinstance(current, (int, float)):
+            if not math.isfinite(current):
+                raise ValueError(f'{current_key or "값"}은 유한한 수여야 합니다')
+            continue
+        if isinstance(current, dict):
+            pending.extend((child, child_key, depth + 1)
+                           for child_key, child in current.items())
+        elif isinstance(current, list):
+            pending.extend((child, None, depth + 1) for child in current)
+
+
+def reject_json_constant(value):
+    raise ValueError(f'비표준 숫자 {value}')
+
+
+def record_start_readiness(worker, cam, *, clock=time.monotonic):
+    """차량 기록 시작에 필요한 감사 가능한 capability를 발급한다."""
+    ready, evidence = _record_capability_state(worker, cam, clock=clock,
+                                               ensure_camera=True)
+    if not ready:
+        return False, evidence
+    snapshot, frame, now = evidence
+    pos = snapshot['pos']
+    return True, {
+        'issued_at': now,
+        'actuation_epoch': snapshot['actuation_epoch'],
+        'base_lease': {
+            'active': True,
+            'expires_at': float(snapshot['base_interlock_expires_at']),
+        },
+        'camera': {
+            'sequence': int(frame['sequence']),
+            'captured_at': float(frame['captured_at']),
+        },
+        'pan': {
+            'actual': float(pos['shoulder_pan']),
+            'center': float(snapshot['pan_lock']),
+            'tolerance': float(snapshot['pan_tol']),
+        },
+        'arm': {
+            'connected': True,
+            'calibrated': True,
+            'safety_ready': True,
+            'torque_state': 'on',
+            'pos_at': float(snapshot['pos_at']),
+        },
+    }
+
+
+def _record_capability_state(worker, cam, *, clock, ensure_camera=False):
+    """현재 Worker·camera 상태를 capability 검증용으로 읽는다."""
+    try:
+        snapshot = worker.snapshot()
+    except Exception as e:
+        return False, f'팔 상태 확인 실패: {type(e).__name__}'
+    if not isinstance(snapshot, dict):
+        return False, '팔 상태 스냅샷이 유효하지 않습니다'
+    required = (
+        ('connected', '팔 연결 필요'),
+        ('calibrated', '캘리브레이션 필요'),
+        ('safety_ready', '보호 레지스터 검증 필요'),
+        ('base_interlock_active', '베이스 인터록 준비 필요'),
+    )
+    for field, reason in required:
+        if snapshot.get(field) is not True:
+            return False, reason
+    if snapshot.get('stop_latched') is not False:
+        return False, '정지 latch 해제가 필요합니다'
+    epoch = snapshot.get('actuation_epoch')
+    if type(epoch) is not int or epoch < 0:
+        return False, '동작 epoch 근거가 없습니다'
+    if not (snapshot.get('torque') is True
+            and snapshot.get('torque_state') == 'on'):
+        return False, '토크 ON read-back이 필요합니다'
+    pos = snapshot.get('pos')
+    if (not isinstance(pos, dict)
+            or any(joint not in pos for joint in arm_lib.JOINTS)):
+        return False, '현재 관절 자세가 완전하지 않습니다'
+    try:
+        if any(type(pos[joint]) not in (int, float)
+               or not math.isfinite(pos[joint]) for joint in arm_lib.JOINTS):
+            return False, '현재 관절 자세가 유효하지 않습니다'
+        observed_at = float(snapshot.get('pos_at'))
+        base_expires_at = float(snapshot.get('base_interlock_expires_at'))
+        max_age = float((getattr(worker, 'profile', None) or {})['state_max_age_s'])
+        now = clock()
+        age = now - observed_at
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False, '관절 자세 freshness 근거가 없습니다'
+    if not math.isfinite(age) or not math.isfinite(max_age) \
+            or max_age <= 0 or age < 0 or age > max_age:
+        return False, '현재 관절 자세가 오래되었습니다'
+    if not math.isfinite(base_expires_at) or base_expires_at <= now:
+        return False, '베이스 인터록 lease가 만료되었습니다'
+    try:
+        pan_center = float(snapshot.get('pan_lock'))
+        pan_tol = float(snapshot.get('pan_tol'))
+        pan_actual = float(pos['shoulder_pan'])
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False, '차량 팬 잠금 근거가 없습니다'
+    if (not math.isfinite(pan_center) or not math.isfinite(pan_tol)
+            or pan_tol <= 0 or not math.isfinite(pan_actual)):
+        return False, '차량 팬 잠금 근거가 유효하지 않습니다'
+    if abs(pan_actual - pan_center) > pan_tol:
+        return False, '실제 shoulder_pan이 차량 팬 허용 범위를 벗어났습니다'
+    if cam is None:
+        return False, '손목캠이 필요합니다'
+    try:
+        if ensure_camera:
+            cam.ensure()
+        frame = cam.snapshot_frame()
+    except Exception as e:
+        return False, f'손목캠 상태 확인 실패: {type(e).__name__}'
+    if not isinstance(frame, dict):
+        return False, '손목캠 상태가 유효하지 않습니다'
+    try:
+        sequence = int(frame.get('sequence'))
+        captured_at = float(frame.get('captured_at'))
+        frame_age = float(frame.get('age'))
+        stale_limit = float(getattr(cam, 'STALE_S'))
+    except (TypeError, ValueError, OverflowError):
+        return False, '손목캠 fresh-frame 근거가 없습니다'
+    if (frame.get('stale') is not False or sequence <= 0
+            or not math.isfinite(captured_at) or not math.isfinite(frame_age)
+            or not math.isfinite(stale_limit) or stale_limit <= 0
+            or frame_age < 0 or frame_age > stale_limit
+            or not isinstance(frame.get('jpeg'), bytes) or not frame['jpeg']):
+        return False, '손목캠 새 프레임이 필요합니다'
+    return True, (snapshot, frame, now)
+
+
+def make_record_capability_validator(worker, cam, *, clock=time.monotonic):
+    """발급 capability의 epoch·lease·팬·카메라 high-water를 재검증한다."""
+    high_water = {'sequence': None, 'captured_at': None}
+    high_water_lock = threading.Lock()
+
+    def validate(capability):
+        if not isinstance(capability, dict):
+            return False, '기록 capability가 유효하지 않습니다'
+        ready, evidence = _record_capability_state(worker, cam, clock=clock)
+        if not ready:
+            return False, evidence
+        snapshot, frame, _now = evidence
+        try:
+            epoch = capability['actuation_epoch']
+            lease_expires = float(capability['base_lease']['expires_at'])
+            camera_sequence = int(capability['camera']['sequence'])
+            camera_captured_at = float(capability['camera']['captured_at'])
+            pan_center = float(capability['pan']['center'])
+            pan_tol = float(capability['pan']['tolerance'])
+            current_lease = float(snapshot['base_interlock_expires_at'])
+            current_sequence = int(frame['sequence'])
+            current_captured_at = float(frame['captured_at'])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return False, '기록 capability 근거가 불완전합니다'
+        if snapshot['actuation_epoch'] != epoch:
+            return False, 'STOP 이후 동작 epoch가 변경되었습니다'
+        if current_lease < lease_expires:
+            return False, '베이스 인터록 lease가 교체되거나 단축되었습니다'
+        if (float(snapshot['pan_lock']) != pan_center
+                or float(snapshot['pan_tol']) != pan_tol):
+            return False, '차량 팬 잠금 설정이 변경되었습니다'
+        if (current_sequence < camera_sequence
+                or current_captured_at < camera_captured_at):
+            return False, '손목캠 프레임이 capability보다 이전으로 되돌아갔습니다'
+        with high_water_lock:
+            previous_sequence = high_water['sequence']
+            previous_captured_at = high_water['captured_at']
+            if (previous_sequence is not None
+                    and (current_sequence < previous_sequence
+                         or current_captured_at < previous_captured_at)):
+                return False, '손목캠 프레임 순서가 되돌아갔습니다'
+            high_water['sequence'] = current_sequence
+            high_water['captured_at'] = current_captured_at
+        return True, None
+
+    return validate
+
+
+def _loopback(value):
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return value == 'localhost'
+
+
+def _host_port(value, default_port):
+    """Host 헤더를 URL 파서로 엄격히 분리한다. 사용자정보·경로는 허용하지 않는다."""
+    if not value or any(ch in value for ch in '/?#@'):
+        return None
+    try:
+        parsed = urlsplit('//' + value)
+        host = parsed.hostname
+        port = parsed.port if parsed.port is not None else default_port
+    except ValueError:
+        return None
+    if not host or not _loopback(host):
+        return None
+    return host.lower(), port
+
+
+def _same_origin(value, server_port):
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port if parsed.port is not None else 80
+    except ValueError:
+        return False
+    return (parsed.scheme == 'http' and parsed.username is None
+            and parsed.password is None and not parsed.path
+            and not parsed.query and not parsed.fragment
+            and parsed.hostname is not None and _loopback(parsed.hostname)
+            and port == server_port)
 
 
 class Camera(threading.Thread):
@@ -52,13 +298,19 @@ class Camera(threading.Thread):
     띄우고 캠을 안 볼 때 USB 대역·CPU를 안 쓰기 위해서다.
     """
 
-    def __init__(self, index):
+    STALE_S = 1.0
+
+    def __init__(self, index, clock=time.monotonic):
         super().__init__(daemon=True)
         self.index = index
         self.lock = threading.Lock()
         self.jpeg = None
+        self.sequence = 0
+        self.captured_at = None
+        self._clock = clock
         self.started = False
         self._start_lock = threading.Lock()   # 핸들러가 병렬이라 check-then-act 보호
+        self._closing = threading.Event()
 
     def ensure(self):
         with self._start_lock:
@@ -93,8 +345,36 @@ class Camera(threading.Thread):
         return ext[0][1]
 
     def snapshot_jpeg(self):
+        return self.snapshot_frame()['jpeg']
+
+    def snapshot_frame(self):
         with self.lock:
-            return self.jpeg
+            captured_at = self.captured_at
+            age = (None if captured_at is None
+                   else max(0.0, self._clock() - captured_at))
+            stale = self.jpeg is None or age is None or age > self.STALE_S
+            return {'jpeg': None if stale else self.jpeg,
+                    'sequence': self.sequence,
+                    'captured_at': captured_at,
+                    'age': age, 'stale': stale}
+
+    def _store_jpeg(self, jpeg):
+        with self.lock:
+            self.jpeg = jpeg
+            self.sequence += 1
+            self.captured_at = self._clock()
+
+    def _mark_failed(self):
+        with self.lock:
+            self.jpeg = None
+            self.captured_at = None
+
+    def shutdown(self, timeout=2.0):
+        """캡처 루프를 멈추고 카메라 핸들 해제를 bounded wait한다."""
+        self._closing.set()
+        if self.is_alive():
+            self.join(max(0.0, float(timeout)))
+        return not self.is_alive()
 
     def _open(self, cv2):
         cap = cv2.VideoCapture(self.index, cv2.CAP_V4L2)   # 백엔드 명시 — GStreamer 로
@@ -125,28 +405,34 @@ class Camera(threading.Thread):
         cap = self._open(cv2)
         if cap is None:
             return
-        fails = 0
-        while True:
-            ok, frame = cap.read()
-            if ok:
-                fails = 0
-                ok2, buf = cv2.imencode('.jpg', frame,
-                                        [cv2.IMWRITE_JPEG_QUALITY, 80])
-                if ok2:
-                    with self.lock:
-                        self.jpeg = buf.tobytes()
-            else:
-                # 케이블이 빠지면 read 가 영원히 False 다 — 방치하면 /cam 이 마지막
-                # JPEG 로 굳는다(깊이 쪽에서 없앤 바로 그 증상). 닫고 다시 연다.
-                fails += 1
-                if fails >= 50:
-                    cap.release()
-                    time.sleep(2.0)
-                    cap = self._open(cv2)
-                    if cap is None:
-                        return
+        try:
+            fails = 0
+            while not self._closing.is_set():
+                ok, frame = cap.read()
+                if ok:
                     fails = 0
-            time.sleep(0.1)                      # 10fps — 패널 확인용이라 충분
+                    ok2, buf = cv2.imencode('.jpg', frame,
+                                            [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    if ok2:
+                        self._store_jpeg(buf.tobytes())
+                    else:
+                        self._mark_failed()
+                else:
+                    # 케이블이 빠지면 read 가 영원히 False 다 — 방치하면 /cam 이 마지막
+                    # JPEG 로 굳는다(깊이 쪽에서 없앤 바로 그 증상). 닫고 다시 연다.
+                    fails += 1
+                    self._mark_failed()
+                    if fails >= 50:
+                        cap.release()
+                        if self._closing.wait(2.0):
+                            return
+                        cap = self._open(cv2)
+                        if cap is None:
+                            return
+                        fails = 0
+                self._closing.wait(0.1)          # 10fps — 패널 확인용이라 충분
+        finally:
+            cap.release()
 
 
 class Mirror(threading.Thread):
@@ -173,7 +459,8 @@ class Mirror(threading.Thread):
         self.started = False
         self._start_lock = threading.Lock()
         self._proc_lock = threading.Lock()
-        self._closing = False
+        self._stop_guard = threading.Lock()
+        self._closing = threading.Event()
         self._proc = None
         self._log = None
         self._restarts = 0
@@ -186,7 +473,7 @@ class Mirror(threading.Thread):
 
     def snapshot_jpeg(self):
         with self.lock:
-            return self.jpeg
+            return self.jpeg if self.status.get('ok') else None
 
     def ensure(self):
         with self._start_lock:
@@ -195,10 +482,32 @@ class Mirror(threading.Thread):
                 self.start()
 
     def shutdown(self, timeout=6.0):
-        self._closing = True
+        timeout = max(0.0, float(timeout))
+        deadline = time.monotonic() + timeout
+        self._closing.set()
+        errors = []
+        try:
+            self._stop_proc(grace=max(0.0, deadline - time.monotonic()))
+        except RuntimeError as e:
+            errors.append(str(e))
         if self.is_alive():
-            self.join(2.0)
-        self._stop_proc(grace=timeout)
+            self.join(max(0.0, deadline - time.monotonic()))
+        if self.is_alive():
+            errors.append('미러 감시 스레드 종료 timeout')
+        with self._proc_lock:
+            process_alive = self._proc is not None and self._proc.poll() is None
+        if process_alive:
+            errors.append('미러 데몬 프로세스가 종료되지 않았습니다')
+        if self._log is not None:
+            try:
+                self._log.close()
+            except Exception as e:
+                errors.append(f'미러 로그 닫기 실패: {type(e).__name__}: {e}')
+            finally:
+                self._log = None
+        if errors:
+            raise RuntimeError(' | '.join(errors))
+        return True
 
     def request(self, path, body=None, timeout=4.0):
         """데몬으로 중계 (POST). 시점 변경·프리뷰·재생에 쓴다."""
@@ -222,24 +531,40 @@ class Mirror(threading.Thread):
         except Exception as e:
             return {'ok': False, 'msg': f'미러 데몬 통신 실패: {type(e).__name__}'}
 
+    def _read_fresh_frame(self):
+        """데몬이 공개한 freshness 상태를 확인한 뒤에만 JPEG를 받는다."""
+        daemon = self.request('/state', timeout=3.0)
+        if daemon.get('stale') is not False:
+            raise RuntimeError(daemon.get('msg') or '미러 데몬 프레임 stale')
+        import urllib.request
+        url = f'http://127.0.0.1:{self.port}/frame.jpg'
+        with urllib.request.urlopen(url, timeout=3.0) as response:
+            jpeg = response.read()
+        if not jpeg:
+            raise RuntimeError('미러 데몬 JPEG 없음')
+        return jpeg
+
     def _spawn(self):
+        if self._closing.is_set():
+            return
+        py = self.python_bin()
+        if py is None:
+            with self.lock:
+                self.status = {'ok': False,
+                               'msg': 'mujoco 환경(rlwalk) 없음 — 미러 비활성'}
+            return
+        # 포트 선점 확인 — 살아 있는 데몬이 있으면 그걸 쓴다(깊이와 같은 규약)
+        h = self.request('/health', timeout=0.5)
+        if h.get('beat_age') is not None:
+            if h['beat_age'] <= self.STALE_S:
+                return
+            subprocess.run(['fuser', '-k', '-TERM', f'{self.port}/tcp'],
+                           capture_output=True)
+            if self._closing.wait(1.5):
+                return
         with self._proc_lock:
-            if self._closing:
+            if self._closing.is_set():
                 return
-            py = self.python_bin()
-            if py is None:
-                with self.lock:
-                    self.status = {'ok': False,
-                                   'msg': 'mujoco 환경(rlwalk) 없음 — 미러 비활성'}
-                return
-            # 포트 선점 확인 — 살아 있는 데몬이 있으면 그걸 쓴다(깊이와 같은 규약)
-            h = self.request('/health', timeout=0.5)
-            if h.get('beat_age') is not None:
-                if h['beat_age'] <= self.STALE_S:
-                    return
-                subprocess.run(['fuser', '-k', '-TERM', f'{self.port}/tcp'],
-                               capture_output=True)
-                time.sleep(1.5)
             if self._log is None:
                 self._log = open(HERE / 'mirror_daemon.log', 'ab', buffering=0)
             self._proc = subprocess.Popen(
@@ -249,53 +574,86 @@ class Mirror(threading.Thread):
                 stderr=subprocess.STDOUT)
 
     def _stop_proc(self, grace=6.0):
-        with self._proc_lock:
-            p, self._proc = self._proc, None
-        if p is None or p.poll() is not None:
-            return
+        grace = max(0.0, float(grace))
+        if not self._stop_guard.acquire(timeout=grace):
+            raise RuntimeError('미러 데몬 종료 실패 — 다른 종료 작업 timeout')
         try:
-            p.terminate()
-            p.wait(grace)
-        except Exception:
+            with self._proc_lock:
+                p = self._proc
+            if p is None:
+                return True
+            if p.poll() is not None:
+                with self._proc_lock:
+                    if self._proc is p:
+                        self._proc = None
+                return True
+            errors = []
             try:
-                p.kill()
-                p.wait(3.0)
-            except Exception:
-                pass
+                p.terminate()
+            except Exception as e:
+                errors.append(f'terminate 실패: {type(e).__name__}: {e}')
+            try:
+                p.wait(grace)
+            except Exception as e:
+                errors.append(f'terminate wait 실패: {type(e).__name__}: {e}')
+                try:
+                    p.kill()
+                except Exception as kill_error:
+                    errors.append(f'kill 실패: {type(kill_error).__name__}: {kill_error}')
+                try:
+                    p.wait(min(3.0, grace))
+                except Exception as wait_error:
+                    errors.append(f'kill wait 실패: {type(wait_error).__name__}: {wait_error}')
+            if p.poll() is None:
+                errors.append('프로세스 생존')
+            else:
+                with self._proc_lock:
+                    if self._proc is p:
+                        self._proc = None
+            if errors and p.poll() is None:
+                raise RuntimeError('미러 데몬 종료 실패 — ' + ' | '.join(errors))
+            return True
+        finally:
+            self._stop_guard.release()
 
     def run(self):
-        import urllib.request
         self._spawn()
         last_ok = time.monotonic()
-        while not self._closing:
-            time.sleep(0.1)
+        while not self._closing.wait(0.1):
             try:
-                url = f'http://127.0.0.1:{self.port}/frame.jpg'
-                with urllib.request.urlopen(url, timeout=3.0) as r:
-                    j = r.read()
-                if j:
-                    with self.lock:
-                        self.jpeg = j
-                        self.status = {'ok': True, 'msg': ''}
-                    last_ok = time.monotonic()
-                    self._restarts = 0
+                j = self._read_fresh_frame()
+                with self.lock:
+                    self.jpeg = j
+                    self.status = {'ok': True, 'msg': ''}
+                last_ok = time.monotonic()
+                self._restarts = 0
             except Exception as e:
+                with self.lock:
+                    self.jpeg = None
+                    self.status = {'ok': False,
+                                   'msg': f'미러 프레임 stale ({type(e).__name__})'}
                 if time.monotonic() - last_ok > 15.0:
                     with self.lock:
                         self.status = {'ok': False,
                                        'msg': f'미러 데몬 무응답 — 재시작 ({type(e).__name__})'}
-                    self._stop_proc()
+                    try:
+                        self._stop_proc()
+                    except RuntimeError as stop_error:
+                        with self.lock:
+                            self.status = {'ok': False, 'msg': str(stop_error)}
+                        self._closing.set()
+                        break
                     self._restarts += 1
-                    time.sleep(min(3.0 * (2 ** min(self._restarts - 1, 3)), 30.0))
-                    if self._closing:
+                    if self._closing.wait(
+                            min(3.0 * (2 ** min(self._restarts - 1, 3)), 30.0)):
                         break
                     self._spawn()
                     last_ok = time.monotonic()
                 else:
-                    time.sleep(0.5)
+                    self._closing.wait(0.5)
 
 
-def serve_mjpeg(handler, get_jpeg, fps=10):
+def serve_mjpeg(handler, get_jpeg, fps=10, stop_on_empty=False):
     """최신 JPEG 를 multipart 로 흘린다.
 
     같은 프레임이어도 매번 보내고 Content-Length를 붙이지 않는다. 바뀔 때만
@@ -314,13 +672,76 @@ def serve_mjpeg(handler, get_jpeg, fps=10):
                                     b'Content-Type: image/jpeg\r\n\r\n')
                 handler.wfile.write(j)
                 handler.wfile.write(b'\r\n')
+            elif stop_on_empty:
+                break
             time.sleep(1.0 / fps)
     except (BrokenPipeError, ConnectionResetError, OSError):
         pass                              # 탭을 닫으면 여기로 — 정상 종료
 
 
+def shutdown_runtime(worker, recorder=None, base_monitor=None, camera=None,
+                     mirror=None, *, reason='panel server shutdown', timeout=2.0):
+    """ROS 감시를 멈춘 뒤 Worker 명령을 terminal로 만들고 자원을 닫는다."""
+    errors = []
+    if base_monitor is not None:
+        try:
+            base_monitor.stop()
+            base_monitor.join(timeout)
+        except Exception as e:
+            errors.append(f'base monitor: {type(e).__name__}: {e}')
+    worker_stopped = False
+    try:
+        worker_stopped = bool(worker.shutdown(reason, timeout))
+    except Exception as e:
+        errors.append(f'worker: {type(e).__name__}: {e}')
+    if not worker_stopped and not any(error.startswith('worker:') for error in errors):
+        errors.append('worker: shutdown timeout')
+    for name, component in (('recorder', recorder), ('camera', camera),
+                            ('mirror', mirror)):
+        if component is None:
+            continue
+        try:
+            if name == 'recorder':
+                stopped = component.shutdown()
+                if stopped is False:
+                    errors.append('recorder: shutdown 실패')
+            else:
+                stopped = component.shutdown(timeout)
+                if stopped is False:
+                    errors.append(f'{name}: shutdown timeout')
+        except Exception as e:
+            errors.append(f'{name}: {type(e).__name__}: {e}')
+    if errors:
+        raise RuntimeError('종료 정리 실패 — ' + ' | '.join(errors))
+    return worker_stopped
+
+
 def make_handler(worker, kin, cam, mir=None, rec=None):
-    page = (HERE / 'panel.html').read_bytes()
+    csrf_token = secrets.token_urlsafe(32)
+    page = (HERE / 'panel.html').read_text().replace(
+        '"__SO101_CSRF__"', json.dumps(csrf_token)).encode()
+    recorded, record_lock = OrderedDict(), threading.Lock()
+
+    def on_terminal(command):
+        if (rec is None or command.get('status') != 'completed'
+                or not command.get('applied_action')):
+            return
+        command_id = str(command.get('id') or '')
+        if not command_id:
+            return
+        with record_lock:
+            if command_id in recorded:
+                return
+            recorded[command_id] = None
+            while len(recorded) > 256:
+                recorded.popitem(last=False)
+        rec.note_command(command)
+
+    def terminal_tombstone_count():
+        with record_lock:
+            return len(recorded)
+
+    remove_terminal_listener = worker.add_terminal_listener(on_terminal)
 
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):                # 콘솔 잡음 끄기
@@ -334,43 +755,155 @@ def make_handler(worker, kin, cam, mir=None, rec=None):
             self.end_headers()
             self.wfile.write(body)
 
+        def _request_host_ok(self):
+            expected_port = self.server.server_address[1]
+            parsed = _host_port(self.headers.get('Host'), expected_port)
+            return parsed is not None and parsed[1] == expected_port
+
+        def _authorize_command(self):
+            if not self._request_host_ok():
+                self._json({'error': 'forbidden host'}, 403)
+                return False
+            origin = self.headers.get('Origin')
+            if origin:
+                port = self.server.server_address[1]
+                if not _same_origin(origin, port):
+                    self._json({'error': 'forbidden origin'}, 403)
+                    return False
+                supplied = self.headers.get('X-SO101-CSRF', '').encode()
+                if not secrets.compare_digest(supplied, csrf_token.encode()):
+                    self._json({'error': 'invalid csrf token'}, 403)
+                    return False
+            else:
+                peer = self.client_address[0]
+                if not _loopback(peer):
+                    self._json({'error': 'loopback client required'}, 403)
+                    return False
+            media_type = self.headers.get('Content-Type', '').split(';', 1)[0]
+            if media_type.strip().lower() != 'application/json':
+                self._json({'error': 'application/json required'}, 415)
+                return False
+            return True
+
+        def _submit_command(self, op, *args):
+            """모든 팔 명령을 추적 가능한 Worker 공개 경계로 제출한다."""
+            submit = getattr(worker, 'submit', None)
+            status = getattr(worker, 'command_status', None)
+            if not callable(submit) or not callable(status):
+                raise RuntimeError('Worker 명령 추적 인터페이스가 없습니다')
+            command_id = submit(op, *args)
+            if not isinstance(command_id, str) or not command_id:
+                raise RuntimeError('Worker가 command_id를 반환하지 않았습니다')
+            return command_id
+
+        def _command_response(self, command_id, **extra):
+            status = worker.command_status(command_id)
+            if not isinstance(status, dict):
+                raise RuntimeError('명령 상태를 찾을 수 없습니다')
+            phase = status.get('status')
+            if phase not in ('accepted', 'executing', 'completed', 'rejected'):
+                raise RuntimeError('Worker 명령 상태가 유효하지 않습니다')
+            body = {
+                'ok': phase != 'rejected',
+                'command_id': command_id,
+                'status': phase,
+                'reason': status.get('reason'),
+            }
+            body.update(extra)
+            return self._json(body)
+
         def do_GET(self):
-            if self.path in ('/', '/index.html'):
+            if not self._request_host_ok():
+                return self._json({'error': 'forbidden host'}, 403)
+            parsed = urlsplit(self.path)
+            if parsed.path == '/command':
+                try:
+                    query = parse_qs(parsed.query, strict_parsing=True,
+                                     keep_blank_values=True)
+                except ValueError:
+                    return self._json({'error': 'invalid query'}, 400)
+                ids = query.get('id')
+                if (set(query) != {'id'} or not ids or len(ids) != 1
+                        or not ids[0] or len(ids[0]) > 128):
+                    return self._json({'error': 'one valid command id required'}, 400)
+                status = worker.command_status(ids[0])
+                if not isinstance(status, dict):
+                    return self._json({'error': 'command not found'}, 404)
+                return self._json(status)
+            if parsed.query:
+                return self._json({'error': 'query not allowed'}, 400)
+            if parsed.path in ('/', '/index.html'):
                 self.send_response(200)
                 self.send_header('Content-Type', 'text/html; charset=utf-8')
+                self.send_header('Cache-Control', 'no-store')
+                self.send_header('X-Content-Type-Options', 'nosniff')
+                self.send_header('Content-Security-Policy',
+                                 "default-src 'self'; img-src 'self'; "
+                                 "style-src 'self' 'unsafe-inline'; "
+                                 "script-src 'self' 'unsafe-inline'; "
+                                 "frame-ancestors 'none'; base-uri 'none'")
                 self.send_header('Content-Length', str(len(page)))
                 self.end_headers()
                 self.wfile.write(page)
-            elif self.path == '/state':
+            elif parsed.path == '/state':
                 s = worker.snapshot()
                 # 차량 프로필은 손목캠 단독이다. Astra 상태를 섞지 않아 연결된 장치와
                 # 현재 제어 계약이 화면에서 서로 다르게 보이는 일을 막는다.
                 s['vision'] = {'source': 'wrist', 'depth': False,
                                'yolo_gate': 'cable_recheck'}
+                if cam is None:
+                    s['vision']['camera'] = {
+                        'sequence': 0, 'captured_at': None, 'age': None, 'stale': True,
+                        'available': False}
+                else:
+                    frame = cam.snapshot_frame()
+                    s['vision']['camera'] = {
+                        'sequence': frame['sequence'],
+                        'captured_at': frame['captured_at'], 'age': frame['age'],
+                        'stale': frame['stale'], 'available': True}
                 self._json(s)
-            elif self.path == '/cam':
+            elif parsed.path == '/cam':
                 if cam is None:
                     return self._json({'error': 'camera off'}, 503)
                 cam.ensure()
+                if cam.snapshot_frame()['stale']:
+                    return self._json({'error': 'camera frame stale'}, 503)
                 # MJPEG 스트림 — 브라우저 <img>가 그대로 재생한다
-                serve_mjpeg(self, cam.snapshot_jpeg)
-            elif self.path == '/mirror':
+                serve_mjpeg(self, cam.snapshot_jpeg, stop_on_empty=True)
+            elif parsed.path == '/frame.jpg':
+                if cam is None:
+                    return self._json({'error': 'camera off'}, 503)
+                cam.ensure()
+                frame = cam.snapshot_frame()
+                if frame['stale'] or frame['jpeg'] is None:
+                    return self._json({'error': 'camera frame stale'}, 503)
+                body = frame['jpeg']
+                self.send_response(200)
+                self.send_header('Content-Type', 'image/jpeg')
+                self.send_header('Cache-Control', 'no-store')
+                self.send_header('Content-Length', str(len(body)))
+                self.send_header('X-Frame-Sequence', str(frame['sequence']))
+                self.send_header('X-Frame-Captured-At', str(frame['captured_at']))
+                self.send_header('X-Frame-Age', str(frame['age']))
+                self.end_headers()
+                self.wfile.write(body)
+            elif parsed.path == '/mirror':
                 if mir is None:
                     return self._json({'error': 'mirror off'}, 503)
                 mir.ensure()
-                serve_mjpeg(self, mir.snapshot_jpeg)
-            elif self.path == '/mirror/state':
+                serve_mjpeg(self, mir.snapshot_jpeg, stop_on_empty=True)
+            elif parsed.path == '/mirror/state':
                 if mir is None:
                     return self._json({'ok': False, 'msg': 'mirror off'}, 503)
                 mir.ensure()
                 with mir.lock:
                     st = dict(mir.status)
                 self._json({'proxy': st, 'daemon': mir.request('/state')})
-            elif self.path == '/rec/status':
+            elif parsed.path == '/rec/status':
                 if rec is None:
                     return self._json({'recording': False, 'msg': '레코더 비활성'})
                 self._json(rec.status())
-            elif self.path == '/rec/list':
+            elif parsed.path == '/rec/list':
                 self._json({'datasets': ds_record.list_datasets(),
                             'root': str(ds_record.DEFAULT_ROOT)})
             else:
@@ -381,74 +914,76 @@ def make_handler(worker, kin, cam, mir=None, rec=None):
             # 있고(응답만 못 읽을 뿐 명령은 실행된다), /cmd 는 토크를 푼다.
             # Origin 이 붙어 있는데 우리 것이 아니면 거절한다. 로컬 스크립트
             # (urllib 등)는 Origin 을 안 보내므로 영향이 없다.
-            origin = self.headers.get('Origin')
-            if origin and not origin.startswith(('http://127.0.0.1',
-                                                 'http://localhost')):
-                return self._json({'error': 'forbidden origin'}, 403)
             if self.path != '/cmd':
                 return self._json({'error': 'not found'}, 404)
-            n = int(self.headers.get('Content-Length', 0))
-            req = json.loads(self.rfile.read(n) or '{}')
+            if not self._authorize_command():
+                return
+            try:
+                n = int(self.headers.get('Content-Length', ''))
+            except ValueError:
+                return self._json({'error': 'invalid content length'}, 400)
+            if n < 2 or n > MAX_COMMAND_BYTES:
+                return self._json({'error': 'command body size rejected'}, 413)
+            try:
+                req = json.loads(
+                    self.rfile.read(n), parse_constant=reject_json_constant)
+            except (json.JSONDecodeError, UnicodeDecodeError, ValueError,
+                    RecursionError):
+                return self._json({'error': 'invalid json'}, 400)
+            if not isinstance(req, dict):
+                return self._json({'error': 'json object required'}, 400)
+            try:
+                validate_json_values(req)
+            except (ValueError, RecursionError) as e:
+                return self._json({'error': str(e)}, 400)
             op = req.get('op')
             try:
                 if op == 'stop':
-                    # 큐를 우회한다 — 보간 이동 중이면 다음 스텝에서 즉시 끊긴다.
-                    worker.abort.set()
-                    try:                          # 밀려 있는 명령도 전부 버린다
-                        while True:
-                            worker.cmd.get_nowait()
-                    except Exception:
-                        pass
-                    worker.cmd.put(('stop',))
-                elif op in ('connect', 'disconnect', 'neutral', 'save_calib'):
-                    worker.cmd.put((op,))
+                    command_id = worker.stop_and_cancel('운영자 정지')
+                    return self._command_response(command_id)
+                elif op in ('connect', 'disconnect', 'neutral', 'save_calib',
+                            'rearm'):
+                    command_id = self._submit_command(op)
                 elif op == 'torque':
-                    worker.cmd.put(('torque', bool(req['on'])))
+                    command_id = self._submit_command('torque', bool(req['on']))
                 elif op == 'range':
-                    worker.cmd.put(('range', bool(req['start'])))
+                    command_id = self._submit_command('range', bool(req['start']))
                 elif op == 'jog':
-                    worker.cmd.put(('jog', req['joint'], float(req['delta'])))
-                    if rec is not None:      # 액션 = 명령 목표 (데이터셋 기록용)
-                        cur = (worker.snapshot().get('pos') or {}).get(req['joint'])
-                        if cur is not None:
-                            rec.note_action({req['joint']:
-                                             cur + float(req['delta'])})
+                    command_id = self._submit_command(
+                        'jog', req['joint'], float(req['delta']))
                 elif op == 'teleop_profile':
-                    worker.cmd.put(('teleop_profile', bool(req.get('on', True))))
-                    return self._json({'ok': True})
+                    command_id = self._submit_command(
+                        'teleop_profile', bool(req.get('on', True)))
                 elif op == 'pose':
                     joints = dict(req.get('joints') or {})
-                    worker.cmd.put(('pose', joints))
-                    if rec is not None and joints:
-                        rec.note_action({j: float(v) for j, v in joints.items()})
-                    return self._json({'ok': True})
+                    command_id = self._submit_command('pose', joints)
+                    return self._command_response(command_id)
                 elif op == 'goto':
-                    worker.cmd.put(('goto', req['joint'], float(req['value'])))
-                    if rec is not None:
-                        rec.note_action({req['joint']: float(req['value'])})
+                    command_id = self._submit_command(
+                        'goto', req['joint'], float(req['value']))
                 elif op == 'stop_test':
-                    worker.cmd.put(('stop_test', req['joint'], float(req['target']),
-                                    float(req.get('wait', 1.0))))
+                    command_id = self._submit_command(
+                        'stop_test', req['joint'], float(req['target']),
+                        float(req.get('wait', 1.0)))
                 elif op == 'grip_test':
-                    worker.cmd.put(('grip_test', float(req['delta'])))
+                    command_id = self._submit_command('grip_test', float(req['delta']))
                 elif op == 'pan_lock':
-                    worker.cmd.put(('pan_lock', bool(req.get('on', True)),
-                                    float(req.get('tol', 0.0)),
-                                    (float(req['center']) if req.get('center')
-                                     is not None else None)))
+                    command_id = self._submit_command(
+                        'pan_lock', bool(req.get('on', True)),
+                        float(req.get('tol', 0.0)),
+                        (float(req['center']) if req.get('center')
+                         is not None else None))
                 elif op == 'grip_force':
-                    worker.cmd.put(('grip_force', int(req.get('pct', 45))))
+                    command_id = self._submit_command(
+                        'grip_force', int(req.get('pct', 45)))
                 elif op == 'speed':
-                    worker.cmd.put(('speed', int(req['pct'])))
+                    command_id = self._submit_command('speed', int(req['pct']))
                 elif op == 'home':
-                    # 사용자가 잡아 둔 홈이 mapping.json 에 있으면 그것을 쓴다
-                    hq = arm_lib.load_mapping().get('home_q', HOME_Q)
-                    worker.cmd.put(('move_q', hq, 2.5))
-                    if rec is not None:
-                        mph = arm_lib.load_mapping()
-                        rec.note_action({j: mph['signs'][j] * math.degrees(hq[i])
-                                         + mph['offsets'][j]
-                                         for i, j in enumerate(arm_lib.JOINTS)})
+                    mapping = arm_lib.load_mapping()
+                    hq = mapping.get('home_q')
+                    if not (isinstance(hq, list) and len(hq) == len(arm_lib.JOINTS)):
+                        raise RuntimeError('mapping.json에 차량 홈 자세 home_q가 없습니다')
+                    command_id = self._submit_command('move_q', hq, 2.5)
                 elif op in ('ik', 'ik_preview'):
                     x, y, z = (float(req[k]) for k in 'xyz')
                     pitch = math.radians(float(req.get('pitch', -90)))
@@ -492,50 +1027,56 @@ def make_handler(worker, kin, cam, mir=None, rec=None):
                                            'mirror': shown, 'msg': why or '',
                                            'q': [round(v, 4) for v in q],
                                            'fk_pan': pan, 'deg': tgt})
-                    # 보간 시간을 거리 비례로 (2026-08-20): 고정 3초는 짧은
-                    # 구간을 굼뜨게, 긴 구간은 속도상한에 눌려 프로파일이
-                    # 어긋났다. 최대 관절 이동량 / (상한 × 0.85) 로 잡는다.
-                    secs = 3.0
                     try:
-                        cur = worker.snapshot().get('pos') or {}
-                        md = max(abs((tgt[j] - cur.get(j, tgt[j]) + 180)
-                                     % 360 - 180) for j in arm_lib.JOINTS)
-                        vel = worker._profile_vel() * 0.087   # [°/s]
-                        secs = min(14.0, max(0.8, md / (vel * 0.6)))
-                        # 상한 6→14초 (2026-08-26): 차량에서 작업↔관찰 자세는
-                        # wrist_flex 가 69° 를 움직인다. 6초 상한이면 11.5°/s 로
-                        # 명령이 나가는데 중력을 드는 손목이 못 따라가 스톨 오판.
-                    except Exception:
-                        pass
-                    worker.cmd.put(('move_q', list(q), round(secs, 2)))
-                    if rec is not None:
-                        rec.note_action(tgt)
-                    return self._json({'ok': True,
-                                       'q': [round(v, 4) for v in q],
-                                       'fk_pan': pan})
+                        secs = float(worker.estimate_motion_duration(tgt))
+                    except (AttributeError, RuntimeError, TypeError, ValueError) as e:
+                        raise RuntimeError(f'이동 시간 안전 계산 실패: {e}') from e
+                    if not math.isfinite(secs) or secs <= 0:
+                        raise RuntimeError('이동 시간 안전 계산이 유효한 값을 주지 않았습니다')
+                    command_id = self._submit_command(
+                        'move_q', list(q), round(secs, 2))
+                    return self._command_response(
+                        command_id, q=[round(v, 4) for v in q], fk_pan=pan)
                 elif op in ('rec_start', 'rec_stop', 'rec_cancel', 'rec_replay'):
                     if rec is None:
                         return self._json({'ok': False, 'msg': '레코더 비활성'}, 503)
                     if op == 'rec_start':
                         rid = str(req.get('repo_id') or '').strip()
-                        if not rid or '/' in rid or rid.startswith('.'):
+                        if not valid_repo_id(rid):
                             return self._json({'ok': False,
-                                               'msg': '데이터셋 이름을 확인하세요 '
-                                                      '(빈 값·/·. 로 시작 불가)'}, 400)
-                        return self._json(rec.start_episode(
+                                               'msg': '데이터셋 이름은 영문·숫자·_·- '
+                                                      '1~64자만 허용됩니다'}, 400)
+                        if req.get('wrist', True) is not True:
+                            return self._json(
+                                {'ok': False, 'msg': '차량 기록은 손목캠이 필수입니다'},
+                                503)
+                        ready, evidence = record_start_readiness(worker, cam)
+                        if not ready:
+                            return self._json({'ok': False, 'msg': evidence}, 503)
+                        result = rec.start_episode(
                             rid, req.get('task') or '', int(req.get('fps', 10)),
                             wrist=bool(req.get('wrist', True)),
-                            depth=False, pointmap=False))
+                            depth=False, pointmap=False,
+                            capability=evidence,
+                            validate_capability=make_record_capability_validator(
+                                worker, cam))
+                        return self._json(result, 200 if result.get('ok') else 503)
                     if op == 'rec_stop':
-                        return self._json(rec.stop_episode(save=True))
+                        result = rec.stop_episode(save=True)
+                        return self._json(result, 200 if result.get('ok') else 503)
                     if op == 'rec_cancel':
-                        return self._json(rec.stop_episode(save=False))
+                        result = rec.stop_episode(save=False)
+                        return self._json(result, 200 if result.get('ok') else 503)
                     # rec_replay — 기록된 궤적을 미러에서 되돌려 본다(팔 정지)
+                    rid = str(req.get('repo_id') or '').strip()
+                    if not valid_repo_id(rid):
+                        return self._json({'ok': False,
+                                           'msg': '잘못된 데이터셋 이름'}, 400)
                     if mir is None:
                         return self._json({'ok': False, 'msg': '미러 비활성'}, 503)
                     try:
                         frames = ds_record.episode_frames(
-                            req['repo_id'], int(req.get('episode', 0)),
+                            rid, int(req.get('episode', 0)),
                             stride=int(req.get('stride', 1)))
                     except Exception as e:
                         return self._json({'ok': False,
@@ -568,10 +1109,14 @@ def make_handler(worker, kin, cam, mir=None, rec=None):
                         timeout=10.0))
                 else:
                     return self._json({'error': f'unknown op {op}'}, 400)
-                self._json({'ok': True})
-            except (KeyError, ValueError) as e:
+                self._command_response(command_id)
+            except RuntimeError as e:
+                self._json({'ok': False, 'msg': str(e)}, 503)
+            except (KeyError, TypeError, ValueError, OverflowError) as e:
                 self._json({'ok': False, 'msg': f'인자 오류: {e}'}, 400)
 
+    H.remove_terminal_listener = staticmethod(remove_terminal_listener)
+    H.terminal_tombstone_count = staticmethod(terminal_tombstone_count)
     return H
 
 
@@ -615,6 +1160,8 @@ def main():
 
     worker = Worker(port, a.id)
     worker.start()
+    base_monitor = BaseMonitor(worker)
+    base_monitor.start()
     kin = arm_lib.load_kinematics()
     if a.cam >= 0:
         idx = Camera.find_index(a.cam if a.cam != 4 else None)
@@ -648,8 +1195,8 @@ def main():
         sys.exit(1)
     _panel_lock.write(str(os.getpid())); _panel_lock.flush()
 
-    srv = ThreadingHTTPServer(('127.0.0.1', a.http),
-                              make_handler(worker, kin, cam, mir, rec))
+    handler = make_handler(worker, kin, cam, mir, rec)
+    srv = ThreadingHTTPServer(('127.0.0.1', a.http), handler)
     print(f'SO-101 패널 → http://127.0.0.1:{a.http}  (시리얼 {port})')
 
     # SIGTERM(systemctl stop · kill)에도 정리 경로를 타게 한다. 기본 동작은 즉시
@@ -667,15 +1214,12 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        if rec is not None:
-            rec.shutdown()          # 기록 중이면 저장하고 끝낸다 — 버리지 않는다
-        if mir is not None:
-            mir.shutdown()          # 렌더 데몬을 남기면 GPU 를 문 고아가 된다
-        # ★ 토크 유지 종료 (2026-08-24) — 팔 자세와 무관하게 토크를 끊던 옛
-        # 경로는 펴진 팔을 책상에 떨어뜨렸다. 토크 해제는 사용자의 명시적
-        # '해제'(disconnect op)에서만.
-        worker.cmd.put(('disconnect_hold',))
-        worker.stop()
+        try:
+            shutdown_runtime(worker, rec, base_monitor, cam, mir,
+                             reason='panel server shutdown', timeout=2.0)
+        finally:
+            handler.remove_terminal_listener()
+            srv.server_close()
 
 
 if __name__ == '__main__':

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from _canonical_redirect import redirect_if_main as _redirect
+_redirect(__name__, 'floor_from_depth.py')
 """뎁스캠 평면 피팅으로 책상면 높이를 **비접촉**으로 잰다.
 
 접촉 탐지(probe_floor.py)의 대체다 — 2026-08-19 접촉 방식이 판정 실패로 책상을

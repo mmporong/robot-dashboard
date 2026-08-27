@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+exec python3 "$(dirname "$0")/../_canonical_redirect.py" sim/restart_viewer.sh "$@"
 # MuJoCo 미러 뷰어 재시작 — 이전 뷰어를 반드시 정리하고 하나만 띄운다.
 # (--record 프로세스는 건드리지 않는다. pkill -f 전면 금지 규칙 대신
 #  pgrep 으로 정확히 뷰어 인스턴스만 골라 pid 단위로 죽인다.)

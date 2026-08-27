@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from _canonical_redirect import redirect_if_main as _redirect
+_redirect(__name__, 'probe_floor.py')
 """죠를 천천히 내려 책상면 높이를 부하로 찾아 등록한다 — 파지 높이의 기준점.
 
 ## 왜 비전이 아니라 접촉인가

@@ -1,4 +1,6 @@
 #!/bin/sh
+echo "legacy 실행 차단 — canonical usb_port_cycle.sh 진입점이 없습니다" >&2
+exit 2
 # Astra 뎁스캠이 붙은 USB 포트의 전원(VBUS)만 껐다 켠다.
 #
 # 왜 필요한가: Astra 는 열거 도중 멈추는 일이 있다(port state 가 configured 에
