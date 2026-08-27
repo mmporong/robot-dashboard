@@ -30,6 +30,7 @@
         padding:6px 13px;cursor:pointer;font-family:inherit;font-size:12.5px;
         font-weight:600;color:var(--ink);white-space:nowrap}
   .chip:hover{border-color:var(--accent);color:var(--accent)}
+  .chip:disabled,.jbtn:disabled{opacity:.42;cursor:not-allowed;border-color:var(--rule);color:var(--muted)}
   .chip:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
   .chip.hot{border-color:var(--crit);color:var(--crit)}
   .chip.hot:hover{background:#FDECEC}
@@ -46,8 +47,8 @@
   .stage{position:relative;background:var(--stage);border-radius:12px;overflow:hidden;
          display:flex;align-items:center;justify-content:center}
   .stage img{width:100%;height:100%;object-fit:contain;display:block}
-  .feeds{position:absolute;inset:0;display:grid;grid-template-columns:1fr 1fr 1fr;gap:2px}
-  .feeds.nomirror{grid-template-columns:1fr 1fr}
+  .feeds{position:absolute;inset:0;display:grid;grid-template-columns:1fr 1fr;gap:2px}
+  .feeds.nomirror{grid-template-columns:1fr}
   .mctl{position:absolute;right:8px;bottom:8px;display:flex;gap:4px}
   .mctl button{background:rgba(10,14,18,.72);color:#C8D2DC;border:1px solid #2A3441;
     border-radius:6px;font-size:11px;padding:3px 7px;cursor:pointer;line-height:1.4}
@@ -73,6 +74,10 @@
   .ops{display:flex;flex-direction:column;gap:9px;min-height:0;overflow:auto}
   .card{background:var(--panel);border:1px solid var(--rule);border-radius:12px;
         padding:11px 13px}
+  .system{display:grid;grid-template-columns:1fr auto;gap:4px 10px;align-items:center}
+  .system b{font-size:12px}
+  .system span{font-size:11px;color:var(--muted);text-align:right}
+  .system .gate{color:var(--warn);font-weight:700}
 
   /* 속도 */
   .speedrow{display:flex;align-items:center;gap:10px}
@@ -164,7 +169,7 @@
     <div class="brand">SO-101 팔로워<span id="port">—</span></div>
     <button class="chip" id="bConn">연결</button>
     <button class="chip" id="bDisc">해제</button>
-    <button class="chip" id="bTon">토크 ON</button>
+    <button class="chip" id="bTon" disabled>토크 ON</button>
     <button class="chip hot" id="bToff">토크 OFF</button>
     <button class="stop-big" id="bStop">⏹ 정지<small>SPACE</small></button>
   </div>
@@ -174,19 +179,11 @@
     <section class="stage">
       <div class="feeds" id="feeds">
         <div class="feed">
-          <img id="cam" src="/cam" alt="손목캠"
-               onerror="this.outerHTML='<div class=nocam>손목캠 없음</div>'">
-          <span class="ftag">손목캠 · 색 검출</span>
-        </div>
-        <div class="feed">
-          <img id="dep" src="/depth" alt="깊이"
-               onerror="this.outerHTML='<div class=nocam>깊이 없음 — Astra 연결 확인</div>'">
-          <span class="ftag" id="dtag">뎁스캠 · 거리</span>
+          <img id="cam" src="/cam" alt="손목캠">
+          <span class="ftag" id="ctag">손목캠 · 연결 중</span>
         </div>
         <div class="feed" id="mirfeed">
-          <img id="mir" src="/mirror" alt="미러"
-               onerror="document.getElementById('feeds').classList.add('nomirror');
-                        this.parentElement.remove()">
+          <img id="mir" src="/mirror" alt="미러">
           <span class="ftag" id="mtag">MuJoCo 미러 · 디지털 트윈</span>
           <div class="mctl">
             <button data-az="-30" title="시점 왼쪽">↺</button>
@@ -201,6 +198,9 @@
         <span class="badge" id="hC"><span class="led"></span>연결</span>
         <span class="badge" id="hK"><span class="led"></span>캘리브</span>
         <span class="badge" id="hT"><span class="led"></span>토크</span>
+        <span class="badge warn" id="hPan"><span class="led"></span>팬 잠금 없음</span>
+        <span class="badge num" id="hTemp">—°C</span>
+        <span class="badge num" id="hVolt">—V</span>
         <span class="badge" id="hR" hidden><span class="led"></span>범위 기록 중</span>
         <span class="badge num" id="hSpd">15%</span>
       </div>
@@ -208,6 +208,12 @@
 
     <!-- 조작 컬럼 -->
     <aside class="ops">
+      <div class="card system">
+        <b>차량 프로필</b><span>노트북 제어 · Pi 베이스</span>
+        <b>비전</b><span>손목캠 단독 · depth 비활성</span>
+        <b>ROS</b><span>읽기 전용 프리플라이트 PASS</span>
+        <b>YOLO</b><span class="gate">케이블 정리 후 안전 게이트 재검증</span>
+      </div>
       <div class="card speedrow">
         <label>속도</label>
         <input type="range" id="speed" min="1" max="100" value="15">
@@ -227,23 +233,24 @@
         </div>
         <div class="ikact">
           <button class="chip" id="bPrev" title="팔은 움직이지 않고 미러에만 그려 봅니다">시뮬 확인</button>
-          <button class="chip go" id="bIK">IK 이동</button>
-          <button class="chip" id="bHome">홈 자세</button>
+          <button class="chip" id="bPiece" title="입력한 x·y에 시뮬 큐브만 놓습니다">물체 배치</button>
+          <button class="chip go" id="bIK" disabled>IK 이동</button>
+          <button class="chip" id="bHome" disabled>홈 자세</button>
         </div>
         <div class="ikout" id="ikout">[시뮬 확인]으로 미러에서 먼저 보고 → [IK 이동]. 도달 후 죠 끝을 자로 재서 예측과 비교합니다.</div>
       </div>
       <div class="card">
         <p class="eyebrow">데이터셋 — LeRobot 표준 포맷으로 기록</p>
         <div class="dsgrid">
-          <label>이름</label><input id="dsName" value="so101_cube_pick">
+          <label>이름</label><input id="dsName" value="so101_car">
           <label>태스크</label><input id="dsTask" value="pick the red cube and drop it in the box">
           <label>fps</label><input id="dsFps" value="10">
         </div>
         <div class="ikact">
-          <button class="chip go" id="bRec">● 기록 시작</button>
+          <button class="chip go" id="bRec" disabled>● 기록 시작</button>
           <button class="chip" id="bRecCancel" title="저장하지 않고 버립니다">버리기</button>
         </div>
-        <div class="ikout" id="dsout">연결·캘리브 후 시작합니다. 액션은 패널이 낸 명령 목표로 기록됩니다.</div>
+        <div class="ikout" id="dsout">차량 프로필은 관절 상태와 손목캠만 기록합니다. depth 채널은 만들지 않습니다.</div>
         <div class="dslist" id="dslist"></div>
       </div>
     </aside>
@@ -275,6 +282,19 @@ const ALL=[...ARM,'gripper'];
 const $=id=>document.getElementById(id);
 const esc=s=>String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 
+/* MJPEG가 잠깐 늦게 뜨더라도 요소를 지우지 않고 재연결한다. */
+function retryFeed(id,path,label){
+  const img=$(id), tag=$(id==='cam'?'ctag':'mtag');
+  img.onload=()=>{ tag.textContent=label; if(id==='mir') $('feeds').classList.remove('nomirror'); };
+  img.onerror=()=>{
+    tag.textContent=`${label} · 재연결 중`;
+    if(id==='mir') $('feeds').classList.add('nomirror');
+    setTimeout(()=>{ img.src=''; requestAnimationFrame(()=>img.src=path); },2000);
+  };
+}
+retryFeed('cam','/cam','손목캠 · YOLO 입력');
+retryFeed('mir','/mirror','MuJoCo 미러 · 차량 받침대');
+
 /* 관절 행 — 슬라이더가 상태 표시이자 조작 */
 for(const m of ALL){
   const step=m==='gripper'?5:2;
@@ -291,12 +311,15 @@ for(const m of ALL){
 }
 document.querySelectorAll('.jbtn').forEach(b=>b.onclick=()=>
   cmd({op:'jog',joint:b.dataset.j,delta:+b.dataset.d}));
+document.querySelectorAll('.jbtn').forEach(b=>b.disabled=true);
 
 async function cmd(body){
   try{
     const r=await fetch('/cmd',{method:'POST',headers:{'Content-Type':'application/json'},
                                 body:JSON.stringify(body)});
-    return await r.json();
+    const out=await r.json();
+    if(!r.ok||out.ok===false) $('log').textContent=out.msg||out.error||`명령 실패 (${r.status})`;
+    return out;
   }catch(e){ $('log').textContent='서버와 연결이 끊겼습니다 — panel_server.py 를 확인하세요'; }
 }
 $('bConn').onclick=()=>cmd({op:'connect'});
@@ -354,6 +377,10 @@ $('bPrev').onclick=async()=>{
   }else{
     $('ikout').innerHTML=`실행하면 거부됩니다 — ${r.msg||'IK 해 없음'}`;
   }
+};
+$('bPiece').onclick=async()=>{
+  const r=await cmd({op:'mirror_piece',x:$('ix').value,y:$('iy').value});
+  if(r&&r.ok) $('ikout').innerHTML=`시뮬 큐브를 <span class="num">(${$('ix').value}, ${$('iy').value})</span>에 배치했습니다 · 팔은 움직이지 않았습니다`;
 };
 
 /* 데이터셋 — LeRobot 표준 포맷 기록·목록·미러 재생 */
@@ -417,12 +444,30 @@ document.querySelectorAll('.mctl button[data-el]').forEach(b=>b.onclick=()=>{
   mirEl=Math.max(-85,Math.min(5,mirEl+ +b.dataset.el)); cmd({op:'mirror_view',elevation:mirEl});});
 const bLive=$('bMirLive'); if(bLive) bLive.onclick=()=>cmd({op:'mirror_live'});
 
-/* 상태 폴링 */
-let calibInit=false;
+/* 상태 폴링 — 응답이 멎어도 마지막 정상 상태로 조작 버튼이 남지 않게 한다. */
+let calibInit=false, tickBusy=false, lastStateAt=0;
+function markStateStale(){
+  $('port').textContent='○ 상태 끊김';
+  $('hC').className='badge warn';
+  for(const b of document.querySelectorAll('.jbtn,#bIK,#bHome,#bTon,#bRec,#joints input[type=range]'))
+    b.disabled=true;
+}
 async function tick(){
+  if(tickBusy) return;
+  tickBusy=true;
   let st;
-  try{ st=await (await fetch('/state')).json(); }
-  catch(e){ $('hC').className='badge'; return; }
+  const ctl=new AbortController(), timer=setTimeout(()=>ctl.abort(),800);
+  try{
+    const response=await fetch('/state',{signal:ctl.signal});
+    if(!response.ok) throw new Error(`state ${response.status}`);
+    st=await response.json();
+    lastStateAt=performance.now();
+  }
+  catch(e){
+    markStateStale();
+    return;
+  }
+  finally{ clearTimeout(timer); tickBusy=false; }
   recording=st.recording;
   $('port').textContent=st.connected?'● 온라인':'○ 오프라인';
   $('hC').className='badge'+(st.connected?' on':'');
@@ -430,10 +475,16 @@ async function tick(){
   $('hT').className='badge'+(st.torque?' on':'');
   $('hR').hidden=!st.recording;
   $('hSpd').textContent=st.teleop?'무제한(텔레옵)':(st.speed_pct||15)+'%';
-  const dt=$('dtag'), dp=st.depth;
-  if(dt&&dp) dt.textContent = dp.ok
-    ? `뎁스캠 · 중앙 ${dp.center_mm}mm · 최근접 ${dp.min_mm}mm · 유효 ${dp.valid_pct}%`
-    : `뎁스캠 · ${dp.msg||'대기'}`;
+  const pan=st.pan_lock, tol=+(st.pan_tol||0);
+  $('hPan').className='badge'+(pan==null?' warn':' on');
+  $('hPan').innerHTML='<span class="led"></span>'+(pan==null?'팬 잠금 없음':`팬 ${(+pan).toFixed(1)}° ±${tol.toFixed(1)}°`);
+  const temps=Object.values(st.temp||{}).map(Number).filter(Number.isFinite);
+  const volts=Object.values(st.volt||{}).map(Number).filter(Number.isFinite);
+  const tmax=temps.length?Math.max(...temps):null, vmin=volts.length?Math.min(...volts):null;
+  $('hTemp').textContent=tmax==null?'—°C':`${tmax.toFixed(0)}°C`;
+  $('hTemp').className='badge num'+(tmax>=55?' warn':'');
+  $('hVolt').textContent=vmin==null?'—V':`${vmin.toFixed(1)}V`;
+  $('hVolt').className='badge num'+(vmin!=null&&vmin<11.5?' warn':'');
   if(st.speed_pct&&document.activeElement!==$('speed')){
     $('speed').value=st.speed_pct; $('speedv').textContent=st.teleop?'무제한(텔레옵)':st.speed_pct+'%';
   }
@@ -445,6 +496,10 @@ async function tick(){
     :'<span class="todo">필요 — 펼쳐서 1→2→3 순서로</span>');
 
   const calibView=st.calibrated&&!st.recording;
+  const motionReady=st.connected&&st.calibrated&&st.torque&&!st.recording;
+  for(const b of document.querySelectorAll('.jbtn,#bIK,#bHome')) b.disabled=!motionReady;
+  $('bTon').disabled=!(st.connected&&st.calibrated);
+  $('bRec').disabled=!(st.connected&&st.calibrated);
   for(const m of ALL){
     const v=st.pos[m];
     const s=$('s_'+m);
@@ -460,7 +515,11 @@ async function tick(){
   $('log').innerHTML=lines.map((l,i,a)=>i===a.length-1?`<b>${esc(l)}</b>`:esc(l)).join('\n');
   $('log').scrollTop=$('log').scrollHeight;
 }
-setInterval(tick,200); tick();
+setInterval(()=>{
+  tick();
+  if(lastStateAt&&performance.now()-lastStateAt>1000) markStateStale();
+},200);
+tick();
 </script>
 </body>
 </html>

@@ -2,13 +2,13 @@
 
 `run_demo.sh` 가 남기는 것은 MCAP 한 덩어리가 아니라 **파일 묶음**이다:
 
-    media/<날짜>/demo_<시각>_rgb.mp4      정면 (뎁스캠 컬러)
-                 demo_<시각>_wrist.mp4    손목캠
-                 demo_<시각>_depth.mp4    깊이
+    media/<날짜>/demo_<시각>_wrist.mp4    손목캠
                  demo_<시각>_sim.mp4      MuJoCo 미러
                  demo_<시각>_screen.mp4   패널 화면
                  demo_<시각>_state.csv    관절각·온도(·전압) 시계열
                  demo_<시각>_simrec.log   시뮬 녹화 로그
+
+과거 벤치의 rgb/depth 파일은 legacy 채널로 읽기만 하며 새 차량 기록에는 만들지 않는다.
 
 여기서 하는 일은 그 묶음을 시각으로 엮고, 영상은 예산에 맞게 다시 인코딩해
 한 장짜리 HTML 에 실을 수 있는 크기로 만드는 것이다.
@@ -184,7 +184,7 @@ def grab_frames(path, fps, max_w):
 
 
 def read_datasets():
-    """LeRobot 데이터셋 목록 — 같은 벤치에서 나온 학습용 수집물."""
+    """LeRobot 데이터셋 목록 — 차량 호환 여부를 함께 표시한다."""
     root = pathlib.Path(P.DATASET_ROOT)
     out = []
     if not root.exists():
@@ -194,13 +194,52 @@ def read_datasets():
             info = json.loads(info_p.read_text())
         except Exception:
             continue
-        out.append({'repo_id': info_p.parent.parent.name,
+        repo_id = info_p.parent.parent.name
+        features = sorted(info.get('features', {}).keys())
+        wrist_only = ('observation.images.wrist' in features
+                      and 'observation.images.depth' not in features)
+        out.append({'repo_id': repo_id,
                     'episodes': info.get('total_episodes'),
                     'frames': info.get('total_frames'),
                     'fps': info.get('fps'),
                     'robot_type': info.get('robot_type'),
-                    'features': sorted(info.get('features', {}).keys())})
+                    'features': features,
+                    'profile': 'vehicle' if repo_id.startswith('so101_car') else 'legacy',
+                    'compatible': repo_id.startswith('so101_car') and wrist_only})
     return out
+
+
+def read_status():
+    """차량 운영 현황을 구조화된 원자료에서 다시 계산한다."""
+    status = dict(P.STATUS)
+    yolo = pathlib.Path(P.YOLO_LOG)
+    if yolo.exists():
+        rows = []
+        for line in yolo.read_text().splitlines():
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        hits = sum(r.get('target') is not None for r in rows)
+        status['yolo'] = {'frames': len(rows), 'hits': hits,
+                          'rate_pct': round(100 * hits / len(rows), 1) if rows else 0,
+                          'confidence': 0.40, 'gate': 'blocked'}
+
+    pick = pathlib.Path(P.PICK_LOG)
+    if pick.exists():
+        with pick.open(newline='') as fh:
+            rows = list(csv.DictReader(fh))
+        car = [r for r in rows if r.get('repo') == 'so101_car']
+        if car:
+            last = car[-1]
+            status['pick'] = {
+                'cycles': len(car),
+                'success': sum(r.get('result') == 'success' for r in car),
+                'last_at': last.get('ts'),
+                'last_result': last.get('result'),
+                'last_reason': last.get('reason'),
+            }
+    return status
 
 
 def main():
@@ -275,8 +314,11 @@ def main():
     ds = read_datasets()
     pathlib.Path('datasets.json').write_text(
         json.dumps(ds, ensure_ascii=False, separators=(',', ':')))
+    pathlib.Path('status.json').write_text(
+        json.dumps(read_status(), ensure_ascii=False, separators=(',', ':')))
     shown = sum(1 for r in runs if r['show'])
-    print(f'runs.json {len(runs)} 시행 (영상 {shown}개) · datasets.json {len(ds)} 개')
+    print(f'runs.json {len(runs)} 시행 (영상 {shown}개) · datasets.json {len(ds)} 개'
+          ' · status.json 차량 현황')
 
 
 if __name__ == '__main__':

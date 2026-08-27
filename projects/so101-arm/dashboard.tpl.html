@@ -1,5 +1,5 @@
 <meta charset="utf-8">
-<title>SO-101 Bench Telemetry</title>
+<title>SO-101 Mobile Manipulation Telemetry</title>
 <style>
   :root{
     --ground:#EEF1F4; --panel:#FFFFFF; --ink:#12171C; --muted:#5B6670;
@@ -46,6 +46,12 @@
   .fact .s{font-size:11px;color:var(--muted)}
   .fact.warn{border-color:var(--warn);background:var(--warn-soft)}
   .fact.crit{border-color:var(--crit);background:var(--crit-soft)}
+  .statusgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:8px}
+  .statuscard{border:1px solid var(--rule);border-radius:8px;padding:8px 10px;background:#F8FAFB}
+  .statuscard b{display:block;font-size:11px;margin-bottom:2px}
+  .statuscard span{font-size:11.5px;color:var(--muted)}
+  .statuscard.warn{border-color:var(--warn);background:var(--warn-soft)}
+  .statuscard.ok{border-color:var(--ok);background:var(--ok-soft)}
 
   /* 영상 */
   /* 채널 격자. 열 수를 사용자가 정한다 — 다섯을 나란히 보고 싶을 때와 둘만 크게
@@ -133,16 +139,23 @@
   .dsrow b{font-weight:600}
   .dsrow .num{margin-left:auto;color:var(--muted)}
   .feat{font-family:var(--mono);font-size:10.5px;color:var(--muted)}
+  .profile{font-size:10px;border:1px solid var(--rule);border-radius:10px;padding:1px 6px;color:var(--muted)}
+  .profile.vehicle{border-color:var(--ok);color:var(--ok)}
+  .profile.bad{border-color:var(--warn);color:var(--warn)}
   .empty{color:var(--muted);font-size:12.5px;padding:6px 0}
   .note{font-size:11.5px;color:var(--muted);margin-top:7px}
 </style>
 
 <div class="app">
   <div class="topbar">
-    <div class="brand">SO-101 Bench Telemetry<span>실기 기록 — 영상·상태·데이터셋</span></div>
+    <div class="brand">SO-101 Mobile Manipulation<span>차량 실기 — 손목캠·상태·데이터셋</span></div>
     <div class="runsel" id="runsel"></div>
   </div>
   <div class="wrap">
+    <div class="pane">
+      <p class="eyebrow">현재 차량 구성 · <span id="statusdate"></span></p>
+      <div class="statusgrid" id="statusgrid"></div>
+    </div>
     <div class="pane">
       <p class="eyebrow" id="runhead">시행</p>
       <div class="facts" id="facts"></div>
@@ -213,6 +226,7 @@
 <script>
 const RUNS = /*__RUNS__*/[];
 const DATASETS = /*__DATASETS__*/[];
+const STATUS = /*__STATUS__*/{};
 const $ = id => document.getElementById(id);
 
 const JCOL = {shoulder_pan:'#0E7490', shoulder_lift:'#B45309', elbow_flex:'#15803D',
@@ -425,8 +439,28 @@ function drawDatasets(){
   }
   el.innerHTML = DATASETS.map(d =>
     `<div class="dsrow"><b>${d.repo_id}</b>`
+    + `<span class="profile ${d.compatible?'vehicle':'bad'}">${d.compatible?'차량 호환':'legacy/확인 필요'}</span>`
     + `<span class="feat">${(d.features||[]).filter(f=>f.startsWith('observation')||f==='action').join(' · ')}</span>`
     + `<span class="num">회차 ${d.episodes} · ${d.frames} 프레임 · ${d.fps}fps</span></div>`).join('');
+}
+
+function drawStatus(){
+  $('statusdate').textContent=STATUS.updated||'갱신일 미상';
+  const y=STATUS.yolo||{}, p=STATUS.pick||{};
+  const cards=[
+    ['연산 배치',STATUS.compute||'—',''],
+    ['비전',STATUS.vision||'—',''],
+    ['ROS',STATUS.ros||'—','ok'],
+    ['팬 안전범위',STATUS.pan||'—','ok'],
+    ['YOLO 안전 게이트',y.frames!=null
+      ? `conf ${y.confidence.toFixed(2)} · ${y.hits}/${y.frames} (${y.rate_pct.toFixed(1)}%) · ${STATUS.yolo_gate}`
+      : STATUS.yolo_gate||'원자료 없음','warn'],
+    ['최근 수집',p.cycles!=null
+      ? `${p.success}/${p.cycles} 성공 · 마지막 ${p.last_result||'—'} · ${p.last_reason||''}`
+      : 'pick_log.csv 기록 없음',p.last_result==='success'?'ok':'warn'],
+  ];
+  $('statusgrid').innerHTML=cards.map(([k,v,c])=>
+    `<div class="statuscard ${c}"><b>${k}</b><span>${v}</span></div>`).join('');
 }
 
 /* ── 선택 ─────────────────────────────── */
@@ -524,14 +558,15 @@ function events(r){
   if (sm.temp_max_at != null) ev.push({t: sm.temp_max_at, k: '최고 온도', v: `${sm.temp_max}°C`});
   if (sm.torque_off_at != null) ev.push({t: sm.torque_off_at, k: '토크 꺼짐', v: '팔에서 힘이 빠졌다'});
   // 정지 구간 — 관절이 오래 안 움직이면 그 자체가 볼 거리다(대기인지 멈춘 건지)
-  const j0 = (sm.joints || [])[0];
-  if (j0 && S[j0 + '_deg']){
-    const d = S[j0 + '_deg']; let run = 0, from = 0;
-    for (let i = 1; i < d.length; i++){
-      const still = Math.abs(d[i] - d[i-1]) < 0.15;
+  const moving = (sm.joints || []).filter(j=>j!=='shoulder_pan'&&S[j+'_deg']);
+  if (moving.length){
+    let run = 0, from = 0;
+    for (let i = 1; i < ts.length; i++){
+      const still = moving.every(j=>Math.abs(S[j+'_deg'][i]-S[j+'_deg'][i-1])<0.15);
       if (still){ if (!run) from = ts[i-1]; run++; }
       else { if (run >= 40) ev.push({t: from, k: '정지', v: `${(ts[i-1]-from).toFixed(0)}초간 움직임 없음`}); run = 0; }
     }
+    if(run>=40) ev.push({t:from,k:'정지',v:`${(ts[ts.length-1]-from).toFixed(0)}초간 움직임 없음`});
   }
   return ev.sort((a,b) => a.t - b.t);
 }
@@ -561,8 +596,9 @@ if (RUNS.length){
   select((withVideo[withVideo.length-1] || RUNS[RUNS.length-1]).id);
 }else{
   $('runhead').textContent = '기록 없음';
-  $('runnote').textContent = 'python3 dash.py so101-arm all 을 돌리면 ~/so101_tools/media 의 기록이 실립니다.';
+  $('runnote').textContent = 'python3 dash.py so101-arm all 을 돌리면 ~/so101-mobile-manipulation/media 의 기록이 실립니다.';
 }
 drawDatasets();
+drawStatus();
 window.addEventListener('resize', () => drawCharts(duration() * $('seek').value / 1000));
 </script>

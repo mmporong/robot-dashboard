@@ -5,6 +5,7 @@ projects/*/dashboard.html
 projects/*/runs.json
 projects/*/run_frames.json
 projects/*/trend.json
+projects/*/status.json
 
 # 기록 원본은 리포에 넣지 않는다. MCAP 한 시행이 수백 MB가 되기도 하고
 # (`ros2 bag record` 실기록 하나가 163MB였다), git은 그런 것을 담는 도구가 아니다.

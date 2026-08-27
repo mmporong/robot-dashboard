@@ -3,13 +3,16 @@
 
 다른 프로젝트(capstone-pick·slam)의 대시보드는 **기록을 보는** 정적 페이지지만,
 이 패널은 **실물 팔을 움직이는** 라이브 페이지라 뒤에 서버가 필요하다. 시리얼
-통신은 `~/so101_tools/arm_gui.py` 의 `Worker`(전담 스레드)를 그대로 쓰고, 이
+통신은 `~/so101-mobile-manipulation/arm_gui.py`의 `Worker`(전담 스레드)를 쓰고, 이
 서버는 그 앞에 HTTP 만 얹는다.
 
     GET  /        → panel.html
     GET  /state   → Worker 상태 JSON (연결·캘리브·토크·관절각·범위·로그)
+    GET  /cam     → 손목캠 MJPEG
+    GET  /mirror  → MuJoCo 미러 MJPEG
     POST /cmd     → {"op": "connect" | "disconnect" | "torque" | "neutral"
-                     | "range" | "save_calib" | "jog" | "ik" | "home"} + 인자
+                     | "range" | "save_calib" | "jog" | "ik" | "home"
+                     | "mirror_piece"} + 인자
 
 IK 는 서버에서 푼다 — 캡스톤 `kinematics.ik_best` 로 관절각을 만들어 Worker 에
 넘긴다. 좌표는 pan 축 기준(x=전방·y=좌·z=상, 원점=베이스 서보 회전 중심).
@@ -20,7 +23,6 @@ IK 는 서버에서 푼다 — 캡스톤 `kinematics.ik_best` 로 관절각을 �
     python3 panel_server.py --port-serial /dev/ttyACM1 --http 8766
 """
 import argparse
-import base64
 import json
 import math
 import pathlib
@@ -32,7 +34,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = pathlib.Path(__file__).parent
-TOOLS = pathlib.Path('~/so101_tools').expanduser()
+TOOLS = pathlib.Path('~/so101-mobile-manipulation').expanduser()
 sys.path.insert(0, str(TOOLS))
 
 import arm_lib                                    # noqa: E402
@@ -105,12 +107,8 @@ class Camera(threading.Thread):
                 cap = cv2.VideoCapture(alt, cv2.CAP_V4L2)
         if not cap.isOpened():
             return None
-        # ★ 대역폭을 줄인다. 이 캠(USB 2.0 PC Cam)은 YUYV 단일 포맷·30fps 고정이라
-        # (VIDIOC_ENUM 실측 2026-08-19) MJPG·fps 지정은 무시된다 — 먹히는 레버는
-        # 해상도뿐이다. 640x480 YUYV(147Mbps)는 같은 USB2 버스의 Astra(깊이+컬러
-        # ≈294Mbps)와 합치면 등시성 한도를 넘어 Astra 가 굶고, 구형 SDK 는 거기서
-        # 영구 교착한다(실측: /cam 첫 접속 순간 깊이 스트림 동결). 352x288 은
-        # 49Mbps 라 공존한다. 패널 확인용 화면이라 화질도 충분하다.
+        # 차량 손목캠의 검증 해상도와 맞춘다. YOLO 실측도 352×288 기준이라 패널과
+        # 관찰기가 같은 픽셀 좌표를 쓰며, 불필요한 USB·인코딩 부하도 피한다.
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, 352)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 288)
         fcc = int(cap.get(cv2.CAP_PROP_FOURCC))
@@ -151,185 +149,8 @@ class Camera(threading.Thread):
             time.sleep(0.1)                      # 10fps — 패널 확인용이라 충분
 
 
-class Depth(threading.Thread):
-    """깊이 데몬(depth_daemon.py)을 감독하고 최신 프레임을 중계한다.
-
-    손목캠과 달리 이쪽은 **거리를 직접 측정**한다. 손목캠이 못 푸는 전후(x) 를
-    여기서 얻는 것이 이 카메라를 붙인 이유다(2026-08-18: 면적 기반 x 추정이 두 번
-    실패 — 신호가 거리와 무관하게 움직였다).
-
-    ★ 캡처는 같은 프로세스가 아니라 **별도 프로세스**가 한다. Legacy SDK 는
-    같은 USB2 버스의 UVC 캠이 열리는 순간 astra_update() 안에서 영구 교착할 수
-    있는데(실측 2026-08-19: /cam 최초 접속에 깊이 스레드가 C 코드에서 멈춰
-    재연결 루프조차 안 돌았다), 교착한 스레드는 살릴 방법이 없고 서버 재시작은
-    팔 토크를 풀어 버린다. 프로세스로 떼어 두면 데몬만 갈아끼우면 된다.
-
-    이 스레드가 하는 일: 데몬 기동 → /all 을 10Hz 로 끌어와 캐시 → 하트비트가
-    멎거나 프로세스가 죽으면 백오프를 두고 재기동. 밖에서 보는 인터페이스
-    (lock·stats·blob·snapshot_jpeg·ensure·shutdown)는 종전 그대로다.
-    """
-
-    # 데몬 HTTP 가 살아 있어도 하트비트(beat_age)가 이보다 오래 멎으면 캡처가
-    # SDK 안에서 굳은 것이다 — 데몬 자체 워치독(12s)이 놓친 경우의 안전망.
-    STALE_S = 20.0
-    # /all 요청이 이 시간 동안 계속 실패하면(기동 직후 제외) 데몬을 갈아끼운다.
-    HTTP_DEAD_S = 15.0
-
-    def __init__(self, port=8766):
-        super().__init__(daemon=True)
-        self.port = port
-        self.lock = threading.Lock()
-        self.jpeg = None
-        self.rgb_jpeg = None
-        self.stats = {'ok': False, 'msg': '시작 전'}
-        self.blob = None
-        self.started = False
-        self._start_lock = threading.Lock()
-        self._proc_lock = threading.Lock()   # _spawn / _stop_proc / shutdown 경쟁 방지
-        self._closing = False
-        self._proc = None
-        self._log = None
-        self._restarts = 0                   # 연속 재기동 횟수 — 백오프 근거
-
-    def snapshot_jpeg(self, attr):
-        with self.lock:
-            return getattr(self, attr)
-
-    def ensure(self):
-        with self._start_lock:
-            if not self.started:
-                self.started = True
-                self.start()
-
-    def shutdown(self, timeout=10.0):
-        """데몬을 곱게 끝낸다 — SIGTERM 이면 데몬이 Astra 를 스스로 닫는다."""
-        self._closing = True
-        if self.is_alive():
-            self.join(2.0)
-        self._stop_proc(grace=timeout)
-
-    def _health(self, timeout=0.5):
-        import urllib.request
-        try:
-            with urllib.request.urlopen(
-                    f'http://127.0.0.1:{self.port}/health', timeout=timeout) as r:
-                return json.loads(r.read())
-        except Exception:
-            return None
-
-    def _spawn(self):
-        with self._proc_lock:
-            if self._closing:                 # shutdown 직후의 재기동 경로 차단 —
-                return                        # 안 막으면 고아 데몬이 남는다
-            # 프리플라이트: 포트에 이미 데몬이 있으면 새로 못 띄운다(bind 실패 →
-            # 즉시 exit → 재기동 폭주. 그런데 폴링은 그 선점 데몬에 붙어 성공하니
-            # 겉으론 멀쩡해 보인다). 건강하면 채택하고, 굳었으면 밀어낸다.
-            h = self._health()
-            if h is not None:
-                if h.get('beat_age', 999) <= self.STALE_S:
-                    return                    # 살아 있는 데몬 채택 — 폴링만 한다
-                subprocess.run(['fuser', '-k', '-TERM', f'{self.port}/tcp'],
-                               capture_output=True)
-                time.sleep(2.0)
-            if self._log is None:
-                self._log = open(HERE / 'depth_daemon.log', 'ab', buffering=0)
-            self._proc = subprocess.Popen(
-                [sys.executable, '-u', str(HERE / 'depth_daemon.py'),
-                 '--http', str(self.port)],
-                cwd=str(HERE), stdout=self._log, stderr=subprocess.STDOUT)
-
-    def _stop_proc(self, grace=10.0):
-        """SIGTERM → 대기 → SIGKILL. grace 를 넉넉히 — 데몬이 Astra 를 닫는 데
-        시간이 걸리고, 안 닫힌 채 죽으면 다음 열기가 한동안 실패한다."""
-        with self._proc_lock:
-            p, self._proc = self._proc, None
-        if p is None or p.poll() is not None:
-            return
-        try:
-            p.terminate()
-            p.wait(grace)
-        except Exception:
-            try:
-                p.kill()
-                p.wait(3.0)
-            except Exception:
-                pass
-
-    def _backoff(self):
-        """연속 재기동이 쌓이면 3→6→12→24→30초로 간격을 늘린다 — 영구 실패
-        (장치 없음·import 실패)에서 3초마다 프로세스를 찍어내지 않게."""
-        self._restarts += 1
-        return min(3.0 * (2 ** min(self._restarts - 1, 3)), 30.0)
-
-    def run(self):
-        import urllib.request
-        self._spawn()
-        last_seq = -1
-        now = time.monotonic()
-        last_http_ok = last_beat_ok = now
-        while not self._closing:
-            # 감독 스레드는 죽으면 안 된다 — 죽으면 ensure() 가 되살리지 못하고
-            # 화면은 마지막 JPEG 로 영원히 굳는다(원래 잡으려던 바로 그 증상).
-            try:
-                time.sleep(0.1)
-                now = time.monotonic()
-                # ① 데몬이 스스로 죽음(자체 워치독의 SDK 교착 감지 등) → 재기동
-                if self._proc is not None and self._proc.poll() is not None:
-                    code = self._proc.returncode
-                    wait_s = self._backoff()
-                    with self.lock:
-                        self.stats = {'ok': False,
-                                      'msg': f'데몬 재시작 중 (exit {code} · {self._restarts}회)'}
-                    self._proc = None
-                    time.sleep(wait_s)        # 커널의 usbfs 회수 + 백오프
-                    if self._closing:
-                        break
-                    self._spawn()
-                    last_http_ok = last_beat_ok = time.monotonic()
-                    continue
-                # ② 프레임·상태 끌어오기
-                try:
-                    with urllib.request.urlopen(
-                            f'http://127.0.0.1:{self.port}/all', timeout=0.8) as r:
-                        d = json.loads(r.read())
-                except Exception:
-                    d = None
-                if d is not None:
-                    last_http_ok = now
-                    if d.get('beat_age', 0) <= self.STALE_S:
-                        last_beat_ok = now
-                    if d.get('seq', -1) != last_seq:
-                        last_seq = d.get('seq', last_seq)
-                        self._restarts = 0     # 프레임이 흐른다 — 백오프 리셋
-                        with self.lock:
-                            if d.get('depth_jpeg'):
-                                self.jpeg = base64.b64decode(d['depth_jpeg'])
-                            if d.get('rgb_jpeg'):
-                                self.rgb_jpeg = base64.b64decode(d['rgb_jpeg'])
-                            self.stats = d.get('stats') or self.stats
-                            self.blob = d.get('blob')
-                    else:                      # 프레임은 그대로여도 상태는 싣는다
-                        with self.lock:
-                            self.stats = d.get('stats') or self.stats
-                # ③ 살아는 있는데 응답이 없거나 캡처가 굳음 → 갈아끼운다
-                if (now - last_http_ok > self.HTTP_DEAD_S
-                        or now - last_beat_ok > self.STALE_S + 5):
-                    with self.lock:
-                        self.stats = {'ok': False, 'msg': '데몬 응답 없음 — 재시작'}
-                    self._stop_proc()
-                    time.sleep(self._backoff())
-                    if self._closing:
-                        break
-                    self._spawn()
-                    last_http_ok = last_beat_ok = time.monotonic()
-            except Exception as e:
-                with self.lock:
-                    self.stats = {'ok': False, 'msg': f'감독 오류: {type(e).__name__}'}
-                time.sleep(1.0)
-
-
 class Mirror(threading.Thread):
-    """MuJoCo 미러 데몬(~/so101_tools/sim/mirror_daemon.py)을 감독·중계한다.
+    """MuJoCo 미러 데몬(~/so101-mobile-manipulation/sim/mirror_daemon.py)을 감독·중계한다.
 
     별도 프로세스인 이유는 깊이 데몬과 다르다 — 장치 교착이 아니라 **환경**이다.
     mujoco 는 rlwalk 환경에만 설치돼 있고 이 서버는 lerobot 환경에서 돈다.
@@ -477,9 +298,8 @@ class Mirror(threading.Thread):
 def serve_mjpeg(handler, get_jpeg, fps=10):
     """최신 JPEG 를 multipart 로 흘린다.
 
-    ★ 같은 프레임이어도 매번 보내고, Content-Length 를 붙이지 않는다. "바뀔 때만
-    보내기"와 Content-Length 를 넣었다가 브라우저가 첫 프레임만 그리고 멈췄다
-    (2026-08-19: /cam 은 정상인데 /depth 만 정지). 대역을 아끼려 들지 말 것.
+    같은 프레임이어도 매번 보내고 Content-Length를 붙이지 않는다. 바뀔 때만
+    보내면 브라우저가 첫 프레임에서 멈추는 조합이 있어 연결 안정성을 우선한다.
     """
     handler.send_response(200)
     handler.send_header('Cache-Control', 'no-store')
@@ -499,7 +319,7 @@ def serve_mjpeg(handler, get_jpeg, fps=10):
         pass                              # 탭을 닫으면 여기로 — 정상 종료
 
 
-def make_handler(worker, kin, cam, dep, mir=None, rec=None):
+def make_handler(worker, kin, cam, mir=None, rec=None):
     page = (HERE / 'panel.html').read_bytes()
 
     class H(BaseHTTPRequestHandler):
@@ -523,30 +343,11 @@ def make_handler(worker, kin, cam, dep, mir=None, rec=None):
                 self.wfile.write(page)
             elif self.path == '/state':
                 s = worker.snapshot()
-                # 서보 온도를 함께 싣는다. 과열은 화면에 보여야 사람이 멈출 수 있다
-                # (2026-08-19 발연 사고 — 아무 계기도 없어 아무도 몰랐다).
-                if dep is not None:
-                    with dep.lock:
-                        s['depth'] = dict(dep.stats)
+                # 차량 프로필은 손목캠 단독이다. Astra 상태를 섞지 않아 연결된 장치와
+                # 현재 제어 계약이 화면에서 서로 다르게 보이는 일을 막는다.
+                s['vision'] = {'source': 'wrist', 'depth': False,
+                               'yolo_gate': 'cable_recheck'}
                 self._json(s)
-            elif self.path == '/blob':
-                # 정합용 측정창 — 뎁스캠이 본 빨간 물체의 카메라 좌표를 그대로 준다.
-                if dep is None:
-                    return self._json({'ok': False, 'msg': 'depth off'}, 503)
-                dep.ensure()
-                with dep.lock:
-                    b, st = dep.blob, dict(dep.stats)
-                self._json({'ok': b is not None, 'blob': b, 'depth': st})
-            elif self.path == '/rgb':
-                if dep is None:
-                    return self._json({'error': 'depth off'}, 503)
-                dep.ensure()
-                serve_mjpeg(self, lambda: dep.snapshot_jpeg('rgb_jpeg'))
-            elif self.path == '/depth':
-                if dep is None:
-                    return self._json({'error': 'depth off'}, 503)
-                dep.ensure()
-                serve_mjpeg(self, lambda: dep.snapshot_jpeg('jpeg'))
             elif self.path == '/cam':
                 if cam is None:
                     return self._json({'error': 'camera off'}, 503)
@@ -630,6 +431,13 @@ def make_handler(worker, kin, cam, dep, mir=None, rec=None):
                                     float(req.get('wait', 1.0))))
                 elif op == 'grip_test':
                     worker.cmd.put(('grip_test', float(req['delta'])))
+                elif op == 'pan_lock':
+                    worker.cmd.put(('pan_lock', bool(req.get('on', True)),
+                                    float(req.get('tol', 0.0)),
+                                    (float(req['center']) if req.get('center')
+                                     is not None else None)))
+                elif op == 'grip_force':
+                    worker.cmd.put(('grip_force', int(req.get('pct', 45))))
                 elif op == 'speed':
                     worker.cmd.put(('speed', int(req['pct'])))
                 elif op == 'home':
@@ -693,7 +501,10 @@ def make_handler(worker, kin, cam, dep, mir=None, rec=None):
                         md = max(abs((tgt[j] - cur.get(j, tgt[j]) + 180)
                                      % 360 - 180) for j in arm_lib.JOINTS)
                         vel = worker._profile_vel() * 0.087   # [°/s]
-                        secs = min(3.5, max(0.5, md / (vel * 1.6)))
+                        secs = min(14.0, max(0.8, md / (vel * 0.6)))
+                        # 상한 6→14초 (2026-08-26): 차량에서 작업↔관찰 자세는
+                        # wrist_flex 가 69° 를 움직인다. 6초 상한이면 11.5°/s 로
+                        # 명령이 나가는데 중력을 드는 손목이 못 따라가 스톨 오판.
                     except Exception:
                         pass
                     worker.cmd.put(('move_q', list(q), round(secs, 2)))
@@ -702,14 +513,6 @@ def make_handler(worker, kin, cam, dep, mir=None, rec=None):
                     return self._json({'ok': True,
                                        'q': [round(v, 4) for v in q],
                                        'fk_pan': pan})
-                elif op == 'cam_home':
-                    # 뎁스캠을 정합 기준각으로 — 파지 전 필수 단계. 버스 소유자가
-                    # Worker 라 큐로 넘긴다(별도 프로세스가 같은 포트를 열면 경합).
-                    worker.cmd.put(('cam_home',))
-                    return self._json({'ok': True, 'queued': True})
-                elif op == 'cam_move':
-                    worker.cmd.put(('cam_move', req['axis'], float(req['delta'])))
-                    return self._json({'ok': True, 'queued': True})
                 elif op in ('rec_start', 'rec_stop', 'rec_cancel', 'rec_replay'):
                     if rec is None:
                         return self._json({'ok': False, 'msg': '레코더 비활성'}, 503)
@@ -722,8 +525,7 @@ def make_handler(worker, kin, cam, dep, mir=None, rec=None):
                         return self._json(rec.start_episode(
                             rid, req.get('task') or '', int(req.get('fps', 10)),
                             wrist=bool(req.get('wrist', True)),
-                            depth=bool(req.get('depth', True)),
-                            pointmap=bool(req.get('pointmap', False))))
+                            depth=False, pointmap=False))
                     if op == 'rec_stop':
                         return self._json(rec.stop_episode(save=True))
                     if op == 'rec_cancel':
@@ -745,7 +547,8 @@ def make_handler(worker, kin, cam, dep, mir=None, rec=None):
                                                 'fps': float(req.get('fps', 10))},
                                     timeout=20.0)
                     return self._json(dict(r, frames=len(frames)))
-                elif op in ('mirror_view', 'mirror_live', 'mirror_replay'):
+                elif op in ('mirror_view', 'mirror_live', 'mirror_replay',
+                            'mirror_piece'):
                     # 미러는 표시 계층이라 팔을 건드리지 않는다 — 데몬으로 중계만
                     if mir is None:
                         return self._json({'ok': False, 'msg': '미러 비활성'}, 503)
@@ -756,6 +559,9 @@ def make_handler(worker, kin, cam, dep, mir=None, rec=None):
                         return self._json(mir.request('/view', body))
                     if op == 'mirror_live':
                         return self._json(mir.request('/live', {}))
+                    if op == 'mirror_piece':
+                        body = {k: req[k] for k in ('x', 'y', 'yaw') if k in req}
+                        return self._json(mir.request('/piece', body))
                     return self._json(mir.request(
                         '/replay', {'frames': req.get('frames') or [],
                                     'fps': float(req.get('fps', 10))},
@@ -777,10 +583,6 @@ def main():
                          "고정 경로로 띄운 서버는 조용히 죽은 포트를 붙든다")
     ap.add_argument('--id', default='follower')
     ap.add_argument('--http', type=int, default=8765)
-    ap.add_argument('--no-depth', dest='depth', action='store_false',
-                    help='Orbbec 깊이 스트림을 끈다')
-    ap.add_argument('--depth-port', type=int, default=8766,
-                    help='깊이 캡처 데몬(depth_daemon.py)의 HTTP 포트')
     ap.add_argument('--cam', type=int, default=4,
                     help='V4L2 인덱스 (/dev/videoN). -1이면 캠 끔')
     ap.add_argument('--no-mirror', dest='mirror', action='store_false',
@@ -801,7 +603,7 @@ def main():
         cands = [p for p in [arm_lib.find_arm_port()] if p]
         if not cands:
             # 포트가 없어도 서버는 띄운다 (2026-08-21). 여기서 죽으면 팔 전원이
-            # 꺼져 있다는 이유로 미러·깊이캠·패널까지 통째로 못 뜬다 — 데이터셋
+            # 꺼져 있다는 이유로 미러·손목캠·패널까지 통째로 못 뜬다 — 데이터셋
             # 검수나 시뮬 작업은 팔 없이도 하는 일이다. Worker._do_connect 가
             # 연결 시점에 포트를 재탐색하므로, 나중에 꽂아도 그대로 붙는다.
             port = '/dev/ttyACM0'
@@ -825,14 +627,13 @@ def main():
     else:
         cam = None
 
-    dep = Depth(a.depth_port) if a.depth else None
     mir = None
     if a.mirror:
         if Mirror.python_bin() is None:
             print('mujoco 환경(rlwalk) 없음 — 미러 비활성 (/mirror 503)')
         else:
             mir = Mirror(a.mirror_port, a.piece)   # 첫 요청에 기동(ensure)
-    rec = ds_record.Recorder(worker, cam, dep) if a.record else None
+    rec = ds_record.Recorder(worker, cam, None) if a.record else None
     ThreadingHTTPServer.daemon_threads = True   # 남은 스트림 스레드가 종료를 막지 않게
     # ★ 단일 인스턴스 잠금 (2026-08-24) — 패널이 둘 뜨면 같은 시리얼 포트를
     # 두 프로세스가 물고 명령 유실·패킷 실패·유령 무응답이 생긴다(하루 종일
@@ -848,12 +649,11 @@ def main():
     _panel_lock.write(str(os.getpid())); _panel_lock.flush()
 
     srv = ThreadingHTTPServer(('127.0.0.1', a.http),
-                              make_handler(worker, kin, cam, dep, mir, rec))
+                              make_handler(worker, kin, cam, mir, rec))
     print(f'SO-101 패널 → http://127.0.0.1:{a.http}  (시리얼 {port})')
 
     # SIGTERM(systemctl stop · kill)에도 정리 경로를 타게 한다. 기본 동작은 즉시
-    # 종료라 finally 가 실행되지 않고, 그러면 Astra 를 열어 둔 채 프로세스만
-    # 사라져 다음 기동이 실패한다.
+    # 종료 신호에서도 레코더·미러·팔 워커 정리 경로를 반드시 탄다.
     import signal
 
     def _bye(signum, frame):
@@ -871,8 +671,6 @@ def main():
             rec.shutdown()          # 기록 중이면 저장하고 끝낸다 — 버리지 않는다
         if mir is not None:
             mir.shutdown()          # 렌더 데몬을 남기면 GPU 를 문 고아가 된다
-        if dep is not None:
-            dep.shutdown()
         # ★ 토크 유지 종료 (2026-08-24) — 팔 자세와 무관하게 토크를 끊던 옛
         # 경로는 펴진 팔을 책상에 떨어뜨렸다. 토크 해제는 사용자의 명시적
         # '해제'(disconnect op)에서만.

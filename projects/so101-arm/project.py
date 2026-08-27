@@ -2,12 +2,12 @@
 
 같은 디렉터리의 `panel.html`/`panel_server.py` 는 **라이브** 화면(지금 팔을
 움직인다)이고, 이쪽은 **기록** 화면이다(끝난 시행을 되돌려 본다). 데이터가
-서로 다르다: 라이브는 서보에서 직접, 기록은 `~/so101_tools/media/` 에 남은
+서로 다르다. 라이브는 서보에서 직접 읽고, 기록은 `~/so101-mobile-manipulation/media/`에 남은
 영상·상태 CSV 와 `~/so101_datasets/` 의 LeRobot 데이터셋에서 온다.
 
 캡스톤(capstone-pick)과 다른 점: 저기는 Gazebo MCAP 한 파일에 관측·영상·실좌표가
 같이 들어 있지만, 실기는 그런 것이 없다. 시행 하나는 `run_demo.sh` 가 남긴
-**파일 묶음**(demo_<시각>_{wrist,rgb,depth,screen,sim}.mp4 + _state.csv)이고,
+**파일 묶음**(demo_<시각>_{wrist,screen,sim}.mp4 + _state.csv)이고,
 그 묶음을 시각으로 엮는 것이 read_runs.py 가 하는 일이다.
 """
 import pathlib
@@ -20,21 +20,22 @@ ARM_ORDER = ['shoulder_pan', 'shoulder_lift', 'elbow_flex',
              'wrist_flex', 'wrist_roll']
 GRIPPER = 'gripper'
 
-MEDIA_ROOT = pathlib.Path('~/so101_tools/media').expanduser()
+MEDIA_ROOT = pathlib.Path('~/so101-mobile-manipulation/media').expanduser()
 DATASET_ROOT = pathlib.Path('~/so101_datasets').expanduser()
 
-# 파일 접미사 → 화면에서 부를 이름·설명. run_demo.sh 의 6채널 규약과 맞춘다.
+# 파일 접미사 → 화면에서 부를 이름·설명. 차량은 손목캠 단독이며, rgb/depth는
+# 2026-08-20 벤치 기록을 되감기 위한 legacy 채널로만 읽는다.
 # `_realtime` 접미사가 붙은 판이 있으면 그쪽을 쓴다 — 무접미 판은 mpjpeg 를
 # 벽시계 타임스탬프 없이 받아 2.5배속으로 굳은 기록이다(2026-08-20 실측).
 CHANNELS = {
-    'rgb':    {'label': '정면 (뎁스캠 컬러)', 'realtime': True},
-    'wrist':  {'label': '손목캠',             'realtime': True},
-    'depth':  {'label': '깊이',               'realtime': True},
-    'sim':    {'label': 'MuJoCo 미러',        'realtime': False},
-    'screen': {'label': '패널 화면',          'realtime': False},
+    'wrist':  {'label': '손목캠',                'realtime': True},
+    'sim':    {'label': 'MuJoCo 차량 미러',      'realtime': False},
+    'screen': {'label': '패널 화면',             'realtime': False},
+    'rgb':    {'label': '정면 컬러 (과거 벤치)', 'realtime': True, 'legacy': True},
+    'depth':  {'label': '깊이 (과거 벤치)',      'realtime': True, 'legacy': True},
 }
 # 화면에 세울 채널 순서 (없는 채널은 그냥 빠진다)
-CHANNEL_ORDER = ['rgb', 'wrist', 'sim', 'depth', 'screen']
+CHANNEL_ORDER = ['wrist', 'sim', 'screen', 'rgb', 'depth']
 
 # ── 판정 ───────────────────────────────────────────────────────────
 # 실기에는 Gazebo 실좌표 같은 심판이 없다. 로그의 "PICK_SUCCESS" 를 그대로 믿지
@@ -49,8 +50,23 @@ TEMPLATE = 'dashboard.tpl.html'
 DATA = {
     '/*__RUNS__*/': 'runs.json',
     '/*__DATASETS__*/': 'datasets.json',
+    '/*__STATUS__*/': 'status.json',
 }
 TREND = False               # 판(epoch) 누적 회귀는 아직 쓰지 않는다
+REQUIRE_FRESH_BUILD = True  # check가 템플릿·JSON보다 오래된 dashboard.html을 거부
+
+# 차량 현황은 원자료에서 다시 계산한다. 화면 문구에 성공률을 손으로 복제하지 않는다.
+YOLO_LOG = DATASET_ROOT / 'wrist_yolo_stationary_20260827_01.jsonl'
+PICK_LOG = DATASET_ROOT / 'pick_log.csv'
+STATUS = {
+    'updated': '2026-08-27',
+    'profile': 'SO-101 Mobile Manipulation',
+    'compute': '노트북: 손목캠·YOLO·ACT·Nav2 / Pi: 베이스·센서',
+    'vision': '손목캠 단독 · Astra 비활성',
+    'ros': '읽기 전용 프리플라이트 PASS',
+    'pan': '−15.6° ±7.0°',
+    'yolo_gate': '케이블 정리 후 conf 0.40 양성 ≥95%·음성 0건 필요',
+}
 
 # 영상은 다시 인코딩해 예산에 맞춘다. 원본은 시행 하나가 60MB를 넘기도 해서
 # (demo_160236 5채널 합 73MB) 그대로 실을 수 없다.
@@ -66,9 +82,11 @@ VIDEO_MAX_W = 480           # 기본 폭
 # 화면 녹화나 시뮬 미러는 배경으로만 둔다. 예산은 하나뿐이니 필요한 쪽에 몰아준다.
 # 값은 기준 crf에 더하는 차 — 클수록 나빠지고 작아진다
 # (실측 2026-08-21: 같은 원본이 crf 28에 5.9MB, crf 40에 2.1MB).
-VIDEO_CRF_BY_CHANNEL = {'rgb': -4, 'wrist': -4, 'sim': +4, 'depth': +2, 'screen': +8}
+VIDEO_CRF_BY_CHANNEL = {'wrist': -4, 'sim': +4, 'screen': +8,
+                        'rgb': -2, 'depth': +2}
 # 폭도 채널마다. 손목캠은 원본이 작아(352) 그대로 두고, 배경 채널은 더 줄인다.
-VIDEO_W_BY_CHANNEL = {'rgb': 640, 'wrist': 512, 'depth': 480, 'sim': 400, 'screen': 400}
+VIDEO_W_BY_CHANNEL = {'wrist': 512, 'sim': 480, 'screen': 400,
+                      'rgb': 480, 'depth': 400}
 VIDEO_PRESET = 'veryfast'   # 시행 하나가 채널 다섯이라 slow 는 빌드가 분 단위로 는다
 # 한 화면에 세울 시행 수 — 최신부터. 전부 실으면 아티팩트 한도를 넘는다.
 MAX_RUNS = 8
