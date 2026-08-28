@@ -52,13 +52,13 @@ cd "$HOME/robot-dashboard"
 
 ## 오프라인 CI 범위
 
-secret이 없는 `dashboard-unit`은 실제 `panel_server.py`로 HTTP Origin·CSRF·JSON,
+`dashboard-unit`은 실제 `panel_server.py`로 HTTP Origin·CSRF·JSON,
 명령 lifecycle, 카메라 freshness, UI·종료, legacy redirect 계약을 항상 검사한다.
 이 모드의 canonical fixture는 import 경계만 제공하며 예상 밖 호출은 즉시 실패한다.
 
-`canonical-integration`은 `SO101_CANONICAL_TOKEN`이 있을 때만 private 정본을 checkout해
-Worker·BaseMonitor 공개 API까지 다시 검사한다. secret이 없으면 로그에 integration
-skip을 명시한다. unit 통과는 canonical 안전 구현이나 실물 HIL 통과를 뜻하지 않는다.
+`canonical-integration`은 공개된 `mmporong/so101-mobile-manipulation` 정본을 checkout해
+Worker·BaseMonitor API와 패널의 시작·종료 lifecycle 연결을 매번 검사한다. 두 CI가
+통과해도 차량에서 반복 파지가 성공했다는 뜻은 아니다. 실물 HIL 결과는 별도로 남긴다.
 
 ## 화면에서 확인할 안전 상태
 

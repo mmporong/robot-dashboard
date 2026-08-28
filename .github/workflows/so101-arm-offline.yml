@@ -10,15 +10,22 @@ on:
       - 'projects/so101-arm/**'
       - '.github/workflows/so101-arm-offline.yml'
 
+permissions:
+  contents: read
+
 jobs:
   dashboard-unit:
     name: Dashboard-owned unit (no secrets)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      - name: Install dashboard test dependencies
+        run: pip install pillow
       - name: Dashboard HTTP, UI, lifecycle, camera and legacy guards
         env:
           SO101_DASHBOARD_TEST_MODE: unit
@@ -36,31 +43,24 @@ jobs:
           sh -n projects/so101-arm/tools/usb_port_cycle.sh
 
   canonical-integration:
-    name: Canonical integration (token-gated)
+    name: Canonical integration (public source)
     runs-on: ubuntu-latest
-    env:
-      SO101_CANONICAL_TOKEN: ${{ secrets.SO101_CANONICAL_TOKEN }}
     steps:
       - uses: actions/checkout@v4
-      - name: Integration skip notice
-        if: ${{ env.SO101_CANONICAL_TOKEN == '' }}
-        run: echo 'INTEGRATION — SKIP (SO101_CANONICAL_TOKEN secret 없음)'
-      - name: Checkout private canonical repository
-        if: ${{ env.SO101_CANONICAL_TOKEN != '' }}
+        with:
+          persist-credentials: false
+      - name: Checkout public canonical repository
         uses: actions/checkout@v4
         with:
           repository: mmporong/so101-mobile-manipulation
           path: so101-mobile-manipulation
-          token: ${{ secrets.SO101_CANONICAL_TOKEN }}
+          persist-credentials: false
       - uses: actions/setup-python@v5
-        if: ${{ env.SO101_CANONICAL_TOKEN != '' }}
         with:
           python-version: '3.11'
       - name: Install integration dependencies
-        if: ${{ env.SO101_CANONICAL_TOKEN != '' }}
-        run: pip install numpy opencv-python-headless
+        run: pip install numpy opencv-python-headless pillow
       - name: Run against actual canonical code
-        if: ${{ env.SO101_CANONICAL_TOKEN != '' }}
         env:
           SO101_DASHBOARD_TEST_MODE: integration
           SO101_CANONICAL_DIR: ${{ github.workspace }}/so101-mobile-manipulation

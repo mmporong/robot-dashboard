@@ -600,14 +600,17 @@ def test_legacy_redirect_executes_only_temporary_canonical_target():
     assert usb.returncode == 2 and 'legacy 실행 차단' in usb.stderr
 
 
-def test_ci_has_honest_unit_and_token_gated_integration():
+def test_ci_always_runs_public_canonical_integration():
     workflow = (HERE.parents[1] / '.github/workflows/so101-arm-offline.yml').read_text()
     assert 'dashboard-unit:' in workflow and 'canonical-integration:' in workflow
     assert 'SO101_DASHBOARD_TEST_MODE: unit' in workflow
     assert 'SO101_DASHBOARD_TEST_MODE: integration' in workflow
-    assert 'SO101_CANONICAL_TOKEN secret 없음' in workflow
-    assert 'token: ${{ secrets.SO101_CANONICAL_TOKEN }}' in workflow
-    assert 'github.token' not in workflow and '||' not in workflow
+    assert 'repository: mmporong/so101-mobile-manipulation' in workflow
+    assert 'path: so101-mobile-manipulation' in workflow
+    assert 'permissions:\n  contents: read' in workflow
+    assert workflow.count('persist-credentials: false') == 3
+    assert 'SO101_CANONICAL_TOKEN' not in workflow
+    assert 'secrets.' not in workflow and 'github.token' not in workflow
 
 
 def test_canonical_directory_environment_override():
@@ -1395,14 +1398,14 @@ def test_record_dashboard_contract():
 def main():
     print(f'MODE — {MODE}')
     if MODE == 'unit':
-        print('INTEGRATION — SKIP (SO101_CANONICAL_TOKEN/canonical checkout 없음)')
+        print('INTEGRATION — SKIP (unit 모드)')
     else:
         print(f'INTEGRATION — canonical={pathlib.Path(os.environ["SO101_CANONICAL_DIR"]).resolve()}')
     tests = [test_vehicle_channels, test_status_evidence,
              test_live_panel_contract, test_unit_fixture_rejects_unexpected_canonical_calls,
              test_legacy_runtime_entrypoints_are_redirected_or_blocked,
              test_legacy_redirect_executes_only_temporary_canonical_target,
-             test_ci_has_honest_unit_and_token_gated_integration,
+             test_ci_always_runs_public_canonical_integration,
              test_canonical_directory_environment_override,
              test_http_command_boundary,
              test_deep_json_is_deterministic_400_and_server_survives,
