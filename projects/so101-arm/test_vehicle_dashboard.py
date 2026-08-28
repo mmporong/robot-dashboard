@@ -609,6 +609,8 @@ def test_ci_always_runs_public_canonical_integration():
     assert 'path: so101-mobile-manipulation' in workflow
     assert 'permissions:\n  contents: read' in workflow
     assert workflow.count('persist-credentials: false') == 3
+    assert 'python3 dash.py so101-arm all' in workflow
+    assert 'python3 dash.py so101-arm check' in workflow
     assert 'SO101_CANONICAL_TOKEN' not in workflow
     assert 'secrets.' not in workflow and 'github.token' not in workflow
 

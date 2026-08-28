@@ -59,6 +59,7 @@ cd "$HOME/robot-dashboard"
 `canonical-integration`은 공개된 `mmporong/so101-mobile-manipulation` 정본을 checkout해
 Worker·BaseMonitor API와 패널의 시작·종료 lifecycle 연결을 매번 검사한다. 두 CI가
 통과해도 차량에서 반복 파지가 성공했다는 뜻은 아니다. 실물 HIL 결과는 별도로 남긴다.
+기록 파일이 없는 새 러너에서는 빈 입력으로 대시보드를 한 번 만든 뒤 최신성까지 확인한다.
 
 ## 화면에서 확인할 안전 상태
 

@@ -35,7 +35,9 @@ jobs:
       - name: JavaScript syntax
         run: sed -n '/<script>/,/<\/script>/p' projects/so101-arm/panel.html | sed '1d;$d' | node --check -
       - name: Dashboard build check
-        run: python3 dash.py so101-arm check
+        run: |
+          python3 dash.py so101-arm all
+          python3 dash.py so101-arm check
       - name: Legacy shell syntax
         run: |
           bash -n projects/so101-arm/tools/run_demo.sh
