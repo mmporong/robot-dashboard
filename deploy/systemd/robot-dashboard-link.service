@@ -1,0 +1,14 @@
+[Unit]
+Description=Robot dashboard read-only Pi data connection
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ssh -N -T -o BatchMode=yes -o ConnectTimeout=5 -o StrictHostKeyChecking=yes -o HostKeyAlias=jdamr.local -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -L 127.0.0.1:18091:127.0.0.1:8090 %u@jdamr.local
+Restart=always
+RestartSec=5
+TimeoutStopSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

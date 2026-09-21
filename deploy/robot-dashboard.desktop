@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=AMMR 관제
+Comment=고정된 AMMR 관제 화면 열기
+Exec=xdg-open http://127.0.0.1:8090
+Icon=utilities-system-monitor
+Terminal=false
+Categories=Science;Robotics;
+StartupNotify=false

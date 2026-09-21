@@ -1,0 +1,22 @@
+[Unit]
+Description=JD-AMR read-only operations dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lim
+Environment=PYTHONUNBUFFERED=1
+Environment=ROS_DOMAIN_ID=12
+Environment=ROS_AUTOMATIC_DISCOVERY_RANGE=SUBNET
+Environment=FASTDDS_BUILTIN_TRANSPORTS=UDPv4
+WorkingDirectory=/home/lim/ammr_dashboard
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=OMP_NUM_THREADS=1
+ExecStart=/bin/bash -lc 'source /opt/ros/jazzy/setup.bash; exec /usr/bin/python3 /home/lim/ammr_dashboard/ammr_dashboard.py --bind 127.0.0.1 --port 8090 --scan-yaw-deg 180 --scan-x-m -0.010 --scan-y-m 0 --scan-display-frame base_footprint'
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=8
+
+[Install]
+WantedBy=multi-user.target
