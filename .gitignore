@@ -2,6 +2,9 @@
 # 특히 dashboard.html은 빌드할 때마다 통째로 바뀌는 3~4MB짜리라 이력에 넣으면
 # 리포가 커밋 수만큼 무거워진다.
 projects/*/dashboard.html
+# AMMR live UI is source, not a generated replay artifact.
+!projects/ammr-live/dashboard.html
+projects/ammr-live/version.json
 projects/*/runs.json
 projects/*/run_frames.json
 projects/*/trend.json
